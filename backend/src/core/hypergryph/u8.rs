@@ -117,3 +117,90 @@ pub async fn grant(
 
     Ok(response)
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerListRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerListResponse {
+    pub data: ServerListResponseData,
+    pub msg: String,
+    pub status: i8,
+    #[serde(rename = "type")]
+    pub response_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerListResponseData {
+    #[serde(rename = "serverList")]
+    pub server_list: Vec<ServerListData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerListData {
+    pub server_id: String,
+    pub server_name: String,
+    pub server_domain: String,
+    pub default_choose: bool,
+    pub role_id: String,
+    pub level: i32,
+    pub extension: String,
+}
+
+pub async fn server_list(
+    client: &Client,
+    token: &str,
+) -> Result<ServerListResponse, Box<dyn std::error::Error>> {
+    let body = ServerListRequest {
+        token: token.to_string(),
+    };
+
+    let response = client
+        .post("https://u8.gryphline.com/game/server/v1/server_list")
+        .json(&body)
+        .send()
+        .await?
+        .json::<ServerListResponse>()
+        .await?;
+
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfirmServerRequest {
+    pub token: String,
+    #[serde(rename = "serverId")]
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfirmServerResponse {
+    pub msg: String,
+    pub status: i8,
+    #[serde(rename = "type")]
+    pub response_type: String,
+}
+
+pub async fn confirm_server(
+    client: &Client,
+    token: &str,
+    server_id: i32,
+) -> Result<ConfirmServerResponse, Box<dyn std::error::Error>> {
+    let body = ConfirmServerRequest {
+        token: token.to_string(),
+        server_id: server_id.to_string(),
+    };
+
+    let response = client
+        .post("https://u8.gryphline.com/game/role/v1/confirm_server")
+        .json(&body)
+        .send()
+        .await?
+        .json::<ConfirmServerResponse>()
+        .await?;
+
+    Ok(response)
+}
