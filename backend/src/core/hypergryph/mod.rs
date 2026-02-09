@@ -1,3 +1,4 @@
+pub mod binding;
 pub mod launcher;
 pub mod launcher_web;
 pub mod u8;
