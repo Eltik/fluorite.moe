@@ -1,3 +1,4 @@
+pub mod account_service;
 pub mod binding;
 pub mod launcher;
 pub mod launcher_web;
