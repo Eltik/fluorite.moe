@@ -145,8 +145,8 @@ pub struct ServerListData {
     pub server_name: String,
     pub server_domain: String,
     pub default_choose: bool,
-    pub role_id: String,
-    pub level: i32,
+    pub role_id: Option<String>,
+    pub level: Option<i32>,
     pub extension: String,
 }
 
@@ -178,6 +178,7 @@ pub struct ConfirmServerRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfirmServerResponse {
+    pub code: Option<i32>,
     pub msg: String,
     pub status: i8,
     #[serde(rename = "type")]

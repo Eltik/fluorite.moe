@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+// --- Login types ---
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenByEmailRequest {
     pub email: String,
@@ -26,28 +28,54 @@ pub struct TokenByEmailData {
     pub is_latest_user_agreement: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptchaChallenge {
+    pub geetest_id: String,
+    pub challenge: String,
+    pub risk_type: String,
+}
+
+pub enum LoginResult {
+    Success(TokenByEmailResponse),
+    CaptchaRequired(CaptchaChallenge),
+}
+
 pub async fn token_by_email_password(
     client: &Client,
     email: &str,
     password: &str,
     from: Option<i8>,
-) -> Result<TokenByEmailResponse, Box<dyn std::error::Error>> {
+) -> Result<LoginResult, Box<dyn std::error::Error>> {
     let body = TokenByEmailRequest {
         email: email.to_string(),
         password: password.to_string(),
         from: from.unwrap_or(0),
     };
 
-    let response = client
+    let raw: serde_json::Value = client
         .post("https://as.gryphline.com/user/auth/v1/token_by_email_password")
         .json(&body)
         .send()
         .await?
-        .json::<TokenByEmailResponse>()
+        .json()
         .await?;
 
-    Ok(response)
+    let status = raw["status"].as_i64().unwrap_or(-1);
+
+    if status == 0 {
+        let response: TokenByEmailResponse = serde_json::from_value(raw)?;
+        Ok(LoginResult::Success(response))
+    } else if status == 1 && raw["data"]["captcha"].is_object() {
+        let challenge: CaptchaChallenge = serde_json::from_value(raw["data"]["captcha"].clone())?;
+        Ok(LoginResult::CaptchaRequired(challenge))
+    } else {
+        let msg = raw["msg"].as_str().unwrap_or("Unknown error");
+        Err(format!("Login failed (status {}): {}", status, msg).into())
+    }
 }
+
+// --- OAuth2 types ---
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +147,8 @@ pub async fn oauth2_grant<T: DeserializeOwned>(
 
     Ok(response)
 }
+
+// --- User info types ---
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InfoBasic {

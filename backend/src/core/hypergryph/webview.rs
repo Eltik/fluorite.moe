@@ -13,9 +13,19 @@ pub enum PoolType {
     ECharacterGachaPoolTypeSpecial,
 }
 
+impl PoolType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            PoolType::ECharacterGachaPoolTypeBeginner => "E_CharacterGachaPoolType_Beginner",
+            PoolType::ECharacterGachaPoolTypeStandard => "E_CharacterGachaPoolType_Standard",
+            PoolType::ECharacterGachaPoolTypeSpecial => "E_CharacterGachaPoolType_Special",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebViewRecordChar {
-    pub code: i8,
+    pub code: i32,
     pub data: WebViewRecordCharData,
     pub msg: String,
 }
@@ -36,14 +46,14 @@ pub struct WebViewRecordCharDataList {
     pub rarity: i8,
     pub is_free: bool,
     pub is_new: bool,
-    pub gacha_ts: i64,
+    pub gacha_ts: String,
     pub seq_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebViewRecordContent {
-    pub code: i8,
-    pub data: WebViewRecordContentData,
+    pub code: i32,
+    pub data: Option<WebViewRecordContentData>,
     pub msg: String,
 }
 
@@ -95,13 +105,13 @@ pub async fn record_char(
 
     let mut params: Vec<(&str, String)> = vec![
         ("lang", lang.to_string()),
-        ("pool_type", format!("{:?}", pool_type)),
+        ("pool_type", pool_type.as_str().to_string()),
         ("token", token),
         ("server_id", server_id.to_string()),
     ];
 
     if let Some(id) = seq_id {
-        params.push(("seqId", id.to_string()));
+        params.push(("seq_id", id.to_string()));
     }
 
     let response = client
@@ -130,7 +140,7 @@ pub async fn content(
 
     let params: Vec<(&str, String)> = vec![
         ("lang", lang.to_string()),
-        ("pool_id", format!("{:?}", pool_id)),
+        ("pool_id", pool_id.to_string()),
         ("server_id", server_id.to_string()),
     ];
 

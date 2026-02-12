@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use backend::core::hypergryph::{
     account_service::{
-        OAuth2GrantResponse, OAuth2GrantType1Response, info_basic, oauth2_grant,
+        LoginResult, OAuth2GrantResponse, OAuth2GrantType1Response, info_basic, oauth2_grant,
         token_by_email_password,
     },
     binding::{BindingRoles, binding_list},
@@ -99,9 +99,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         eprintln!("Retrieving account service token ...");
-        let acc_srv_token_rsp = token_by_email_password(&client, &email, &password, None).await?;
-
-        token = acc_srv_token_rsp.data.token;
+        match token_by_email_password(&client, &email, &password, None).await? {
+            LoginResult::Success(rsp) => {
+                token = rsp.data.token;
+            }
+            LoginResult::CaptchaRequired(challenge) => {
+                return Err(format!(
+                    "CAPTCHA required (id={}, type={}). Automated solving is not supported.",
+                    challenge.geetest_id, challenge.risk_type
+                )
+                .into());
+            }
+        }
     }
 
     if let Some(rsp) = &oauth2_rsp {
@@ -128,16 +137,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    print!("Authentication successful!");
+    println!("Authentication successful!");
 
-    print!("Retrieving user account data...");
+    println!("Retrieving user account data...");
     let user_acc_data = info_basic(&client, "d9f6dbb6bbd6bb33", &token).await?;
 
-    print!("Retrieving user game server data...");
+    println!("Retrieving user game server data...");
     let user_game_data = server_list(&client, &u8_token_rsp.data.token).await?;
     let user_game_binding_data = binding_list(&client, &oauth2_token_bind_rsp.data.token).await?;
 
-    print!("Retrieving gacha records...");
+    println!("Retrieving gacha records...");
 
     let selected_server_id = {
         let endfield_entry = user_game_binding_data
@@ -241,17 +250,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut arr: Vec<GachaPoolInfo> = Vec::new();
 
         for pool_id in &pool_id_list {
-            let rsp = content(&client, server_id, pool_id, "ja-jp").await?;
-            arr.push(GachaPoolInfo {
-                pool_id: pool_id.clone(),
-                pool: rsp.data.pool,
-            });
+            let rsp = content(&client, server_id, pool_id, "en-us").await?;
+            if let Some(data) = rsp.data {
+                arr.push(GachaPoolInfo {
+                    pool_id: pool_id.clone(),
+                    pool: data.pool,
+                });
+            } else {
+                eprintln!(
+                    "Warning: no pool data for pool_id {} (code: {})",
+                    pool_id, rsp.code
+                );
+            }
         }
 
         arr
     };
 
-    print!("Data retrieval completed!");
+    println!("Data retrieval completed!");
 
     let endfield_binding = user_game_binding_data
         .data
@@ -265,10 +281,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
 
-        let nickname = if user_acc_data.data.nick_name.is_empty() {
-            "(none)".to_string()
-        } else {
+        let nickname = if !user_acc_data.data.nick_name.is_empty() {
             user_acc_data.data.nick_name.clone()
+        } else {
+            binding
+                .roles
+                .iter()
+                .find(|r| !r.nick_name.is_empty())
+                .map(|r| r.nick_name.clone())
+                .unwrap_or_else(|| "(none)".to_string())
         };
 
         let registered = DateTime::from_timestamp(binding.register_ts, 0)
@@ -343,10 +364,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|dt| dt.format("%Y/%m/%d %H:%M:%S").to_string())
                 .unwrap_or_default();
 
+            let role_id = s.role_id.as_deref().unwrap_or("");
+            let level = s.level.map(|l| l.to_string()).unwrap_or_default();
             table.add_row(vec![
                 &s.server_id,
-                &s.role_id,
-                &s.level.to_string(),
+                role_id,
+                &level,
                 &found,
                 &default,
                 nickname,
@@ -441,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         table.load_preset(UTF8_FULL_CONDENSED);
         table.add_row(vec!["Pool ID", "Pool Name", "Pulled", "Pity", "Character"]);
 
-        for (i, pool_info) in gacha_pool_info_list.iter().enumerate() {
+        for pool_info in &gacha_pool_info_list {
             let records: Vec<&GachaRecord> = gacha_record_rsp
                 .iter()
                 .filter(|r| r.entry.pool_id == pool_info.pool_id)
@@ -462,7 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for record in &records {
                 pity_r6 += 1;
                 if record.entry.rarity == 6 {
-                    let ts = record.entry.gacha_ts;
+                    let ts: i64 = record.entry.gacha_ts.parse().unwrap_or(0);
                     let pulled = DateTime::from_timestamp_millis(ts)
                         .map(|dt| dt.format("%Y/%m/%d %H:%M:%S").to_string())
                         .unwrap_or_default();
@@ -479,12 +502,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             sub_rows.reverse();
-            for row in sub_rows {
-                table.add_row(row);
-            }
-
-            if i < gacha_pool_info_list.len() - 1 {
-                table.add_row(vec!["", "", "", "", ""]);
+            if !sub_rows.is_empty() {
+                if table.row_count() > 1 {
+                    table.add_row(vec!["", "", "", "", ""]);
+                }
+                for row in sub_rows {
+                    table.add_row(row);
+                }
             }
         }
         println!("{table}");
