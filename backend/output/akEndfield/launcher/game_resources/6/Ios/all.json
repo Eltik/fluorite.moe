@@ -1,0 +1,19 @@
+[
+  {
+    "updatedAt": "2026-02-18T18:43:21.714791+00:00",
+    "req": {
+      "appCode": "YDUTE5gscDZ229CW",
+      "gameVersion": "1.0",
+      "platform": "Ios",
+      "randStr": "Qk2mXHuAH1JWKF37",
+      "version": "1.0.14"
+    },
+    "rsp": {
+      "resources": [],
+      "configs": "",
+      "res_version": "",
+      "patch_index_path": "",
+      "domain": ""
+    }
+  }
+]

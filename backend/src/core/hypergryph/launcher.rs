@@ -7,7 +7,7 @@ fn is_valid_semver(version: &str) -> bool {
     parts.len() == 3 && parts.iter().all(|p| p.parse::<u64>().is_ok())
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGame {
     pub action: i32,
     pub version: String,
@@ -18,7 +18,7 @@ pub struct LauncherLatestGame {
     pub launcher_action: i32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGamePkg {
     pub packs: Vec<LauncherLatestGamePack>,
     pub total_size: String,
@@ -31,14 +31,14 @@ pub struct LauncherLatestGamePkg {
     pub game_files_md5: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGamePack {
     pub url: String,
     pub md5: String,
     pub package_size: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGamePatch {
     pub url: String,
     pub md5: String,
@@ -94,7 +94,7 @@ pub enum Platform {
     PlayStation,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGameResources {
     pub resources: Vec<LauncherLatestGameResource>,
     pub configs: String,
@@ -103,7 +103,7 @@ pub struct LauncherLatestGameResources {
     pub domain: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestGameResource {
     pub name: String,
     pub version: String,
@@ -140,7 +140,7 @@ pub async fn latest_game_resources(
     Ok(response)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherLatestLauncher {
     pub action: i32,
     pub version: String,
@@ -152,6 +152,41 @@ pub struct LauncherLatestLauncher {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Region {
+    Os,
+    Cn,
+}
+
+impl Region {
+    pub fn launcher_base(&self) -> &'static str {
+        match self {
+            Region::Os => "launcher.gryphline.com/api",
+            Region::Cn => "launcher.hypergryph.com/api",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Region::Os => "os",
+            Region::Cn => "cn",
+        }
+    }
+
+    pub fn as_str_upper(&self) -> &'static str {
+        match self {
+            Region::Os => "OS",
+            Region::Cn => "CN",
+        }
+    }
+}
+
+impl std::fmt::Display for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub async fn latest_launcher(
     client: &Client,
     app_code: &str,
@@ -159,6 +194,7 @@ pub async fn latest_launcher(
     sub_channel: i32,
     version: Option<&str>,
     target_app: Option<&str>,
+    region: Region,
 ) -> Result<LauncherLatestLauncher, Box<dyn std::error::Error>> {
     if let Some(ver) = version
         && !is_valid_semver(ver)
@@ -180,12 +216,63 @@ pub async fn latest_launcher(
         params.push(("target_app", app.to_string()));
     }
 
+    let url = format!("https://{}/launcher/get_latest", region.launcher_base());
     let response = client
-        .get("https://launcher.gryphline.com/api/launcher/get_latest")
+        .get(&url)
         .query(&params)
         .send()
         .await?
         .json::<LauncherLatestLauncher>()
+        .await?;
+
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LauncherLatestLauncherExe {
+    pub action: i64,
+    pub version: String,
+    pub request_version: String,
+    pub exe_url: String,
+    pub exe_size: String,
+}
+
+pub async fn latest_launcher_exe(
+    client: &Client,
+    app_code: &str,
+    channel: i32,
+    sub_channel: i32,
+    version: Option<&str>,
+    ta: &str,
+    region: Region,
+) -> Result<LauncherLatestLauncherExe, Box<dyn std::error::Error>> {
+    if let Some(ver) = version
+        && !is_valid_semver(ver)
+    {
+        return Err(format!("invalid version string ({})", ver).into());
+    }
+
+    let mut params: Vec<(&str, String)> = vec![
+        ("appcode", app_code.to_string()),
+        ("channel", channel.to_string()),
+        ("sub_channel", sub_channel.to_string()),
+        ("ta", ta.to_string()),
+    ];
+
+    if let Some(ver) = version {
+        params.push(("version", ver.to_string()));
+    }
+
+    let url = format!(
+        "https://{}/launcher/get_latest_launcher",
+        region.launcher_base()
+    );
+    let response = client
+        .get(&url)
+        .query(&params)
+        .send()
+        .await?
+        .json::<LauncherLatestLauncherExe>()
         .await?;
 
     Ok(response)

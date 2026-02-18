@@ -1,0 +1,21 @@
+[
+  {
+    "updatedAt": "2026-02-18T18:43:24.109018+00:00",
+    "req": {
+      "appCode": "abYeZZ16BPluCFyT",
+      "channel": 1,
+      "subChannel": 1,
+      "targetApp": "Arknights"
+    },
+    "rsp": {
+      "action": 1,
+      "version": "1.1.1",
+      "request_version": "",
+      "zip_package_url": "https://launcher-sign.hycdn.cn/abYeZZ16BPluCFyT/launcher/1.1.1/1/1/9lgNrktxI8ARzguv/HypergryphLauncher_v1.1.1.1121_1_1_arknights.zip?auth_key=1771440203-134587e4c3d14bd68dd5641dbc946d7b-0-a54bac5bbf21af064a2a275f4ad1bbe4",
+      "md5": "013d7e900c46b2324c8a749a06b84768",
+      "package_size": "125456996",
+      "total_size": "389401989",
+      "description": ""
+    }
+  }
+]
