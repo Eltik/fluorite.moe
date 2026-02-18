@@ -11,6 +11,10 @@ path = "src/bin/auth_test.rs"
 name = "resource-test"
 path = "src/bin/resource_test.rs"
 
+[[bin]]
+name = "endfield-config-test"
+path = "src/bin/endfield_config_test.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
