@@ -1,0 +1,30 @@
+[
+  {
+    "updatedAt": "2026-02-18T19:07:57.542393+00:00",
+    "req": {
+      "appCode": "YDUTE5gscDZ229CW",
+      "gameVersion": "1.0",
+      "platform": "PlayStation",
+      "randStr": "Qk2mXHuAH1JWKF37",
+      "version": "1.0.14"
+    },
+    "rsp": {
+      "resources": [
+        {
+          "name": "main",
+          "version": "5634417-116",
+          "path": "https://beyond.hg-cdn.com/YDUTE5gscDZ229CW/1.0/resource/PlayStation/main/5634417-116_rExjALahgmdeMttB/files"
+        },
+        {
+          "name": "initial",
+          "version": "5634417-116",
+          "path": "https://beyond.hg-cdn.com/YDUTE5gscDZ229CW/1.0/resource/PlayStation/initial/5634417-116_Umd1muSgnmB3S1GW/files"
+        }
+      ],
+      "configs": "{\"kick_flag\":false}",
+      "res_version": "initial_5634417-116_main_5634417-116",
+      "patch_index_path": "",
+      "domain": "https://beyond.hg-cdn.com"
+    }
+  }
+]

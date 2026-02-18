@@ -45,6 +45,28 @@ mod sub_channel {
 
 const NETWORK_CONCURRENCY: usize = 16;
 
+fn utc8() -> FixedOffset {
+    FixedOffset::east_opt(8 * 3600).unwrap()
+}
+
+fn parse_date_utc8(
+    raw: &str,
+) -> Result<(DateTime<FixedOffset>, String), Box<dyn std::error::Error>> {
+    let dt = raw.parse::<DateTime<Utc>>()?.with_timezone(&utc8());
+    let formatted = dt.format("%Y/%m/%d %H:%M:%S").to_string();
+    Ok((dt, formatted))
+}
+
+async fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn std::error::Error>> {
+    Ok(from_str(&read_to_string(path).await?)?)
+}
+
+const LAUNCHER_BASE: &str = "ArknightsEndfield";
+
+fn game_base_path(output_dir: &Path, dir_name: &str) -> std::path::PathBuf {
+    output_dir.join(LAUNCHER_BASE).join("game").join(dir_name)
+}
+
 struct IgnoreRule {
     path: Vec<String>,
     pattern: regex::Regex,
@@ -151,7 +173,7 @@ where
 
     for file_path in &files_to_check {
         if file_path.exists() {
-            let current: Value = from_str(&read_to_string(file_path).await?)?;
+            let current: Value = read_json_file(file_path).await?;
             let diff = get_object_diff(&current, &data_value, ignore_rules, &[]);
             if !diff.is_empty() {
                 eprintln!(
@@ -171,7 +193,7 @@ where
 
     let all_path = file_path_base.join("all.json");
     let mut all_data: Vec<StoredData<T>> = if all_path.exists() {
-        from_str(&read_to_string(&all_path).await?)?
+        read_json_file(&all_path).await?
     } else {
         Vec::new()
     };
@@ -226,30 +248,50 @@ fn format_bytes(bytes: i64) -> String {
     format!("{:.2} {}", size, UNITS[i])
 }
 
+fn size_table_html(unpacked: i64, packed: i64) -> Vec<String> {
+    vec![
+        "<table>".into(),
+        format!(
+            "  <tr><td>Unpacked Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
+            format_bytes(unpacked)
+        ),
+        format!(
+            "  <tr><td>Packed Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
+            format_bytes(packed)
+        ),
+        "</table>\n".into(),
+    ]
+}
+
+fn file_row_md(
+    url: &str,
+    md5: &str,
+    package_size: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let name = url_filename(url);
+    let size = format_bytes(package_size.parse()?);
+    Ok(format!("|[{name}]({url})|`{md5}`|{size}|"))
+}
+
 async fn generate_game_list_md(
     target: &GameTarget,
     output_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base = output_dir
-        .join("akEndfield/launcher/game")
-        .join(&target.dir_name);
+    let base = game_base_path(output_dir, &target.dir_name);
     let all_path = base.join("all.json");
     if !all_path.exists() {
         return Ok(());
     }
 
-    let game_all: Vec<StoredData<LauncherLatestGame>> =
-        from_str(&read_to_string(&all_path).await?)?;
+    let game_all: Vec<StoredData<LauncherLatestGame>> = read_json_file(&all_path).await?;
 
-    let utc8 = FixedOffset::east_opt(8 * 3600).unwrap();
     let mut lines: Vec<String> = Vec::new();
 
     lines.push(format!("# Game Packages ({})\n", target.name));
 
     for e in &game_all {
         let version = &e.rsp.version;
-        let date = e.updated_at.parse::<DateTime<Utc>>()?.with_timezone(&utc8);
-        let date_str = date.format("%Y/%m/%d %H:%M:%S");
+        let (date, date_str) = parse_date_utc8(&e.updated_at)?;
         let anchor_id = format!("ver-{version}-{}", date.timestamp());
         lines.push(format!("- [{version} ({date_str})](#{anchor_id})"));
     }
@@ -257,8 +299,7 @@ async fn generate_game_list_md(
 
     for e in &game_all {
         let version = &e.rsp.version;
-        let date = e.updated_at.parse::<DateTime<Utc>>()?.with_timezone(&utc8);
-        let date_str = date.format("%Y/%m/%d %H:%M:%S");
+        let (date, date_str) = parse_date_utc8(&e.updated_at)?;
         let anchor_id = format!("ver-{version}-{}", date.timestamp());
 
         let packed_size: i64 = e
@@ -274,23 +315,12 @@ async fn generate_game_list_md(
         lines.push(format!(
             "<h2 id=\"{anchor_id}\">{version} ({date_str})</h2>\n"
         ));
-        lines.push("<table>".into());
-        lines.push(format!(
-            "  <tr><td>Unpacked Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(unpacked_size)
-        ));
-        lines.push(format!(
-            "  <tr><td>Packed Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(packed_size)
-        ));
-        lines.push("</table>\n".into());
+        lines.extend(size_table_html(unpacked_size, packed_size));
         lines.push("|File|MD5 Checksum|Size|".into());
         lines.push("|:--|:--|--:|".into());
 
         for f in &e.rsp.pkg.packs {
-            let name = url_filename(&f.url);
-            let size = format_bytes(f.package_size.parse()?);
-            lines.push(format!("|[{name}]({})|`{}`|{size}|", f.url, f.md5));
+            lines.push(file_row_md(&f.url, &f.md5, &f.package_size)?);
         }
         lines.push(String::new());
     }
@@ -303,18 +333,14 @@ async fn generate_patch_list_md(
     target: &GameTarget,
     output_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base = output_dir
-        .join("akEndfield/launcher/game")
-        .join(&target.dir_name);
+    let base = game_base_path(output_dir, &target.dir_name);
     let all_path = base.join("all_patch.json");
     if !all_path.exists() {
         return Ok(());
     }
 
-    let patch_all: Vec<StoredData<LauncherLatestGame>> =
-        from_str(&read_to_string(&all_path).await?)?;
+    let patch_all: Vec<StoredData<LauncherLatestGame>> = read_json_file(&all_path).await?;
 
-    let utc8 = FixedOffset::east_opt(8 * 3600).unwrap();
     let mut lines: Vec<String> = Vec::new();
 
     lines.push(format!("# Game Patch Packages ({})\n", target.name));
@@ -326,8 +352,7 @@ async fn generate_patch_list_md(
 
         let version = &e.rsp.version;
         let req_version = &e.rsp.request_version;
-        let date = e.updated_at.parse::<DateTime<Utc>>()?.with_timezone(&utc8);
-        let date_str = date.format("%Y/%m/%d %H:%M:%S");
+        let (date, date_str) = parse_date_utc8(&e.updated_at)?;
         let anchor_id = format!("ver-{req_version}-{version}-{}", date.timestamp());
         lines.push(format!(
             "- [{req_version} → {version} ({date_str})](#{anchor_id})"
@@ -342,8 +367,7 @@ async fn generate_patch_list_md(
 
         let version = &e.rsp.version;
         let req_version = &e.rsp.request_version;
-        let date = e.updated_at.parse::<DateTime<Utc>>()?.with_timezone(&utc8);
-        let date_str = date.format("%Y/%m/%d %H:%M:%S");
+        let (date, date_str) = parse_date_utc8(&e.updated_at)?;
         let anchor_id = format!("ver-{req_version}-{version}-{}", date.timestamp());
 
         let packed_size: i64 = patch
@@ -357,29 +381,16 @@ async fn generate_patch_list_md(
         lines.push(format!(
             "<h2 id=\"{anchor_id}\">{req_version} → {version} ({date_str})</h2>\n"
         ));
-        lines.push("<table>".into());
-        lines.push(format!(
-            "  <tr><td>Unpacked Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(unpacked_size)
-        ));
-        lines.push(format!(
-            "  <tr><td>Packed Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(packed_size)
-        ));
-        lines.push("</table>\n".into());
+        lines.extend(size_table_html(unpacked_size, packed_size));
         lines.push("|File|MD5 Checksum|Size|".into());
         lines.push("|:--|:--|--:|".into());
 
         if !patch.url.is_empty() {
-            let name = url_filename(&patch.url);
-            let size = format_bytes(patch.package_size.parse()?);
-            lines.push(format!("|[{name}]({})|`{}`|{size}|", patch.url, patch.md5));
+            lines.push(file_row_md(&patch.url, &patch.md5, &patch.package_size)?);
         }
 
         for f in &patch.patches {
-            let name = url_filename(&f.url);
-            let size = format_bytes(f.package_size.parse()?);
-            lines.push(format!("|[{name}]({})|`{}`|{size}|", f.url, f.md5));
+            lines.push(file_row_md(&f.url, &f.md5, &f.package_size)?);
         }
         lines.push(String::new());
     }
@@ -406,11 +417,11 @@ async fn generate_resource_list_md(
     ];
 
     const PLATFORMS: &[&str] = &["Windows", "Android", "iOS", "PlayStation"];
-    let utc8 = FixedOffset::east_opt(8 * 3600).unwrap();
 
     for platform in PLATFORMS {
         let resource_path = output_dir
-            .join("akEndfield/launcher/game_resources")
+            .join(LAUNCHER_BASE)
+            .join("game_resources")
             .join(channel_str)
             .join(platform)
             .join("all.json");
@@ -419,7 +430,7 @@ async fn generate_resource_list_md(
         }
 
         let game_all: Vec<StoredData<LauncherLatestGameResources>> =
-            from_str(&read_to_string(&resource_path).await?)?;
+            read_json_file(&resource_path).await?;
         let mut res_version_map: IndexMap<String, ResVersionEntry> = IndexMap::new();
         for e in &game_all {
             let res_ver = &e.rsp.res_version;
@@ -439,12 +450,7 @@ async fn generate_resource_list_md(
         md_texts.push("|--|--|--|--|--|".into());
 
         for entry in res_version_map.values() {
-            let date = entry
-                .rsp
-                .updated_at
-                .parse::<DateTime<Utc>>()?
-                .with_timezone(&utc8);
-            let date_str = date.format("%Y/%m/%d %H:%M:%S");
+            let (_, date_str) = parse_date_utc8(&entry.rsp.updated_at)?;
 
             let initial = entry.rsp.rsp.resources.iter().find(|r| r.name == "initial");
             let main = entry.rsp.rsp.resources.iter().find(|r| r.name == "main");
@@ -485,7 +491,8 @@ async fn generate_resource_list_md(
     }
 
     let out_path = output_dir
-        .join("akEndfield/launcher/game_resources")
+        .join(LAUNCHER_BASE)
+        .join("game_resources")
         .join(channel_str)
         .join("list.md");
     write(out_path, md_texts.join("\n")).await?;
@@ -538,6 +545,21 @@ const LAUNCHER_SETTINGS: LauncherSettings = LauncherSettings {
     },
 };
 
+const LAUNCHER_REGIONS: [LauncherRegion; 2] = [
+    LauncherRegion {
+        id: Region::Os,
+        apps: &["EndField", "Official"],
+        code: Some(app_code::launcher::OS_WIN_REL),
+        channel: channel::OS_WIN_REL,
+    },
+    LauncherRegion {
+        id: Region::Cn,
+        apps: &["EndField", "Arknights", "Official"],
+        code: Some(app_code::launcher::CN_WIN_REL),
+        channel: channel::CN_WIN_REL,
+    },
+];
+
 async fn generate_launcher_md(
     launcher_type: LauncherType,
     output_dir: &Path,
@@ -547,24 +569,9 @@ async fn generate_launcher_md(
         LauncherType::Zip => &LAUNCHER_SETTINGS.zip,
     };
 
-    let regions = [
-        LauncherRegion {
-            id: Region::Os,
-            apps: &["EndField", "Official"],
-            code: Some(app_code::launcher::OS_WIN_REL),
-            channel: channel::OS_WIN_REL,
-        },
-        LauncherRegion {
-            id: Region::Cn,
-            apps: &["EndField", "Arknights", "Official"],
-            code: Some(app_code::launcher::CN_WIN_REL),
-            channel: channel::CN_WIN_REL,
-        },
-    ];
-
     let mut lines: Vec<String> = vec![format!("# {}\n", settings.title)];
 
-    for r in &regions {
+    for r in &LAUNCHER_REGIONS {
         for app in r.apps {
             lines.push(format!(
                 "- [{} {}](#launcher-{}-{})",
@@ -577,12 +584,10 @@ async fn generate_launcher_md(
     }
     lines.push("\n".into());
 
-    let utc8 = FixedOffset::east_opt(8 * 3600).unwrap();
-
-    for region in regions {
+    for region in &LAUNCHER_REGIONS {
         for app_name in region.apps {
             let json_path = output_dir
-                .join("akEndfield/launcher")
+                .join(LAUNCHER_BASE)
                 .join(settings.sub_dir)
                 .join(app_name)
                 .join(region.channel.to_string())
@@ -592,7 +597,7 @@ async fn generate_launcher_md(
                 continue;
             }
 
-            let json_data: Vec<StoredData<Value>> = from_str(&read_to_string(&json_path).await?)?;
+            let json_data: Vec<StoredData<Value>> = read_json_file(&json_path).await?;
 
             lines.push(format!(
                 "<h2 id=\"launcher-{}-{}\">{} {}</h2>\n",
@@ -617,8 +622,7 @@ async fn generate_launcher_md(
                 let file_name = url_filename(url);
                 let file_link = format!("[{file_name}]({url})");
 
-                let date = e.updated_at.parse::<DateTime<Utc>>()?.with_timezone(&utc8);
-                let date_str = date.format("%Y/%m/%d %H:%M:%S").to_string();
+                let (_, date_str) = parse_date_utc8(&e.updated_at)?;
 
                 let version = rsp.get("version").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -661,7 +665,7 @@ async fn generate_launcher_md(
     }
 
     let out_path = output_dir
-        .join("akEndfield/launcher")
+        .join(LAUNCHER_BASE)
         .join(settings.sub_dir)
         .join("list.md");
     write(out_path, lines.join("\n")).await?;
@@ -713,7 +717,7 @@ async fn fetch_and_save_latest_game(
         };
 
         save_result(
-            &["akEndfield", "launcher", "game", &target.dir_name],
+            &[LAUNCHER_BASE, "game", &target.dir_name],
             &pretty_rsp.rsp.version.clone(),
             &pretty_rsp,
             true,
@@ -734,9 +738,7 @@ async fn fetch_and_save_latest_game_patches(
     for target in targets {
         println!("Fetching latest game patch {}", target.name);
 
-        let base = output_dir
-            .join("akEndfield/launcher/game")
-            .join(&target.dir_name);
+        let base = game_base_path(output_dir, &target.dir_name);
         let game_all_path = base.join("all.json");
         let patch_all_path = base.join("all_patch.json");
 
@@ -744,11 +746,10 @@ async fn fetch_and_save_latest_game_patches(
             continue;
         }
 
-        let game_all: Vec<StoredData<LauncherLatestGame>> =
-            from_str(&read_to_string(&game_all_path).await?)?;
+        let game_all: Vec<StoredData<LauncherLatestGame>> = read_json_file(&game_all_path).await?;
 
         let mut patch_all: Vec<StoredData<LauncherLatestGame>> = if patch_all_path.exists() {
-            from_str(&read_to_string(&patch_all_path).await?)?
+            read_json_file(&patch_all_path).await?
         } else {
             Vec::new()
         };
@@ -865,7 +866,8 @@ async fn fetch_and_save_latest_game_resources(
     ];
 
     let game_all_path = output_dir
-        .join("akEndfield/launcher/game")
+        .join(LAUNCHER_BASE)
+        .join("game")
         .join(channel_str)
         .join("all.json");
 
@@ -874,8 +876,7 @@ async fn fetch_and_save_latest_game_resources(
         return Ok(());
     }
 
-    let game_all: Vec<StoredData<LauncherLatestGame>> =
-        from_str(&read_to_string(&game_all_path).await?)?;
+    let game_all: Vec<StoredData<LauncherLatestGame>> = read_json_file(&game_all_path).await?;
 
     let re = regex::Regex::new(r"_([^/]+)/.+?$")?;
 
@@ -938,13 +939,7 @@ async fn fetch_and_save_latest_game_resources(
             };
 
             save_result(
-                &[
-                    "akEndfield",
-                    "launcher",
-                    "game_resources",
-                    channel_str,
-                    &platform_str,
-                ],
+                &[LAUNCHER_BASE, "game_resources", channel_str, &platform_str],
                 &entry.version,
                 &pretty_rsp,
                 !is_latest_wrote,
@@ -966,21 +961,6 @@ async fn fetch_and_save_latest_launcher(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Fetching latest launcher...");
 
-    let regions = [
-        LauncherRegion {
-            id: Region::Os,
-            apps: &["EndField", "Official"],
-            code: Some(app_code::launcher::OS_WIN_REL),
-            channel: channel::OS_WIN_REL,
-        },
-        LauncherRegion {
-            id: Region::Cn,
-            apps: &["EndField", "Arknights", "Official"],
-            code: Some(app_code::launcher::CN_WIN_REL),
-            channel: channel::CN_WIN_REL,
-        },
-    ];
-
     let ignore_rules = [
         IgnoreRule {
             path: vec!["rsp".into(), "zip_package_url".into()],
@@ -992,7 +972,7 @@ async fn fetch_and_save_latest_launcher(
         },
     ];
 
-    for region in &regions {
+    for region in &LAUNCHER_REGIONS {
         for app in region.apps {
             let rsp = latest_launcher(
                 client,
@@ -1018,10 +998,7 @@ async fn fetch_and_save_latest_launcher(
             )
             .await?;
 
-            let region_str = match region.id {
-                Region::Os => "os",
-                Region::Cn => "cn",
-            };
+            let region_str = region.id.as_str();
             println!(
                 "Fetched latestLauncher: v{}, {}, {}",
                 rsp.version, region_str, app
@@ -1051,7 +1028,7 @@ async fn fetch_and_save_latest_launcher(
 
             let version = pretty_rsp.rsp.version.clone();
             save_result(
-                &["akEndfield", "launcher", "launcher", app, &channel_str],
+                &[LAUNCHER_BASE, "launcher", app, &channel_str],
                 &version,
                 &pretty_rsp,
                 true,
@@ -1062,7 +1039,7 @@ async fn fetch_and_save_latest_launcher(
 
             let version_exe = pretty_rsp_exe.rsp.version.clone();
             save_result(
-                &["akEndfield", "launcher", "launcherExe", app, &channel_str],
+                &[LAUNCHER_BASE, "launcherExe", app, &channel_str],
                 &version_exe,
                 &pretty_rsp_exe,
                 true,
