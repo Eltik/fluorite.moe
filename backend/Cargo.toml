@@ -19,6 +19,14 @@ path = "src/bin/endfield_config_test.rs"
 name = "zip-range-test"
 path = "src/bin/zip_range_test.rs"
 
+[[bin]]
+name = "fairguard-test"
+path = "src/bin/fairguard_test.rs"
+
+[[bin]]
+name = "vfs-test"
+path = "src/bin/vfs_test.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
@@ -32,3 +40,4 @@ indexmap = "2.13.0"
 semver = "1.0.27"
 futures = "0.3.32"
 flate2 = "1.1.9"
+lz4_flex = "0.12.0"

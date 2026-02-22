@@ -1,4 +1,6 @@
 .DS_Store
 .claude/
-RESEARCH.md
-PLAN.md
+/PLANS
+CLAUDE.md
+/output
+/tasks

@@ -206,3 +206,13 @@ pub fn rc4(data: &mut [u8], key: &[u8]) {
         *byte ^= k.wrapping_sub(0x61);
     }
 }
+
+/// Detect if a compressed block is FairGuard-encrypted.
+/// YarikStudio heuristic: first 32 bytes contain more than 5 occurrences of 0xA6.
+pub fn is_encrypted(data: &[u8]) -> bool {
+    if data.len() < 32 {
+        return false;
+    }
+    let count = data[..32].iter().filter(|&&b| b == 0xA6).count();
+    count > 5
+}
