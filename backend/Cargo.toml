@@ -27,6 +27,18 @@ path = "src/bin/fairguard_test.rs"
 name = "vfs-test"
 path = "src/bin/vfs_test.rs"
 
+[[bin]]
+name = "gameassembly-extract"
+path = "src/bin/gameassembly_extract.rs"
+
+[[bin]]
+name = "magic-search"
+path = "src/bin/magic_search.rs"
+
+[[bin]]
+name = "smiley-decrypt-test"
+path = "src/bin/smiley_decrypt_test.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }

@@ -4,4 +4,5 @@ pub mod lz4_inv;
 pub mod unityfs_header;
 pub mod vfs_aes;
 pub mod vfs_decrypt;
+pub mod wwise_pck;
 pub mod zip_range;

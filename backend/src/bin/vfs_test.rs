@@ -40,6 +40,18 @@ fn hex_dump(data: &[u8], max_bytes: usize) {
     }
 }
 
+/// Detect the format of a .chk file by examining its header.
+fn detect_format(data: &[u8]) -> &'static str {
+    if data.len() >= 8 && vfs_decrypt::is_valid_header(data) {
+        return "VFS";
+    }
+    // :)xD magic = 0x3A297844 stored as bytes [3A, 29, 78, 44]
+    if data.len() >= 4 && data[0] == 0x3A && data[1] == 0x29 && data[2] == 0x78 && data[3] == 0x44 {
+        return ":)xD";
+    }
+    "Unknown"
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     if bytes == 0 {
@@ -55,14 +67,11 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Try to load a cached .chk file for the given VFS directory.
+/// Loads any cached file regardless of format (VFS, :)xD, or unknown).
 fn load_cached(output_dir: &str, dir: &str) -> Option<Vec<u8>> {
     let path = format!("{}/{}_smallest.chk", output_dir, dir);
     let data = std::fs::read(&path).ok()?;
-    if data.len() >= 8 && vfs_decrypt::is_valid_header(&data) {
-        Some(data)
-    } else {
-        None
-    }
+    if data.len() >= 8 { Some(data) } else { None }
 }
 
 /// Download the smallest .chk file for a VFS directory from the ZIP archive.
@@ -87,14 +96,22 @@ async fn download_smallest(
         println!("    Downloading {} ({})...", name, format_bytes(*size));
         match cd.extract(client, name).await {
             Ok(file_data) => {
+                // Save unconditionally for analysis
+                let save_path = format!("{}/{}_smallest.chk", output_dir, dir);
+                let _ = std::fs::write(&save_path, &file_data);
+
                 if vfs_decrypt::is_valid_header(&file_data) {
-                    let save_path = format!("{}/{}_smallest.chk", output_dir, dir);
-                    let _ = std::fs::write(&save_path, &file_data);
                     println!("    VFS valid, saved to cache");
                     return Some(file_data);
                 }
-                println!("    First 64 bytes (not VFS):");
-                hex_dump(&file_data, 64);
+                // Non-VFS file — still return it for format detection
+                if file_data.len() >= 4 {
+                    println!(
+                        "    Not VFS (magic: {:02x}{:02x}{:02x}{:02x}), saved for analysis",
+                        file_data[0], file_data[1], file_data[2], file_data[3]
+                    );
+                }
+                return Some(file_data);
             }
             Err(e) => println!("    Download error: {}", e),
         }
@@ -190,33 +207,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n[3] Processing VFS directories...\n");
 
+    let mut smiley_count = 0u32;
+    let mut vfs_count = 0u32;
+    let mut unknown_count = 0u32;
+
     for dir in &vfs_dirs {
         println!("--- {} ---", dir);
 
         let data = if let Some(cached) = load_cached(output_dir, dir) {
+            let format = detect_format(&cached);
             println!(
-                "    Loaded from cache ({}, VFS valid)",
-                format_bytes(cached.len() as u64)
+                "    Loaded from cache ({}, {})",
+                format_bytes(cached.len() as u64),
+                format
             );
             cached
         } else {
             match download_smallest(&client, &cd, output_dir, dir).await {
                 Some(d) => d,
                 None => {
-                    println!("    SKIP: no VFS-valid .chk file found");
+                    println!("    SKIP: no .chk file found");
                     println!();
+                    unknown_count += 1;
                     continue;
                 }
             }
         };
 
-        match backend::extraction::unityfs_header::process_chk_file(&data) {
-            Ok(assets) => print_pipeline_results(&assets, 10),
-            Err(e) => println!("    ERROR: {}", e),
+        let format = detect_format(&data);
+        match format {
+            "VFS" => {
+                vfs_count += 1;
+                match backend::extraction::unityfs_header::process_chk_file(&data) {
+                    Ok(assets) => print_pipeline_results(&assets, 10),
+                    Err(e) => println!("    ERROR: {}", e),
+                }
+            }
+            ":)xD" => {
+                smiley_count += 1;
+                println!("    :)xD format detected — {} total bytes", data.len());
+                println!("    First 128 bytes:");
+                hex_dump(&data, 128);
+            }
+            _ => {
+                unknown_count += 1;
+                println!("    Unknown format — {} total bytes", data.len());
+                println!("    First 128 bytes:");
+                hex_dump(&data, 128);
+            }
         }
 
         println!();
     }
+
+    println!("=== Format Summary ===");
+    println!("  VFS:     {}", vfs_count);
+    println!("  :)xD:    {}", smiley_count);
+    println!("  Unknown: {}", unknown_count);
 
     println!("=== VFS Test Complete ===");
     Ok(())
