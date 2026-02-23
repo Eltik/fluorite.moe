@@ -7,6 +7,7 @@ use backend::core::endfield::{
 };
 use backend::core::hypergryph::launcher::Platform;
 use backend::extraction::vfs_decrypt;
+use backend::extraction::wwise_pck;
 use backend::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
 
@@ -245,15 +246,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ":)xD" => {
                 smiley_count += 1;
-                println!("    :)xD format detected — {} total bytes", data.len());
-                println!("    First 128 bytes:");
-                hex_dump(&data, 128);
+                match wwise_pck::decrypt_header(&data) {
+                    Ok((decrypted, header_size)) => {
+                        match wwise_pck::parse_header(&decrypted, header_size) {
+                            Ok(pck) => {
+                                let lang_names: Vec<&str> =
+                                    pck.languages.iter().map(|(_, n)| n.as_str()).collect();
+                                println!(
+                                    "    Wwise PCK: {} banks, {} streams, {} externals",
+                                    pck.banks.len(),
+                                    pck.streams.len(),
+                                    pck.externals.len()
+                                );
+                                println!("    Languages: {:?}", lang_names);
+
+                                // Verify first audio entry has valid magic
+                                if let Some(entry) = pck.all_files().next() {
+                                    match wwise_pck::extract_audio(&data, entry) {
+                                        Ok(audio) if audio.len() >= 4 => {
+                                            let magic =
+                                                std::str::from_utf8(&audio[..4]).unwrap_or("????");
+                                            println!(
+                                                "    First audio: id={}, size={}, magic=\"{}\"",
+                                                entry.id,
+                                                format_bytes(entry.size as u64),
+                                                magic
+                                            );
+                                        }
+                                        Ok(_) => println!("    First audio: too small"),
+                                        Err(e) => println!("    First audio extract error: {}", e),
+                                    }
+                                }
+                            }
+                            Err(e) => println!("    Parse error: {}", e),
+                        }
+                    }
+                    Err(e) => println!("    Decrypt error: {}", e),
+                }
             }
             _ => {
                 unknown_count += 1;
-                println!("    Unknown format — {} total bytes", data.len());
-                println!("    First 128 bytes:");
-                hex_dump(&data, 128);
+                println!("    Unknown format — {}", format_bytes(data.len() as u64));
+
+                // Entropy analysis (Shannon entropy over first 4KB)
+                let sample = &data[..data.len().min(4096)];
+                let mut freq = [0u32; 256];
+                for &b in sample {
+                    freq[b as usize] += 1;
+                }
+                let len_f = sample.len() as f64;
+                let entropy: f64 = freq
+                    .iter()
+                    .filter(|&&c| c > 0)
+                    .map(|&c| {
+                        let p = c as f64 / len_f;
+                        -p * p.log2()
+                    })
+                    .sum();
+                println!("    Entropy (first 4KB): {:.2} bits/byte", entropy);
+                if entropy > 7.9 {
+                    println!("    → High entropy — likely encrypted");
+                } else if entropy > 6.0 {
+                    println!("    → Moderate entropy — possibly compressed");
+                } else {
+                    println!("    → Low entropy — likely plaintext/structured");
+                }
+
+                // Try VFS header validation
+                if data.len() >= 8 {
+                    let a = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    let b = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                    let ax = a ^ 0x4A92F0CD;
+                    let c1 = (4u32.wrapping_mul(ax)) & 0xFFFF0000;
+                    let c2 = ax.rotate_right(14);
+                    let expected = c1 ^ c2 ^ 0xD8B1E637;
+                    if b == expected {
+                        println!("    → VFS checksum VALID (but detect_format missed it?)");
+                    } else {
+                        println!("    → VFS checksum invalid (not VFS-encrypted)");
+                    }
+                }
+
+                // Try Wwise XOR-Mul with common seeds
+                let try_seeds: &[(u32, &str)] = &[
+                    (0, "seed=0"),
+                    (1, "seed=1"),
+                    (data.len() as u32, "seed=file_size"),
+                ];
+                for &(seed, label) in try_seeds {
+                    let mut probe = data[..data.len().min(16)].to_vec();
+                    wwise_pck::decipher_inplace(&mut probe, seed, 0);
+                    let magic =
+                        std::str::from_utf8(&probe[..4.min(probe.len())]).unwrap_or("(non-utf8)");
+                    if magic == "AKPK" || magic == ":)xD" || magic == "BKHD" || magic == "RIFF" {
+                        println!("    → Wwise probe {}: magic=\"{}\" — MATCH!", label, magic);
+                    }
+                }
+
+                println!("    First 64 bytes:");
+                hex_dump(&data, 64);
             }
         }
 

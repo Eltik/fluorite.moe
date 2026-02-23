@@ -1,8 +1,9 @@
-/// LZ4Inv decompressor — a modified LZ4 variant used by Arknights Endfield VFS.
-/// Differences from standard LZ4:
-/// - Token nibbles are bit-interleaved (masks 0b00110011 / 0b11001100)
-/// - Back-reference offset is big-endian u16
-/// Source: AnimeStudio — LZ4/LZ4Inv.cs
+//! LZ4Inv decompressor — a modified LZ4 variant used by Arknights Endfield VFS.
+//! Differences from standard LZ4:
+//! - Token nibbles are bit-interleaved (masks 0b00110011 / 0b11001100)
+//! - Back-reference offset is big-endian u16
+//!
+//! Source: AnimeStudio — LZ4/LZ4Inv.cs
 
 /// Parse the bit-interleaved token byte into (literal_count, match_count).
 fn parse_token(val: u8) -> (u8, u8) {

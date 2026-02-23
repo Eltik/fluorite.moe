@@ -104,11 +104,11 @@ fn aes_encrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 11]) -> [u8; 16] 
     add_round_key(&mut state, &round_keys[0]);
 
     // Rounds 1-9: SubBytes, ShiftRows, MixColumns, AddRoundKey
-    for round in 1..10 {
+    for round_key in round_keys.iter().take(10).skip(1) {
         sub_bytes(&mut state, &VFS_AES_SBOX);
         shift_rows(&mut state);
         mix_columns(&mut state);
-        add_round_key(&mut state, &round_keys[round]);
+        add_round_key(&mut state, round_key);
     }
 
     // Final round (no MixColumns)

@@ -1,28 +1,28 @@
-/// Wwise PCK (AudioKinetic Package) decryption and parsing for Arknights Endfield.
-///
-/// Endfield wraps Wwise PCK files with the magic `:)xD` (0x3A297844) instead of
-/// the standard `AKPK`. The header and audio data are encrypted using HyperGryph's
-/// custom XOR-Mul stream cipher (`HGCipherHelper::DecipherInplace`).
-///
-/// File layout:
-///   [0x00] 4 bytes  — magic `:)xD`
-///   [0x04] 4 bytes  — header_size (u32 LE)
-///   [0x08] 4 bytes  — unknown / reserved
-///   [0x0C] header_size-4 bytes — encrypted header body
-///   [8+header_size ..] — encrypted audio data
-///
-/// Decrypted header body (no version field in Endfield variant):
-///   u32 lang_map_size
-///   u32 banks_table_size
-///   u32 streams_table_size
-///   u32 externals_table_size
-///   [lang_map_size bytes]      — language map
-///   [banks_table_size bytes]   — bank file entries (20-byte records)
-///   [streams_table_size bytes] — stream file entries (20 or 24-byte records)
-///   [externals_table_size bytes] — external file entries (24-byte records)
-///
-/// Source: AkSoundEngine.dll / libAkSoundEngine.so (DWARF symbols on Android)
-/// Reference: isHarryh/isharryh.github.io — Endfield CBT3 RE: PCK Files Decryption
+//! Wwise PCK (AudioKinetic Package) decryption and parsing for Arknights Endfield.
+//!
+//! Endfield wraps Wwise PCK files with the magic `:)xD` (0x3A297844) instead of
+//! the standard `AKPK`. The header and audio data are encrypted using HyperGryph's
+//! custom XOR-Mul stream cipher (`HGCipherHelper::DecipherInplace`).
+//!
+//! File layout:
+//!   [0x00] 4 bytes  — magic `:)xD`
+//!   [0x04] 4 bytes  — header_size (u32 LE)
+//!   [0x08] 4 bytes  — unknown / reserved
+//!   [0x0C] header_size-4 bytes — encrypted header body
+//!   [8+header_size ..] — encrypted audio data
+//!
+//! Decrypted header body (no version field in Endfield variant):
+//!   u32 lang_map_size
+//!   u32 banks_table_size
+//!   u32 streams_table_size
+//!   u32 externals_table_size
+//!   [lang_map_size bytes]      — language map
+//!   [banks_table_size bytes]   — bank file entries (20-byte records)
+//!   [streams_table_size bytes] — stream file entries (20 or 24-byte records)
+//!   [externals_table_size bytes] — external file entries (24-byte records)
+//!
+//! Source: AkSoundEngine.dll / libAkSoundEngine.so (DWARF symbols on Android)
+//! Reference: isHarryh/isharryh.github.io — Endfield CBT3 RE: PCK Files Decryption
 
 /// Magic bytes: `:)xD` in ASCII
 pub const SMILEY_MAGIC: [u8; 4] = [0x3A, 0x29, 0x78, 0x44];

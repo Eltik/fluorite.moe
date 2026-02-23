@@ -1,5 +1,5 @@
-/// VFS container encryption constants for Arknights Endfield (release).
-/// Source: AnimeStudio — Crypto/CryptoHelper.cs, Crypto/VFSUtils.cs
+//! VFS container encryption constants for Arknights Endfield (release).
+//! Source: AnimeStudio — Crypto/CryptoHelper.cs, Crypto/VFSUtils.cs
 
 // ── Custom S-box (NOT standard Rijndael) ──
 

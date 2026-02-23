@@ -39,6 +39,14 @@ path = "src/bin/magic_search.rs"
 name = "smiley-decrypt-test"
 path = "src/bin/smiley_decrypt_test.rs"
 
+[[bin]]
+name = "index-test"
+path = "src/bin/index_test.rs"
+
+[[bin]]
+name = "scan-assets"
+path = "src/bin/scan_assets.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
@@ -53,3 +61,4 @@ semver = "1.0.27"
 futures = "0.3.32"
 flate2 = "1.1.9"
 lz4_flex = "0.12.0"
+base64 = "0.22.1"
