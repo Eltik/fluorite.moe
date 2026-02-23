@@ -51,6 +51,30 @@ path = "src/bin/scan_assets.rs"
 name = "extract-json"
 path = "src/bin/extract_json.rs"
 
+[[bin]]
+name = "decrypt-probe"
+path = "src/bin/decrypt_probe.rs"
+
+[[bin]]
+name = "dll-analyze"
+path = "src/bin/dll_analyze.rs"
+
+[[bin]]
+name = "dll-investigate"
+path = "src/bin/dll_investigate.rs"
+
+[[bin]]
+name = "dll-dispatch"
+path = "src/bin/dll_dispatch.rs"
+
+[[bin]]
+name = "dll-descriptor"
+path = "src/bin/dll_descriptor.rs"
+
+[[bin]]
+name = "asset-probe"
+path = "src/bin/asset_probe.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
@@ -68,3 +92,9 @@ lz4_flex = "0.12.0"
 base64 = "0.22.1"
 unity-asset = "0.2.0"
 unity-asset-binary = "0.2.0"
+unity-asset-core = "0.2.0"
+aes = "0.8"
+goblin = "0.8"
+iced-x86 = { version = "1.21", features = ["decoder", "intel"] }
+texture2ddecoder = "0.1"
+image = "0.25"
