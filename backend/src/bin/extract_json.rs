@@ -1,5 +1,5 @@
-/// Extract game JSON/text files from VFS SerializedFile data.
-/// Pipeline: config → ZIP → .chk → VFS decrypt → UnityFS → SerializedFile → TextAsset
+/// Extract game JSON/text files and MonoBehaviour data from VFS SerializedFile data.
+/// Pipeline: config → ZIP → .chk → VFS decrypt → UnityFS → SerializedFile → TextAsset + MonoBehaviour
 use backend::core::endfield::{
     config::{ResolveParams, resolve_game_config},
     constants::{app_code, channel, sub_channel},
@@ -9,8 +9,9 @@ use backend::extraction::unityfs_header;
 use backend::extraction::vfs_decrypt;
 use backend::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
-use std::collections::HashSet;
-use unity_asset_binary::asset::SerializedFileParser;
+use std::collections::{HashMap, HashSet};
+use unity_asset_binary::asset::{ObjectInfo, SerializedFile, SerializedFileParser};
+use unity_asset_binary::object::ObjectHandle;
 
 /// VFS container directories.
 const VFS_DIRS: &[(&str, &str)] = &[("7064D8E2", "bundles/configs"), ("0CE8FA57", "textures")];
@@ -80,6 +81,94 @@ fn extract_text_assets(data: Vec<u8>) -> Vec<(String, Vec<u8>)> {
         {
             results.push(pair);
         }
+    }
+
+    results
+}
+
+/// Get the script type name for a MonoBehaviour object from TypeTree metadata.
+///
+/// Strategy: check TypeTree root node, then class_name, then script_id hex.
+/// MonoBehaviour TypeTrees always have root type_name "MonoBehaviour", but each
+/// distinct C# script type has a unique `script_id` hash in its `SerializedType`.
+/// We use the script_id to group objects by type, and resolve the actual name
+/// from the object's `m_Name` field later.
+fn get_script_type_name(sf: &SerializedFile, info: &ObjectInfo) -> String {
+    if info.type_index >= 0
+        && let Some(st) = sf.types.get(info.type_index as usize)
+    {
+        // Check TypeTree root node for the actual C# class name
+        if !st.type_tree.nodes.is_empty() {
+            let root_type = &st.type_tree.nodes[0].type_name;
+            if !root_type.is_empty() && root_type != "MonoBehaviour" {
+                return root_type.clone();
+            }
+        }
+        // Check class_name field (populated for ref types in version >= 21)
+        if !st.class_name.is_empty() {
+            return st.class_name.clone();
+        }
+        // Use script_id hash as type discriminator
+        if st.script_id != [0u8; 16] {
+            return format!(
+                "script_{}",
+                st.script_id
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
+        }
+    }
+    format!("class_{}", info.type_id)
+}
+
+/// Extracted MonoBehaviour data ready for saving.
+struct MonoBehaviourExport {
+    type_name: String,
+    obj_name: String,
+    json: String,
+}
+
+/// Extract MonoBehaviour objects (classID=114) from a SerializedFile using TypeTree deserialization.
+fn extract_monobehaviours(data: Vec<u8>) -> Vec<MonoBehaviourExport> {
+    let sf = match SerializedFileParser::from_bytes(data) {
+        Ok(sf) => sf,
+        Err(_) => return Vec::new(),
+    };
+
+    if !sf.enable_type_tree {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+
+    for obj in sf.objects_of_type(114) {
+        let type_name = get_script_type_name(&sf, obj);
+        let handle = ObjectHandle::new(&sf, obj);
+
+        let obj_name = handle
+            .peek_name()
+            .ok()
+            .flatten()
+            .filter(|n| !n.is_empty())
+            .map_or_else(|| format!("obj_{}", obj.path_id), |n| sanitize_filename(&n));
+
+        let unity_obj = match handle.read() {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        let props = unity_obj.class.properties();
+        let json = match serde_json::to_string_pretty(props) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        results.push(MonoBehaviourExport {
+            type_name: sanitize_filename(&type_name),
+            obj_name,
+            json,
+        });
     }
 
     results
@@ -173,12 +262,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = "./output/gamedata";
     std::fs::create_dir_all(output_dir)?;
 
-    println!("\n[3] Extracting TextAssets...\n");
+    let mono_dir = format!("{}/monobehaviour", output_dir);
+    std::fs::create_dir_all(&mono_dir)?;
+
+    println!("\n[3] Extracting assets...\n");
     let mut total_assets = 0u64;
     let mut total_json = 0u64;
     let mut total_text = 0u64;
     let mut total_bin = 0u64;
+    let mut total_mono = 0u64;
+    let mut mono_type_counts: HashMap<String, u64> = HashMap::new();
     let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_mono: HashSet<String> = HashSet::new();
 
     for (dir, desc) in VFS_DIRS {
         println!("--- {} ({}) ---", dir, desc);
@@ -256,11 +351,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 for sf_data in serialized_files {
-                    let text_assets = extract_text_assets(sf_data);
+                    let sf_data_clone = sf_data.clone();
 
+                    // Extract TextAssets (classID=49)
+                    let text_assets = extract_text_assets(sf_data);
                     for (ta_name, content) in text_assets {
                         if !seen_names.insert(ta_name.clone()) {
-                            continue; // Skip duplicates
+                            continue;
                         }
                         total_assets += 1;
 
@@ -279,6 +376,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
+
+                    // Extract MonoBehaviours (classID=114)
+                    let monos = extract_monobehaviours(sf_data_clone);
+                    for mono in monos {
+                        let key = format!("{}/{}", mono.type_name, mono.obj_name);
+                        if !seen_mono.insert(key.clone()) {
+                            continue;
+                        }
+
+                        let type_dir = format!("{}/{}", mono_dir, mono.type_name);
+                        let _ = std::fs::create_dir_all(&type_dir);
+
+                        let path = format!("{}/{}.json", type_dir, mono.obj_name);
+                        if std::fs::write(&path, &mono.json).is_ok() {
+                            total_mono += 1;
+                            *mono_type_counts.entry(mono.type_name.clone()).or_insert(0) += 1;
+                            println!(
+                                "    [MONO] {}/{} ({})",
+                                mono.type_name,
+                                mono.obj_name,
+                                format_bytes(mono.json.len() as u64)
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -286,11 +407,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("=== Extraction Summary ===");
-    println!("  TextAssets found: {}", total_assets);
-    println!("  JSON files:       {}", total_json);
-    println!("  Text files:       {}", total_text);
-    println!("  Binary files:     {}", total_bin);
-    println!("  Output directory: {}", output_dir);
+    println!("  TextAssets found:     {}", total_assets);
+    println!("    JSON files:         {}", total_json);
+    println!("    Text files:         {}", total_text);
+    println!("    Binary files:       {}", total_bin);
+    println!("  MonoBehaviours found: {}", total_mono);
+    if !mono_type_counts.is_empty() {
+        let mut types: Vec<_> = mono_type_counts.iter().collect();
+        types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for (type_name, count) in &types {
+            println!("    {}: {}", type_name, count);
+        }
+    }
+    println!("  Output directory:     {}", output_dir);
     println!("\n=== Done ===");
 
     Ok(())
