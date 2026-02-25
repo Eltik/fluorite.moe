@@ -239,7 +239,9 @@ fn disassemble_at(data: &[u8], pe: &PeInfo, file_offset: usize, count: usize, la
         file_offset >= start && file_offset < start + s.size_of_raw_data as usize
     });
     let rva = (file_offset as u32).saturating_sub(
-        containing_section.map(|s| s.pointer_to_raw_data).unwrap_or(0),
+        containing_section
+            .map(|s| s.pointer_to_raw_data)
+            .unwrap_or(0),
     ) + containing_section.map(|s| s.virtual_address).unwrap_or(0);
     let rip = pe.image_base + rva as u64;
 
@@ -358,7 +360,13 @@ fn pass_a_descriptor_dump(data: &[u8], pe: &PeInfo) {
             for i in 0..field_count_32 {
                 let field_off = file_off + i * 4;
                 if let Some(val) = read_u32_at(data, field_off) {
-                    println!("      field[{}] @ +0x{:02X}: 0x{:08X} ({})", i, i * 4, val, val);
+                    println!(
+                        "      field[{}] @ +0x{:02X}: 0x{:08X} ({})",
+                        i,
+                        i * 4,
+                        val,
+                        val
+                    );
                 }
             }
         }
@@ -367,7 +375,10 @@ fn pass_a_descriptor_dump(data: &[u8], pe: &PeInfo) {
     }
 
     // Also dump the string at CALL_SITE2_STRING_RVA
-    println!("  ━━━ Call Site 2 String Data (RVA 0x{:08X}) ━━━", CALL_SITE2_STRING_RVA);
+    println!(
+        "  ━━━ Call Site 2 String Data (RVA 0x{:08X}) ━━━",
+        CALL_SITE2_STRING_RVA
+    );
     if let Some(file_off) = pe.rva_to_file_offset(CALL_SITE2_STRING_RVA) {
         println!("    File offset: 0x{:08X}", file_off);
         if let Some(block) = read_at(data, file_off, 256) {
@@ -442,7 +453,10 @@ fn pass_b_pointer_chains(data: &[u8], pe: &PeInfo) {
 
     // Follow descriptor pointer chains
     for &(rva, label, payload_size, _) in &DESCRIPTOR_ENTRIES {
-        println!("  ━━━ Following pointers in {} (RVA 0x{:08X}) ━━━\n", label, rva);
+        println!(
+            "  ━━━ Following pointers in {} (RVA 0x{:08X}) ━━━\n",
+            label, rva
+        );
 
         let Some(file_off) = pe.rva_to_file_offset(rva) else {
             continue;
@@ -467,9 +481,17 @@ fn pass_b_pointer_chains(data: &[u8], pe: &PeInfo) {
                 // Check if it looks like an RVA (in valid section range)
                 if val > 0x1000 && val < 0x20000000 && pe.rva_to_file_offset(val).is_some() {
                     // Only print if not already covered by 8-byte analysis
-                    if i * 4 % 8 != 0 || !is_ga_va(read_u64_at(data, file_off + (i * 4 / 8) * 8).unwrap_or(0)) {
+                    if i * 4 % 8 != 0
+                        || !is_ga_va(read_u64_at(data, file_off + (i * 4 / 8) * 8).unwrap_or(0))
+                    {
                         let target_off = pe.rva_to_file_offset(val).unwrap();
-                        println!("    u32_field[{}] @ +0x{:02X}: RVA 0x{:08X} (file:0x{:08X})", i, i * 4, val, target_off);
+                        println!(
+                            "    u32_field[{}] @ +0x{:02X}: RVA 0x{:08X} (file:0x{:08X})",
+                            i,
+                            i * 4,
+                            val,
+                            target_off
+                        );
                         if let Some(s) = read_cstring(data, target_off) {
                             println!("      STRING: \"{}\"", s);
                         } else if let Some(block) = read_at(data, target_off, 32) {
@@ -592,8 +614,7 @@ fn pass_c_resolver_disassembly(data: &[u8], pe: &PeInfo) {
                     && let Ok(addr) = u64::from_str_radix(addr_str, 16)
                 {
                     let target_rva = (addr - GA_IMAGE_BASE) as u32;
-                    annotation =
-                        format!("{} ; call target RVA 0x{:08X}", annotation, target_rva);
+                    annotation = format!("{} ; call target RVA 0x{:08X}", annotation, target_rva);
                 }
 
                 println!("    0x{:08X}  {}{}", rva, output, annotation);
@@ -697,14 +718,22 @@ fn pass_d_beyond_xref(data: &[u8], pe: &PeInfo) {
             } else {
                 if current.len() >= 4 {
                     let abs_off = neighbor_start + str_start;
-                    println!("      0x{:08X} \"{}\"", abs_off, &current[..current.len().min(120)]);
+                    println!(
+                        "      0x{:08X} \"{}\"",
+                        abs_off,
+                        &current[..current.len().min(120)]
+                    );
                 }
                 current.clear();
             }
         }
         if current.len() >= 4 {
             let abs_off = neighbor_start + str_start;
-            println!("      0x{:08X} \"{}\"", abs_off, &current[..current.len().min(120)]);
+            println!(
+                "      0x{:08X} \"{}\"",
+                abs_off,
+                &current[..current.len().min(120)]
+            );
         }
 
         // Find RIP-relative code references to this string
@@ -799,7 +828,10 @@ fn pass_d_beyond_xref(data: &[u8], pe: &PeInfo) {
 
             // Search for the string's VA as an 8-byte pointer in data sections
             let string_va_bytes = string_va.to_le_bytes();
-            println!("\n    Searching for VA pointer (0x{:016X}) in data sections:", string_va);
+            println!(
+                "\n    Searching for VA pointer (0x{:016X}) in data sections:",
+                string_va
+            );
             for sec in &pe.sections {
                 let range = sec.file_range();
                 let sec_start = range.start.min(data.len());
@@ -816,12 +848,9 @@ fn pass_d_beyond_xref(data: &[u8], pe: &PeInfo) {
                             .iter()
                             .find(|s| {
                                 let start = s.pointer_to_raw_data as usize;
-                                ptr_file >= start
-                                    && ptr_file < start + s.size_of_raw_data as usize
+                                ptr_file >= start && ptr_file < start + s.size_of_raw_data as usize
                             })
-                            .map(|s| {
-                                (ptr_file as u32 - s.pointer_to_raw_data) + s.virtual_address
-                            })
+                            .map(|s| (ptr_file as u32 - s.pointer_to_raw_data) + s.virtual_address)
                             .unwrap_or(0);
                         println!(
                             "      Found in {} at file:0x{:08X} rva:0x{:08X}",
@@ -946,14 +975,16 @@ fn pass_e_hgp_exports(ga_data: &[u8], ga_pe: &PeInfo) {
                 let target =
                     (hgp_pe.image_base + exp.rva as u64 + 5).wrapping_add_signed(disp as i64);
                 let target_rva = (target - hgp_pe.image_base) as u32;
-                println!("    JMP target: 0x{:016X} (RVA 0x{:08X})", target, target_rva);
+                println!(
+                    "    JMP target: 0x{:016X} (RVA 0x{:08X})",
+                    target, target_rva
+                );
 
                 // What section does it land in?
-                if let Some(target_sec) = hgp_pe
-                    .sections
-                    .iter()
-                    .find(|s| target_rva >= s.virtual_address && target_rva < s.virtual_address + s.virtual_size)
-                {
+                if let Some(target_sec) = hgp_pe.sections.iter().find(|s| {
+                    target_rva >= s.virtual_address
+                        && target_rva < s.virtual_address + s.virtual_size
+                }) {
                     println!("    Lands in section: {}", target_sec.name);
 
                     // Dump 64 bytes at the VM entry point
@@ -974,11 +1005,14 @@ fn pass_e_hgp_exports(ga_data: &[u8], ga_pe: &PeInfo) {
     // Cross-reference: check if any GA descriptor pointers reference HGP's image base range
     println!("  === Cross-Reference: GA Descriptors → HGP Image Range ===\n");
     let hgp_base = hgp_pe.image_base;
-    let hgp_end = hgp_base + hgp_pe.sections.iter().map(|s| (s.virtual_address + s.virtual_size) as u64).max().unwrap_or(0);
-    println!(
-        "  HGP range: 0x{:016X} .. 0x{:016X}",
-        hgp_base, hgp_end
-    );
+    let hgp_end = hgp_base
+        + hgp_pe
+            .sections
+            .iter()
+            .map(|s| (s.virtual_address + s.virtual_size) as u64)
+            .max()
+            .unwrap_or(0);
+    println!("  HGP range: 0x{:016X} .. 0x{:016X}", hgp_base, hgp_end);
 
     for &(rva, label, payload_size, _) in &DESCRIPTOR_ENTRIES {
         let Some(file_off) = ga_pe.rva_to_file_offset(rva) else {
@@ -1070,8 +1104,7 @@ fn pass_f_pinvoke_discovery(data: &[u8], pe: &PeInfo) {
     ];
 
     for &pattern in dll_patterns {
-        let pattern_str = String::from_utf8_lossy(pattern)
-            .replace('\0', "\\0");
+        let pattern_str = String::from_utf8_lossy(pattern).replace('\0', "\\0");
         if data.len() < pattern.len() {
             continue;
         }
@@ -1281,7 +1314,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n  Key questions answered:");
     println!("    1. What are the method/DLL names in the descriptors?");
-    println!("    2. How does the resolver (0x{:08X}) map descriptors → function pointers?", RESOLVER_RVA);
+    println!(
+        "    2. How does the resolver (0x{:08X}) map descriptors → function pointers?",
+        RESOLVER_RVA
+    );
     println!("    3. Which DLL/module hosts beyond_setDecryptionFunc?");
     println!("    4. Do HGP.dll VM entry points match any descriptor targets?");
 

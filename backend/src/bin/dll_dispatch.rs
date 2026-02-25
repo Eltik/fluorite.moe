@@ -50,8 +50,21 @@ const SBOX_FILE_OFFSETS: [usize; 6] = [
 
 /// Crypto-related keyword patterns for string scanning
 const CRYPTO_KEYWORDS: &[&str] = &[
-    "beyond", "decrypt", "encrypt", "VFS", "vfs", "cipher", "AES", "aes", "sbox", "SBox",
-    "Crypt", "BlockCipher", "KeyExpansion", "catalog", "chk",
+    "beyond",
+    "decrypt",
+    "encrypt",
+    "VFS",
+    "vfs",
+    "cipher",
+    "AES",
+    "aes",
+    "sbox",
+    "SBox",
+    "Crypt",
+    "BlockCipher",
+    "KeyExpansion",
+    "catalog",
+    "chk",
 ];
 
 // ══════════════════════════════════════════════════════════════
@@ -294,7 +307,11 @@ fn find_function_start(data: &[u8], offset: usize) -> usize {
     while i > search_start {
         i -= 1;
         // CC CC followed by non-CC = function boundary
-        if i >= 1 && data[i] == 0xCC && data[i - 1] == 0xCC && (i + 1 >= data.len() || data[i + 1] != 0xCC) {
+        if i >= 1
+            && data[i] == 0xCC
+            && data[i - 1] == 0xCC
+            && (i + 1 >= data.len() || data[i + 1] != 0xCC)
+        {
             return i + 1;
         }
         // Also check for typical function prologue patterns:
@@ -489,7 +506,10 @@ fn pass_a_other_dll_scan(ga_data: &[u8]) -> Vec<DllScanResult> {
         }
 
         // Search for VFS_AES_KEY and VFS_AES_IV
-        for (name, pattern) in [("VFS_AES_KEY", &VFS_AES_KEY[..]), ("VFS_AES_IV", &VFS_AES_IV[..])] {
+        for (name, pattern) in [
+            ("VFS_AES_KEY", &VFS_AES_KEY[..]),
+            ("VFS_AES_IV", &VFS_AES_IV[..]),
+        ] {
             let plen = pattern.len();
             let mut count = 0;
             if data.len() >= plen {
@@ -640,7 +660,10 @@ fn pass_b_function_pointer_consumers(data: &[u8], pe: &PeInfo) {
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     let target_va: u64 = GA_IMAGE_BASE + DECRYPT_FUNC_PTR_RVA as u64;
-    println!("  Target: [0x{:016X}] (RVA 0x{:08X})", target_va, DECRYPT_FUNC_PTR_RVA);
+    println!(
+        "  Target: [0x{:016X}] (RVA 0x{:08X})",
+        target_va, DECRYPT_FUNC_PTR_RVA
+    );
     println!("  Searching for RIP-relative accesses in code sections...\n");
 
     let code_sections: Vec<&Section> = pe
@@ -698,9 +721,11 @@ fn pass_b_function_pointer_consumers(data: &[u8], pe: &PeInfo) {
                     let decode_start = instr_start.saturating_sub(4); // give some room
                     let decode_end = (instr_start + 16).min(sec_data.len());
                     let decode_buf = &sec_data[decode_start..decode_end];
-                    let decode_rip = GA_IMAGE_BASE + (sec.virtual_address + decode_start as u32) as u64;
+                    let decode_rip =
+                        GA_IMAGE_BASE + (sec.virtual_address + decode_start as u32) as u64;
 
-                    let mut decoder = Decoder::with_ip(64, decode_buf, decode_rip, DecoderOptions::NONE);
+                    let mut decoder =
+                        Decoder::with_ip(64, decode_buf, decode_rip, DecoderOptions::NONE);
                     let mut found = false;
 
                     while decoder.can_decode() {
@@ -775,10 +800,15 @@ fn pass_b_function_pointer_consumers(data: &[u8], pe: &PeInfo) {
         }
     }
 
-    println!("\n  Total consumers of [0x{:016X}]: {}", target_va, total_hits);
+    println!(
+        "\n  Total consumers of [0x{:016X}]: {}",
+        target_va, total_hits
+    );
     if total_hits == 0 {
         println!("  WARNING: No consumers found! The pointer may be accessed indirectly.");
-        println!("  Consider: the dispatcher may load the address from a vtable or through another indirection.");
+        println!(
+            "  Consider: the dispatcher may load the address from a vtable or through another indirection."
+        );
     }
 }
 
@@ -792,7 +822,10 @@ fn pass_c_extended_call_sites(data: &[u8], pe: &PeInfo) {
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     // Call site 2: function prologue at 0x18C08E4B0 (RVA 0x0C08E4B0)
-    println!("  === Call Site 2 (RVA 0x{:08X}) — Function Prologue ===", CALL_SITE_2_RVA);
+    println!(
+        "  === Call Site 2 (RVA 0x{:08X}) — Function Prologue ===",
+        CALL_SITE_2_RVA
+    );
     if let Some(file_off) = pe.rva_to_file_offset(CALL_SITE_2_RVA) {
         println!("  File offset: 0x{:08X}", file_off);
         println!("  Disassembling 150 instructions from function prologue...");
@@ -817,7 +850,11 @@ fn pass_c_extended_call_sites(data: &[u8], pe: &PeInfo) {
             formatter.format(&instr, &mut output);
 
             let interesting = output.contains("call")
-                || (output.contains("mov") && (output.contains("rcx") || output.contains("rdx") || output.contains("r8") || output.contains("r9")))
+                || (output.contains("mov")
+                    && (output.contains("rcx")
+                        || output.contains("rdx")
+                        || output.contains("r8")
+                        || output.contains("r9")))
                 || output.contains("jmp")
                 || output.contains("ret");
 
@@ -831,7 +868,10 @@ fn pass_c_extended_call_sites(data: &[u8], pe: &PeInfo) {
     }
 
     // Call site 1: instruction at 0x18C0376FF (RVA 0x0C0376FF)
-    println!("\n\n  === Call Site 1 (RVA 0x{:08X}) — Find Function Start ===", CALL_SITE_1_RVA);
+    println!(
+        "\n\n  === Call Site 1 (RVA 0x{:08X}) — Find Function Start ===",
+        CALL_SITE_1_RVA
+    );
     if let Some(file_off) = pe.rva_to_file_offset(CALL_SITE_1_RVA) {
         println!("  Instruction file offset: 0x{:08X}", file_off);
 
@@ -866,7 +906,11 @@ fn pass_c_extended_call_sites(data: &[u8], pe: &PeInfo) {
             formatter.format(&instr, &mut output);
 
             let interesting = output.contains("call")
-                || (output.contains("mov") && (output.contains("rcx") || output.contains("rdx") || output.contains("r8") || output.contains("r9")))
+                || (output.contains("mov")
+                    && (output.contains("rcx")
+                        || output.contains("rdx")
+                        || output.contains("r8")
+                        || output.contains("r9")))
                 || output.contains("jmp")
                 || output.contains("ret");
 
@@ -1014,9 +1058,7 @@ fn pass_d_hgp_deep_dive(dll_results: &[DllScanResult], ga_data: &[u8]) {
                 } else {
                     ""
                 };
-                println!(
-                    "      vs GA S-box {}: Hamming={}{}", i, hamming, tag
-                );
+                println!("      vs GA S-box {}: Hamming={}{}", i, hamming, tag);
             }
 
             // Also compare with VFS_AES_SBOX
@@ -1110,7 +1152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for r in &dll_results {
         let flags = format!(
             "{}{}",
-            if r.has_beyond_exports { " [BEYOND]" } else { "" },
+            if r.has_beyond_exports {
+                " [BEYOND]"
+            } else {
+                ""
+            },
             if r.has_crypto { " [CRYPTO]" } else { "" },
         );
         println!("    {}{}", r.path, flags);
@@ -1118,10 +1164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let beyond_dll = dll_results.iter().find(|r| r.has_beyond_exports);
     if let Some(dll) = beyond_dll {
-        println!(
-            "\n  \x1b[1;33mLikely decryption DLL: {}\x1b[0m",
-            dll.path
-        );
+        println!("\n  \x1b[1;33mLikely decryption DLL: {}\x1b[0m", dll.path);
     } else {
         println!("\n  No DLL with beyond/decrypt exports found.");
         println!("  The decryption function may be loaded dynamically or embedded in VM code.");

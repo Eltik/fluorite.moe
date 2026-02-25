@@ -2547,8 +2547,6 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 [[package]]
 name = "unity-asset"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6705b95fda449527055ff77fe5cff49f774dde7335ed92bc3d048fc74066ebaf"
 dependencies = [
  "unity-asset-binary",
  "unity-asset-core",
@@ -2558,8 +2556,6 @@ dependencies = [
 [[package]]
 name = "unity-asset-binary"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d739d1414c1732be1035417f83b1e60f234c7d5eb8abda0ee70d178a58137cb7"
 dependencies = [
  "binrw",
  "brotli",

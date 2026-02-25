@@ -122,7 +122,10 @@ fn get_int(obj: &unity_asset_binary::object::UnityObject, key: &str) -> i64 {
 }
 
 /// Survey a Texture2D object.
-fn survey_texture2d(sf: &SerializedFile, obj: &unity_asset_binary::asset::ObjectInfo) -> Option<Tex2DInfo> {
+fn survey_texture2d(
+    sf: &SerializedFile,
+    obj: &unity_asset_binary::asset::ObjectInfo,
+) -> Option<Tex2DInfo> {
     let handle = ObjectHandle::new(sf, obj);
     let unity_obj = handle.read().ok()?;
 
@@ -131,12 +134,14 @@ fn survey_texture2d(sf: &SerializedFile, obj: &unity_asset_binary::asset::Object
     let height = get_int(&unity_obj, "m_Height");
     let format = get_int(&unity_obj, "m_TextureFormat");
     let mip_count = get_int(&unity_obj, "m_MipCount");
-    let is_readable = unity_obj.get("m_IsReadable")
+    let is_readable = unity_obj
+        .get("m_IsReadable")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
     // Image data — may be inline bytes or empty (streamed externally)
-    let data_size = unity_obj.get("image data")
+    let data_size = unity_obj
+        .get("image data")
         .and_then(|v| v.as_bytes())
         .map(|b| b.len())
         .unwrap_or(0);
@@ -171,13 +176,17 @@ fn survey_texture2d(sf: &SerializedFile, obj: &unity_asset_binary::asset::Object
 }
 
 /// Survey a Mesh object.
-fn survey_mesh(sf: &SerializedFile, obj: &unity_asset_binary::asset::ObjectInfo) -> Option<MeshInfo> {
+fn survey_mesh(
+    sf: &SerializedFile,
+    obj: &unity_asset_binary::asset::ObjectInfo,
+) -> Option<MeshInfo> {
     let handle = ObjectHandle::new(sf, obj);
     let unity_obj = handle.read().ok()?;
 
     let name = unity_obj.name().unwrap_or_default();
 
-    let submesh_count = unity_obj.get("m_SubMeshes")
+    let submesh_count = unity_obj
+        .get("m_SubMeshes")
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
@@ -346,7 +355,10 @@ fn resolve_stream_data(
         .or_else(|| resources.get(bare_name))
         .or_else(|| {
             // Fuzzy match: find a resource whose key ends with bare_name
-            resources.iter().find(|(k, _)| k.ends_with(bare_name)).map(|(_, v)| v)
+            resources
+                .iter()
+                .find(|(k, _)| k.ends_with(bare_name))
+                .map(|(_, v)| v)
         })?;
 
     let end = (offset + size).min(res_data.len());
@@ -587,7 +599,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("  Total objects: {}\n", total_objects);
-    println!("  {:>8} | {:>6} | {:>10} | Name", "ClassID", "Count", "Total Size");
+    println!(
+        "  {:>8} | {:>6} | {:>10} | Name",
+        "ClassID", "Count", "Total Size"
+    );
     println!("  {}", "-".repeat(55));
 
     let mut sorted_classes: Vec<_> = class_counts.iter().collect();
@@ -669,7 +684,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             println!(
                 "  {:>40} | {:>4}x{:<4} | {:>3} | {:>10} | {:>10} | {}",
-                if t.name.len() > 40 { &t.name[..40] } else { &t.name },
+                if t.name.len() > 40 {
+                    &t.name[..40]
+                } else {
+                    &t.name
+                },
                 t.width,
                 t.height,
                 t.format,
@@ -697,7 +716,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         println!(
             "  {:>50} | {:>4}x{:<4} | {:>20} | {:>10} | {}",
-            if t.name.len() > 50 { &t.name[..50] } else { &t.name },
+            if t.name.len() > 50 {
+                &t.name[..50]
+            } else {
+                &t.name
+            },
             t.width,
             t.height,
             texture_format_name(t.format),
@@ -751,7 +774,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for m in &char_meshes {
             println!(
                 "  {:>50} | {:>8} | {:>4} | {:>10} | {:>10} | {}",
-                if m.name.len() > 50 { &m.name[..50] } else { &m.name },
+                if m.name.len() > 50 {
+                    &m.name[..50]
+                } else {
+                    &m.name
+                },
                 m.vertex_count,
                 m.submesh_count,
                 format_bytes(m.vertex_data_size as u64),
@@ -771,7 +798,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for m in meshes.iter().take(50) {
         println!(
             "  {:>50} | {:>8} | {:>4} | {:>10} | {:>10} | {}",
-            if m.name.len() > 50 { &m.name[..50] } else { &m.name },
+            if m.name.len() > 50 {
+                &m.name[..50]
+            } else {
+                &m.name
+            },
             m.vertex_count,
             m.submesh_count,
             format_bytes(m.vertex_data_size as u64),
@@ -835,7 +866,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             UnityValue::Bool(b) => format!("bool = {}", b),
                             UnityValue::Integer(i) => format!("int = {}", i),
                             UnityValue::Float(f) => format!("float = {}", f),
-                            UnityValue::String(s) => format!("string = {:?}", if s.len() > 50 { &s[..50] } else { s }),
+                            UnityValue::String(s) => {
+                                format!("string = {:?}", if s.len() > 50 { &s[..50] } else { s })
+                            }
                             UnityValue::Array(a) => format!("array[{}]", a.len()),
                             UnityValue::Bytes(b) => format!("bytes[{}]", b.len()),
                             UnityValue::Object(o) => format!("object{{{} fields}}", o.len()),
@@ -865,7 +898,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             UnityValue::Bool(b) => format!("bool = {}", b),
                             UnityValue::Integer(i) => format!("int = {}", i),
                             UnityValue::Float(f) => format!("float = {}", f),
-                            UnityValue::String(s) => format!("string = {:?}", if s.len() > 50 { &s[..50] } else { s }),
+                            UnityValue::String(s) => {
+                                format!("string = {:?}", if s.len() > 50 { &s[..50] } else { s })
+                            }
                             UnityValue::Array(a) => format!("array[{}]", a.len()),
                             UnityValue::Bytes(b) => format!("bytes[{}]", b.len()),
                             UnityValue::Object(o) => format!("object{{{} fields}}", o.len()),
@@ -990,67 +1025,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
 
-                let Some(compressed) = pixel_data else {
-                    no_data += 1;
-                    continue;
-                };
+                    let Some(compressed) = pixel_data else {
+                        no_data += 1;
+                        continue;
+                    };
 
-                // Decode compressed texture → RGBA32
-                let mut rgba_buf = vec![0u32; width * height];
-                let decode_result = decode_texture(format, &compressed, width, height, &mut rgba_buf);
+                    // Decode compressed texture → RGBA32
+                    let mut rgba_buf = vec![0u32; width * height];
+                    let decode_result =
+                        decode_texture(format, &compressed, width, height, &mut rgba_buf);
 
-                match decode_result {
-                    Ok(()) => {
-                        // Convert u32 BGRA → u8 RGBA and save PNG
-                        let mut rgba_bytes = vec![0u8; width * height * 4];
-                        for (i, &pixel) in rgba_buf.iter().enumerate() {
-                            let b = (pixel & 0xFF) as u8;
-                            let g = ((pixel >> 8) & 0xFF) as u8;
-                            let r = ((pixel >> 16) & 0xFF) as u8;
-                            let a = ((pixel >> 24) & 0xFF) as u8;
-                            rgba_bytes[i * 4] = r;
-                            rgba_bytes[i * 4 + 1] = g;
-                            rgba_bytes[i * 4 + 2] = b;
-                            rgba_bytes[i * 4 + 3] = a;
-                        }
+                    match decode_result {
+                        Ok(()) => {
+                            // Convert u32 BGRA → u8 RGBA and save PNG
+                            let mut rgba_bytes = vec![0u8; width * height * 4];
+                            for (i, &pixel) in rgba_buf.iter().enumerate() {
+                                let b = (pixel & 0xFF) as u8;
+                                let g = ((pixel >> 8) & 0xFF) as u8;
+                                let r = ((pixel >> 16) & 0xFF) as u8;
+                                let a = ((pixel >> 24) & 0xFF) as u8;
+                                rgba_bytes[i * 4] = r;
+                                rgba_bytes[i * 4 + 1] = g;
+                                rgba_bytes[i * 4 + 2] = b;
+                                rgba_bytes[i * 4 + 3] = a;
+                            }
 
-                        let path = out_dir.join(format!("{}.png", sanitize_filename(&name)));
-                        match image::save_buffer(
-                            &path,
-                            &rgba_bytes,
-                            width as u32,
-                            height as u32,
-                            image::ColorType::Rgba8,
-                        ) {
-                            Ok(()) => {
-                                extracted += 1;
-                                if extracted <= 20 || extracted.is_multiple_of(100) {
-                                    println!(
-                                        "  [{}] {} ({}x{}, {}) → {}",
-                                        extracted,
-                                        name,
-                                        width,
-                                        height,
-                                        texture_format_name(format),
-                                        path.display()
-                                    );
+                            let path = out_dir.join(format!("{}.png", sanitize_filename(&name)));
+                            match image::save_buffer(
+                                &path,
+                                &rgba_bytes,
+                                width as u32,
+                                height as u32,
+                                image::ColorType::Rgba8,
+                            ) {
+                                Ok(()) => {
+                                    extracted += 1;
+                                    if extracted <= 20 || extracted.is_multiple_of(100) {
+                                        println!(
+                                            "  [{}] {} ({}x{}, {}) → {}",
+                                            extracted,
+                                            name,
+                                            width,
+                                            height,
+                                            texture_format_name(format),
+                                            path.display()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("  FAIL save {}: {}", name, e);
+                                    failed += 1;
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("  FAIL save {}: {}", name, e);
+                        }
+                        Err(msg) => {
+                            if msg == "unsupported" {
+                                skipped_format += 1;
+                            } else {
+                                eprintln!(
+                                    "  FAIL decode {} ({}x{}, fmt={}): {}",
+                                    name, width, height, format, msg
+                                );
                                 failed += 1;
                             }
                         }
                     }
-                    Err(msg) => {
-                        if msg == "unsupported" {
-                            skipped_format += 1;
-                        } else {
-                            eprintln!("  FAIL decode {} ({}x{}, fmt={}): {}", name, width, height, format, msg);
-                            failed += 1;
-                        }
-                    }
-                }
                 }
             }
         }
@@ -1076,23 +1115,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Mesh objects:           {}", meshes.len());
     println!(
         "  Character textures:     {}",
-        textures.iter().filter(|t| {
-            let n = t.name.to_lowercase();
-            n.contains("chr_") || n.contains("actor_") || n.contains("t_actor_")
-        }).count()
+        textures
+            .iter()
+            .filter(|t| {
+                let n = t.name.to_lowercase();
+                n.contains("chr_") || n.contains("actor_") || n.contains("t_actor_")
+            })
+            .count()
     );
     println!(
         "  Character meshes:       {}",
-        meshes.iter().filter(|m| {
-            let n = m.name.to_lowercase();
-            n.contains("s_actor_") || n.contains("chr_") || n.contains("lod")
-        }).count()
+        meshes
+            .iter()
+            .filter(|m| {
+                let n = m.name.to_lowercase();
+                n.contains("s_actor_") || n.contains("chr_") || n.contains("lod")
+            })
+            .count()
     );
 
     // Inline data vs streamed
     let inline_tex = textures.iter().filter(|t| t.data_size > 0).count();
-    let streamed_tex = textures.iter().filter(|t| t.stream_size > 0 && t.data_size == 0).count();
-    let no_data_tex = textures.iter().filter(|t| t.data_size == 0 && t.stream_size == 0).count();
+    let streamed_tex = textures
+        .iter()
+        .filter(|t| t.stream_size > 0 && t.data_size == 0)
+        .count();
+    let no_data_tex = textures
+        .iter()
+        .filter(|t| t.data_size == 0 && t.stream_size == 0)
+        .count();
     println!("\n  Texture data availability:");
     println!("    Inline data:    {}", inline_tex);
     println!("    Streamed only:  {}", streamed_tex);

@@ -75,6 +75,34 @@ path = "src/bin/dll_descriptor.rs"
 name = "asset-probe"
 path = "src/bin/asset_probe.rs"
 
+[[bin]]
+name = "game-data-probe"
+path = "src/bin/game_data_probe.rs"
+
+[[bin]]
+name = "encrypted-dir-probe"
+path = "src/bin/encrypted_dir_probe.rs"
+
+[[bin]]
+name = "vm-disasm"
+path = "src/bin/vm_disasm.rs"
+
+[[bin]]
+name = "frida-companion"
+path = "src/bin/frida_companion.rs"
+
+[[bin]]
+name = "full-config-scan"
+path = "src/bin/full_config_scan.rs"
+
+[[bin]]
+name = "stat-analyzer"
+path = "src/bin/stat_analyzer.rs"
+
+[[bin]]
+name = "config-stat-probe"
+path = "src/bin/config_stat_probe.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
@@ -98,3 +126,7 @@ goblin = "0.8"
 iced-x86 = { version = "1.21", features = ["decoder", "intel"] }
 texture2ddecoder = "0.1"
 image = "0.25"
+
+[patch.crates-io]
+unity-asset-binary = { path = "unity-asset-binary-local" }
+unity-asset = { path = "unity-asset-local" }
