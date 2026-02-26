@@ -115,6 +115,14 @@ path = "src/bin/tcp_dissect.rs"
 name = "crypto-crack"
 path = "src/bin/crypto_crack.rs"
 
+[[bin]]
+name = "char-data-probe"
+path = "src/bin/char_data_probe.rs"
+
+[[bin]]
+name = "stat-engine"
+path = "src/bin/stat_engine.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
