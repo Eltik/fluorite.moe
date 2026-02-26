@@ -103,6 +103,18 @@ path = "src/bin/stat_analyzer.rs"
 name = "config-stat-probe"
 path = "src/bin/config_stat_probe.rs"
 
+[[bin]]
+name = "hgp-probe"
+path = "src/bin/hgp_probe.rs"
+
+[[bin]]
+name = "tcp-dissect"
+path = "src/bin/tcp_dissect.rs"
+
+[[bin]]
+name = "crypto-crack"
+path = "src/bin/crypto_crack.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }

@@ -1,0 +1,1 @@
+/Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/target/x86_64-pc-windows-gnu/release/version.dll: /Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/build.rs /Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/defs/zlib.def /Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/src/lib.rs

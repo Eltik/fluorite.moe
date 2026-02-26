@@ -1,0 +1,19 @@
+[package]
+name = "version-dll-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+winmm = []
+zlib = []
+
+[lib]
+crate-type = ["cdylib"]
+name = "version"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true
