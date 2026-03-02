@@ -150,24 +150,53 @@ struct CaptureEvent {
 
 /// Attribute names indexed by position in Attributes.m_rawData
 const ATTR_NAMES: &[&str] = &[
-    "hp", "str", "agi", "wisd", "will", "atk", "def", "maxHp",
-    "maxUltimateSp", "maxPoise", "poiseRecTime", "poiseRecTimeScalar",
-    "physicalDamageTakenScalar", "fireDamageTakenScalar",
-    "pulseDamageTakenScalar", "crystDamageTakenScalar",
-    "naturalDamageTakenScalar", "etherDamageTakenScalar",
-    "weight", "criticalRate", "criticalDamageIncrease",
-    "moveSpeedMultiplier", "turnRateMultiplier", "attackRate",
-    "skillCooldownScalar", "normalAttackRange",
-    "hpRecoveryPerSec", "hpRecoveryPerSecByHpRatio",
-    "poiseTakenScalar", "poiseOutputScalar",
-    "breakingAttackDamageTakenScalar", "knockDownTimeAddition",
-    "healOutputIncrease", "healTakenIncrease", "lifeSteal",
-    "ultimateSpGainScalar", "atbCostAddition", "skillCooldownAddition",
-    "comboSkillCooldownScalar", "igniteDamageScalar",
+    "hp",
+    "str",
+    "agi",
+    "wisd",
+    "will",
+    "atk",
+    "def",
+    "maxHp",
+    "maxUltimateSp",
+    "maxPoise",
+    "poiseRecTime",
+    "poiseRecTimeScalar",
+    "physicalDamageTakenScalar",
+    "fireDamageTakenScalar",
+    "pulseDamageTakenScalar",
+    "crystDamageTakenScalar",
+    "naturalDamageTakenScalar",
+    "etherDamageTakenScalar",
+    "weight",
+    "criticalRate",
+    "criticalDamageIncrease",
+    "moveSpeedMultiplier",
+    "turnRateMultiplier",
+    "attackRate",
+    "skillCooldownScalar",
+    "normalAttackRange",
+    "hpRecoveryPerSec",
+    "hpRecoveryPerSecByHpRatio",
+    "poiseTakenScalar",
+    "poiseOutputScalar",
+    "breakingAttackDamageTakenScalar",
+    "knockDownTimeAddition",
+    "healOutputIncrease",
+    "healTakenIncrease",
+    "lifeSteal",
+    "ultimateSpGainScalar",
+    "atbCostAddition",
+    "skillCooldownAddition",
+    "comboSkillCooldownScalar",
+    "igniteDamageScalar",
     "physicalInflictionDamageScalar",
-    "physicalDamageIncrease", "fireDamageIncrease",
-    "pulseDamageIncrease", "crystDamageIncrease",
-    "naturalDamageIncrease", "etherDamageIncrease",
+    "physicalDamageIncrease",
+    "fireDamageIncrease",
+    "pulseDamageIncrease",
+    "crystDamageIncrease",
+    "naturalDamageIncrease",
+    "etherDamageIncrease",
 ];
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -228,8 +257,121 @@ struct GadgetCharacterStats {
     computed_stats: Option<ComputedStats>,
 }
 
+/// Collects attrPtr→templateId mappings from multiple event sources.
+fn build_attr_ptr_map(events_raw: &[serde_json::Value]) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+
+    for ev in events_raw {
+        let event_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            // ABILITY_INIT_DEEP: primary source — attrPtrs (plural) from re-entrancy tracking
+            "ABILITY_INIT_DEEP" => {
+                if let Some(as_data) = ev.get("abilitySystem") {
+                    let template_id = as_data
+                        .get("templateId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if template_id.is_empty() {
+                        continue;
+                    }
+                    // Single attrPtr field
+                    if let Some(ap) = as_data.get("attrPtr").and_then(|v| v.as_str())
+                        && !ap.is_empty()
+                    {
+                        map.insert(ap.to_string(), template_id.clone());
+                    }
+                    // Array of attrPtrs (from re-entrancy tracking)
+                    if let Some(aps) = as_data.get("attrPtrs").and_then(|v| v.as_array()) {
+                        for ap in aps {
+                            if let Some(s) = ap.as_str() {
+                                map.insert(s.to_string(), template_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // CHAR_GET_ATTRIBUTES: attrPtr is the return value
+            "CHAR_GET_ATTRIBUTES" => {
+                let template_id = ev
+                    .get("charInfo")
+                    .and_then(|ci| ci.get("templateId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let attr_ptr = ev.get("attrPtr").and_then(|v| v.as_str()).unwrap_or("");
+                if !template_id.is_empty() && template_id != "(null)" && !attr_ptr.is_empty() {
+                    map.insert(attr_ptr.to_string(), template_id.to_string());
+                }
+            }
+            // ATTR_PTR_FIRST_SEEN: may include templateId from charMap
+            "ATTR_PTR_FIRST_SEEN" => {
+                let template_id = ev.get("templateId").and_then(|v| v.as_str()).unwrap_or("");
+                let attr_ptr = ev.get("attrPtr").and_then(|v| v.as_str()).unwrap_or("");
+                if !template_id.is_empty() && !attr_ptr.is_empty() {
+                    map.insert(attr_ptr.to_string(), template_id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Temporal correlation: CONFIG_TABLE_LOOKUP → next ATTR_PTR_FIRST_SEEN
+    // Each CONFIG_TABLE_LOOKUP with stackCharId is immediately followed by the
+    // ATTR_PTR_FIRST_SEEN for that character's attrPtr.
+    let mut pending_config_char: Option<String> = None;
+    for ev in events_raw {
+        match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "CONFIG_TABLE_LOOKUP" => {
+                if let Some(cid) = ev.get("stackCharId").and_then(|v| v.as_str())
+                    && !cid.is_empty()
+                {
+                    pending_config_char = Some(cid.to_string());
+                }
+            }
+            "ATTR_PTR_FIRST_SEEN" => {
+                if let Some(char_id) = pending_config_char.take()
+                    && let Some(ap) = ev.get("attrPtr").and_then(|v| v.as_str())
+                {
+                    map.entry(ap.to_string()).or_insert(char_id);
+                }
+                // Also check duringInitAttributes → ABILITY_INIT_DEEP link
+                if let Some(ap) = ev.get("attrPtr").and_then(|v| v.as_str()) {
+                    let during = ev
+                        .get("duringInitAttributes")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if during
+                        && let Some(init_ptr) = ev.get("initSystemPtr").and_then(|v| v.as_str())
+                    {
+                        for ev2 in events_raw {
+                            if ev2.get("type").and_then(|v| v.as_str()) == Some("ABILITY_INIT_DEEP")
+                                && let Some(as2) = ev2.get("abilitySystem")
+                                && as2.get("ptr").and_then(|v| v.as_str()) == Some(init_ptr)
+                            {
+                                if let Some(tid) = as2.get("templateId").and_then(|v| v.as_str())
+                                    && !tid.is_empty()
+                                {
+                                    map.entry(ap.to_string()).or_insert_with(|| tid.to_string());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    map
+}
+
 fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, GadgetCharacterStats> {
     let mut characters: HashMap<String, GadgetCharacterStats> = HashMap::new();
+
+    // Pre-build attrPtr → templateId map from all sources
+    let attr_ptr_map = build_attr_ptr_map(events_raw);
 
     for ev in events_raw {
         let event_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -251,12 +393,13 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                     continue;
                 }
 
-                let entry = characters.entry(template_id.clone()).or_insert_with(|| {
-                    GadgetCharacterStats {
-                        template_id: template_id.clone(),
-                        ..Default::default()
-                    }
-                });
+                let entry =
+                    characters
+                        .entry(template_id.clone())
+                        .or_insert_with(|| GadgetCharacterStats {
+                            template_id: template_id.clone(),
+                            ..Default::default()
+                        });
 
                 // Update char info
                 if let Some(v) = char_info.get("level").and_then(|v| v.as_i64()) {
@@ -307,6 +450,51 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                 }
             }
 
+            // Phase S2: live stat update from stat_capture_gadget.js
+            "ATTR_REFRESH_UPDATE" => {
+                let template_id = ev
+                    .get("templateId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if !template_id.is_empty() {
+                    let entry = characters.entry(template_id.clone()).or_insert_with(|| {
+                        GadgetCharacterStats {
+                            template_id: template_id.clone(),
+                            ..Default::default()
+                        }
+                    });
+
+                    if let Some(named) = ev.get("namedAttrs").and_then(|v| v.as_object()) {
+                        for (key, val) in named {
+                            if let Some(n) = val.as_f64() {
+                                entry.attributes.insert(key.clone(), n);
+                            }
+                        }
+                    }
+                    if let Some(raw) = ev.get("rawData").and_then(|v| v.as_array()) {
+                        let data: Vec<f64> = raw.iter().filter_map(|v| v.as_f64()).collect();
+                        if !data.is_empty() {
+                            for (i, &val) in data.iter().enumerate() {
+                                if val != 0.0 {
+                                    let name = if i < ATTR_NAMES.len() {
+                                        ATTR_NAMES[i].to_string()
+                                    } else {
+                                        format!("attr_{}", i)
+                                    };
+                                    entry.attributes.insert(name, val);
+                                }
+                            }
+                            entry.raw_data = data;
+                        }
+                    }
+
+                    entry.capture_count += 1;
+                    entry.sources.push("ATTR_REFRESH_UPDATE".to_string());
+                }
+            }
+
             "ATTR_DUMP" => {
                 if let Some(src) = ev.get("sourceAttributes") {
                     let template_id = src
@@ -326,7 +514,8 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
 
                         // Also check dumpResult for the AttributesData.m_attrs
                         if let Some(dump_result) = ev.get("dumpResult")
-                            && let Some(m_attrs) = dump_result.get("m_attrs").and_then(|v| v.as_array())
+                            && let Some(m_attrs) =
+                                dump_result.get("m_attrs").and_then(|v| v.as_array())
                         {
                             let raw: Vec<f64> = m_attrs.iter().filter_map(|v| v.as_f64()).collect();
                             if !raw.is_empty() {
@@ -340,13 +529,21 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                 }
             }
 
-            "ABILITY_INIT_ATTRIBUTES" => {
-                if let Some(as_data) = ev.get("abilitySystem")
-                    && let Some(attrs) = as_data.get("attributes")
-                {
-                    let template_id = attrs
+            "ABILITY_INIT_ATTRIBUTES" | "ABILITY_INIT_DEEP" => {
+                if let Some(as_data) = ev.get("abilitySystem") {
+                    // Try to get templateId from multiple locations
+                    let template_id = as_data
                         .get("templateId")
                         .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            // Fallback: resolve via attrPtr map
+                            as_data
+                                .get("attrPtr")
+                                .and_then(|v| v.as_str())
+                                .and_then(|ptr| attr_ptr_map.get(ptr))
+                                .map(|s| s.as_str())
+                        })
                         .unwrap_or("")
                         .to_string();
 
@@ -357,23 +554,56 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                                 ..Default::default()
                             }
                         });
-                        extract_attributes_into(attrs, entry);
+
+                        // Extract attributes from the abilitySystem data
+                        if let Some(attrs) = as_data.get("attributes") {
+                            extract_attributes_into(attrs, entry);
+                        }
+                        // Also check top-level namedAttrs/rawData (from ABILITY_INIT_DEEP)
+                        if let Some(named) = as_data.get("namedAttrs").and_then(|v| v.as_object()) {
+                            for (key, val) in named {
+                                if let Some(n) = val.as_f64() {
+                                    entry.attributes.insert(key.clone(), n);
+                                }
+                            }
+                        }
+                        if let Some(raw) = as_data.get("rawData").and_then(|v| v.as_array()) {
+                            let data: Vec<f64> = raw.iter().filter_map(|v| v.as_f64()).collect();
+                            if !data.is_empty() {
+                                for (i, &val) in data.iter().enumerate() {
+                                    if val != 0.0 {
+                                        let name = if i < ATTR_NAMES.len() {
+                                            ATTR_NAMES[i].to_string()
+                                        } else {
+                                            format!("attr_{}", i)
+                                        };
+                                        entry.attributes.insert(name, val);
+                                    }
+                                }
+                                entry.raw_data = data;
+                            }
+                        }
+
                         entry.capture_count += 1;
-                        entry.sources.push("ABILITY_INIT_ATTRIBUTES".to_string());
+                        entry.sources.push(event_type.to_string());
                     }
                 }
             }
 
             "ATTR_GET_VALUE" => {
-                let template_id = ev
+                // Resolve templateId: direct field first, then attrPtr map
+                let direct_tid = ev
                     .get("templateId")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
 
-                if template_id.is_empty() {
-                    continue;
-                }
+                let template_id = direct_tid.or_else(|| {
+                    ev.get("attrPtr")
+                        .and_then(|v| v.as_str())
+                        .and_then(|ptr| attr_ptr_map.get(ptr))
+                        .cloned()
+                });
 
                 let attr_name = ev
                     .get("attributeName")
@@ -381,15 +611,235 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                     .unwrap_or("unknown");
                 let value = ev.get("value").and_then(|v| v.as_f64());
 
-                if let Some(val) = value {
-                    let entry = characters.entry(template_id.clone()).or_insert_with(|| {
-                        GadgetCharacterStats {
-                            template_id: template_id.clone(),
-                            ..Default::default()
-                        }
-                    });
+                if let (Some(tid), Some(val)) = (&template_id, value) {
+                    let entry =
+                        characters
+                            .entry(tid.clone())
+                            .or_insert_with(|| GadgetCharacterStats {
+                                template_id: tid.clone(),
+                                ..Default::default()
+                            });
                     entry.attributes.insert(attr_name.to_string(), val);
                 }
+            }
+
+            // v7: Batched GetValue snapshot — attrs map per attrPtr
+            "ATTR_VALUE_SNAPSHOT" => {
+                let direct_tid = ev
+                    .get("templateId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                let template_id = direct_tid.or_else(|| {
+                    ev.get("attrPtr")
+                        .and_then(|v| v.as_str())
+                        .and_then(|ptr| attr_ptr_map.get(ptr))
+                        .cloned()
+                });
+
+                if let Some(tid) = &template_id
+                    && let Some(attrs) = ev.get("attrs").and_then(|v| v.as_object())
+                {
+                    let entry =
+                        characters
+                            .entry(tid.clone())
+                            .or_insert_with(|| GadgetCharacterStats {
+                                template_id: tid.clone(),
+                                ..Default::default()
+                            });
+                    for (key, val) in attrs {
+                        if let Some(n) = val.as_f64() {
+                            entry.attributes.insert(key.clone(), n);
+                        }
+                    }
+                }
+            }
+
+            // v10: Table dictionary walk entries — character data from static config table
+            "TABLE_CHARACTER_ENTRY" => {
+                let char_id = ev
+                    .get("charId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if char_id.is_empty() {
+                    continue;
+                }
+
+                let entry =
+                    characters
+                        .entry(char_id.clone())
+                        .or_insert_with(|| GadgetCharacterStats {
+                            template_id: char_id.clone(),
+                            ..Default::default()
+                        });
+
+                // Extract stats from the probed value object
+                if let Some(stats) = ev.get("stats").and_then(|v| v.as_object()) {
+                    for (key, val) in stats {
+                        if let Some(n) = val.as_f64()
+                            && n != 0.0
+                        {
+                            entry.attributes.entry(key.clone()).or_insert(n);
+                        }
+                    }
+                }
+
+                // Extract rawData array
+                if let Some(raw) = ev.get("rawData").and_then(|v| v.as_array()) {
+                    let data: Vec<f64> = raw.iter().filter_map(|v| v.as_f64()).collect();
+                    if !data.is_empty() && entry.raw_data.is_empty() {
+                        for (i, &val) in data.iter().enumerate() {
+                            if val != 0.0 {
+                                let name = if i < ATTR_NAMES.len() {
+                                    ATTR_NAMES[i].to_string()
+                                } else {
+                                    format!("attr_{}", i)
+                                };
+                                entry.attributes.entry(name).or_insert(val);
+                            }
+                        }
+                        entry.raw_data = data;
+                    }
+                }
+
+                entry.capture_count += 1;
+                entry.sources.push("TABLE_CHARACTER_ENTRY".to_string());
+            }
+
+            // Phase S2: unified full character capture from stat_capture_gadget.js
+            "FULL_CHARACTER_CAPTURE" => {
+                let template_id = ev
+                    .get("templateId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if template_id.is_empty() || template_id == "(null)" {
+                    continue;
+                }
+
+                let entry =
+                    characters
+                        .entry(template_id.clone())
+                        .or_insert_with(|| GadgetCharacterStats {
+                            template_id: template_id.clone(),
+                            ..Default::default()
+                        });
+
+                // Level
+                if let Some(v) = ev.get("level").and_then(|v| v.as_i64()) {
+                    entry.level = v;
+                }
+
+                // Raw data + named attributes
+                if let Some(named) = ev.get("namedAttrs").and_then(|v| v.as_object()) {
+                    for (key, val) in named {
+                        if let Some(n) = val.as_f64() {
+                            entry.attributes.insert(key.clone(), n);
+                        }
+                    }
+                }
+                if let Some(raw) = ev.get("rawData").and_then(|v| v.as_array()) {
+                    let data: Vec<f64> = raw.iter().filter_map(|v| v.as_f64()).collect();
+                    if !data.is_empty() {
+                        for (i, &val) in data.iter().enumerate() {
+                            if val != 0.0 {
+                                let name = if i < ATTR_NAMES.len() {
+                                    ATTR_NAMES[i].to_string()
+                                } else {
+                                    format!("attr_{}", i)
+                                };
+                                entry.attributes.insert(name, val);
+                            }
+                        }
+                        entry.raw_data = data;
+                    }
+                }
+
+                // Data min/max
+                if let Some(min) = ev.get("dataMin").and_then(|v| v.as_array()) {
+                    entry.data_min = Some(min.iter().filter_map(|v| v.as_f64()).collect());
+                }
+                if let Some(max) = ev.get("dataMax").and_then(|v| v.as_array()) {
+                    entry.data_max = Some(max.iter().filter_map(|v| v.as_f64()).collect());
+                }
+
+                // Computed stats: final cached data, scalars, attr types
+                let mut computed = ComputedStats::default();
+
+                if let Some(fcd) = ev.get("finalCachedData") {
+                    if let Some(data) = fcd.get("data").and_then(|v| v.as_array()) {
+                        let vals: Vec<f64> = data.iter().filter_map(|v| v.as_f64()).collect();
+                        for (i, &val) in vals.iter().enumerate() {
+                            if val != 0.0 {
+                                let name = if i < ATTR_NAMES.len() {
+                                    ATTR_NAMES[i].to_string()
+                                } else {
+                                    format!("attr_{}", i)
+                                };
+                                computed.final_attrs.insert(name.clone(), val);
+                                match name.as_str() {
+                                    "hp" => computed.final_hp = Some(val),
+                                    "atk" => computed.final_atk = Some(val),
+                                    "def" => computed.final_def = Some(val),
+                                    "maxHp" => computed.final_max_hp = Some(val),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    if let Some(named) = fcd.get("namedAttrs").and_then(|v| v.as_object()) {
+                        for (k, v) in named {
+                            if let Some(n) = v.as_f64() {
+                                computed.final_attrs.entry(k.clone()).or_insert(n);
+                            }
+                        }
+                    }
+                }
+
+                // Scalars
+                if let Some(scalars) = ev.get("scalars").and_then(|v| v.as_object()) {
+                    computed.scalars.atk_from_main =
+                        scalars.get("atkFromMain").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_str =
+                        scalars.get("atkFromStr").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_agi =
+                        scalars.get("atkFromAgi").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_wisd =
+                        scalars.get("atkFromWisd").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_will =
+                        scalars.get("atkFromWill").and_then(|v| v.as_f64());
+                    computed.scalars.hp_from_str =
+                        scalars.get("hpFromStr").and_then(|v| v.as_f64());
+                    computed.scalars.heal_from_will =
+                        scalars.get("healFromWill").and_then(|v| v.as_f64());
+                    computed.scalars.phys_resist_from_agi =
+                        scalars.get("physResistFromAgi").and_then(|v| v.as_f64());
+                    computed.scalars.energy_resist_from_wisd =
+                        scalars.get("energyResistFromWisd").and_then(|v| v.as_f64());
+                }
+
+                // Main/sub attr types
+                if let Some(mat) = ev.get("mainAttrType")
+                    && let Some(has) = mat.get("hasValue").and_then(|v| v.as_bool())
+                    && has
+                {
+                    computed.main_attr_type =
+                        mat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
+                }
+                if let Some(sat) = ev.get("subAttrType")
+                    && let Some(has) = sat.get("hasValue").and_then(|v| v.as_bool())
+                    && has
+                {
+                    computed.sub_attr_type =
+                        sat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
+                }
+
+                entry.computed_stats = Some(computed);
+                entry.capture_count += 1;
+                entry.sources.push("FULL_CHARACTER_CAPTURE".to_string());
             }
 
             "FINAL_ATTRIBUTES" | "SCAN_CHAR_DATA" => {
@@ -405,12 +855,13 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                     continue;
                 }
 
-                let entry = characters.entry(template_id.clone()).or_insert_with(|| {
-                    GadgetCharacterStats {
-                        template_id: template_id.clone(),
-                        ..Default::default()
-                    }
-                });
+                let entry =
+                    characters
+                        .entry(template_id.clone())
+                        .or_insert_with(|| GadgetCharacterStats {
+                            template_id: template_id.clone(),
+                            ..Default::default()
+                        });
 
                 // Update char info from charInfo block
                 if let Some(ci) = ev.get("charInfo") {
@@ -503,15 +954,24 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
 
                 // Extract scalars
                 if let Some(scalars) = ev.get("scalars").and_then(|v| v.as_object()) {
-                    computed.scalars.atk_from_main = scalars.get("atkFromMain").and_then(|v| v.as_f64());
-                    computed.scalars.atk_from_str = scalars.get("atkFromStr").and_then(|v| v.as_f64());
-                    computed.scalars.atk_from_agi = scalars.get("atkFromAgi").and_then(|v| v.as_f64());
-                    computed.scalars.atk_from_wisd = scalars.get("atkFromWisd").and_then(|v| v.as_f64());
-                    computed.scalars.atk_from_will = scalars.get("atkFromWill").and_then(|v| v.as_f64());
-                    computed.scalars.hp_from_str = scalars.get("hpFromStr").and_then(|v| v.as_f64());
-                    computed.scalars.heal_from_will = scalars.get("healFromWill").and_then(|v| v.as_f64());
-                    computed.scalars.phys_resist_from_agi = scalars.get("physResistFromAgi").and_then(|v| v.as_f64());
-                    computed.scalars.energy_resist_from_wisd = scalars.get("energyResistFromWisd").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_main =
+                        scalars.get("atkFromMain").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_str =
+                        scalars.get("atkFromStr").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_agi =
+                        scalars.get("atkFromAgi").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_wisd =
+                        scalars.get("atkFromWisd").and_then(|v| v.as_f64());
+                    computed.scalars.atk_from_will =
+                        scalars.get("atkFromWill").and_then(|v| v.as_f64());
+                    computed.scalars.hp_from_str =
+                        scalars.get("hpFromStr").and_then(|v| v.as_f64());
+                    computed.scalars.heal_from_will =
+                        scalars.get("healFromWill").and_then(|v| v.as_f64());
+                    computed.scalars.phys_resist_from_agi =
+                        scalars.get("physResistFromAgi").and_then(|v| v.as_f64());
+                    computed.scalars.energy_resist_from_wisd =
+                        scalars.get("energyResistFromWisd").and_then(|v| v.as_f64());
                 }
 
                 // Extract main/sub attr types
@@ -519,13 +979,15 @@ fn extract_gadget_stats(events_raw: &[serde_json::Value]) -> HashMap<String, Gad
                     && let Some(has) = mat.get("hasValue").and_then(|v| v.as_bool())
                     && has
                 {
-                    computed.main_attr_type = mat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
+                    computed.main_attr_type =
+                        mat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
                 }
                 if let Some(sat) = ev.get("subAttrType")
                     && let Some(has) = sat.get("hasValue").and_then(|v| v.as_bool())
                     && has
                 {
-                    computed.sub_attr_type = sat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
+                    computed.sub_attr_type =
+                        sat.get("value").and_then(|v| v.as_i64()).map(|v| v as i32);
                 }
 
                 entry.computed_stats = Some(computed);
@@ -611,17 +1073,51 @@ struct HookCandidate {
 }
 
 const STAT_FIELD_KEYWORDS: &[&str] = &[
-    "hp", "atk", "def", "attack", "defense", "health",
-    "crit", "damage", "speed", "resist", "maxhp", "baseatk",
-    "basedef", "level", "exp", "growth", "stat", "power",
-    "strength", "agility", "stamina", "energy", "shield",
-    "armor", "penetration", "lifesteal", "regen",
+    "hp",
+    "atk",
+    "def",
+    "attack",
+    "defense",
+    "health",
+    "crit",
+    "damage",
+    "speed",
+    "resist",
+    "maxhp",
+    "baseatk",
+    "basedef",
+    "level",
+    "exp",
+    "growth",
+    "stat",
+    "power",
+    "strength",
+    "agility",
+    "stamina",
+    "energy",
+    "shield",
+    "armor",
+    "penetration",
+    "lifesteal",
+    "regen",
 ];
 
 const STAT_METHOD_KEYWORDS: &[&str] = &[
-    "get", "set", "calc", "compute", "load", "init",
-    "parse", "merge", "deserialize", "read", "decode",
-    "apply", "update", "refresh", "setup",
+    "get",
+    "set",
+    "calc",
+    "compute",
+    "load",
+    "init",
+    "parse",
+    "merge",
+    "deserialize",
+    "read",
+    "decode",
+    "apply",
+    "update",
+    "refresh",
+    "setup",
 ];
 
 fn score_class(entry: &ClassEntry) -> ScoredClass {
@@ -701,9 +1197,14 @@ fn score_class(entry: &ClassEntry) -> ScoredClass {
 
         // Check return type for stat-like types
         let ret_lower = method.return_type.to_lowercase();
-        if (ret_lower.contains("int") || ret_lower.contains("float") || ret_lower.contains("double"))
-            && (lower.contains("stat") || lower.contains("hp") || lower.contains("atk")
-                || lower.contains("def") || lower.contains("get"))
+        if (ret_lower.contains("int")
+            || ret_lower.contains("float")
+            || ret_lower.contains("double"))
+            && (lower.contains("stat")
+                || lower.contains("hp")
+                || lower.contains("atk")
+                || lower.contains("def")
+                || lower.contains("get"))
         {
             method_score += 10;
             method_reason = format!("returns {} with stat-like name", method.return_type);
@@ -791,8 +1292,17 @@ fn identify_character(fields: &serde_json::Value) -> Option<String> {
     if let Some(obj) = fields.as_object() {
         // Look for character ID fields
         let id_keys = [
-            "charId", "characterId", "id", "Id", "CharId", "char_id",
-            "character_id", "unitId", "unit_id", "name", "Name",
+            "charId",
+            "characterId",
+            "id",
+            "Id",
+            "CharId",
+            "char_id",
+            "character_id",
+            "unitId",
+            "unit_id",
+            "name",
+            "Name",
         ];
 
         for key in &id_keys {
@@ -852,7 +1362,10 @@ fn pass_1_parse_dump(dump_path: &str) -> Option<Il2cppDump> {
     println!("    Timestamp:        {}", dump.meta.timestamp);
     println!("    Architecture:     {}", dump.meta.arch);
     println!("    GA base:          {}", dump.meta.game_assembly_base);
-    println!("    GA size:          {} bytes", dump.meta.game_assembly_size);
+    println!(
+        "    GA size:          {} bytes",
+        dump.meta.game_assembly_size
+    );
     println!("    Total assemblies: {}", dump.meta.total_assemblies);
     println!("    Total classes:    {}", dump.meta.total_classes);
     println!("    Total methods:    {}", dump.meta.total_methods);
@@ -1006,35 +1519,59 @@ fn pass_3_parse_capture(capture_path: &str) -> (Vec<CaptureEvent>, Vec<serde_jso
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if let Some(json_str) = trimmed.strip_prefix("IL2CPP_EVENT|") {
-            match serde_json::from_str::<serde_json::Value>(json_str) {
-                Ok(val) => {
-                    let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // Strip leading null bytes (Frida File BOM artifact)
+        let trimmed = trimmed.trim_start_matches('\0').trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-                    // Detect format: gadget events have types like CHAR_ATTRIBUTE_REFRESH
-                    if matches!(
-                        event_type,
-                        "CHAR_ATTRIBUTE_REFRESH"
-                            | "CHAR_GET_ATTRIBUTES"
-                            | "ATTR_REFRESH_ALL"
-                            | "ATTR_DUMP"
-                            | "ABILITY_INIT_ATTRIBUTES"
-                            | "ATTR_GET_VALUE"
-                            | "FINAL_ATTRIBUTES"
-                            | "SCAN_CHAR_DATA"
-                    ) {
-                        is_gadget_format = true;
-                    }
+        // Try IL2CPP_EVENT| prefix (console capture log format)
+        let json_str = if let Some(s) = trimmed.strip_prefix("IL2CPP_EVENT|") {
+            s
+        } else if trimmed.starts_with('{') {
+            // Bare JSON line (JSONL file format)
+            trimmed
+        } else {
+            continue;
+        };
 
-                    raw_events.push(val.clone());
+        match serde_json::from_str::<serde_json::Value>(json_str) {
+            Ok(val) => {
+                let event_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                    // Also try parsing as old CaptureEvent format
-                    if let Ok(ev) = serde_json::from_value::<CaptureEvent>(val) {
-                        old_events.push(ev);
-                    }
+                // Detect format: gadget events have types like CHAR_ATTRIBUTE_REFRESH
+                if matches!(
+                    event_type,
+                    "CHAR_ATTRIBUTE_REFRESH"
+                        | "CHAR_GET_ATTRIBUTES"
+                        | "ATTR_REFRESH_ALL"
+                        | "ATTR_DUMP"
+                        | "ABILITY_INIT_ATTRIBUTES"
+                        | "ATTR_GET_VALUE"
+                        | "ATTR_VALUE_SNAPSHOT"
+                        | "ATTR_PTR_FIRST_SEEN"
+                        | "ABILITY_INIT_DEEP"
+                        | "FINAL_ATTRIBUTES"
+                        | "SCAN_CHAR_DATA"
+                        | "CONFIG_TABLE_LOOKUP"
+                        | "CALC_BASE_ATTRIBUTE"
+                        | "CALC_FINAL_ATTRIBUTE"
+                        | "CHARACTER_ATTRIBUTE_TABLE_DUMP"
+                        | "TABLE_DEEP_PROBE"
+                        | "TABLE_CHARACTER_ENTRY"
+                        | "TABLE_DICT_SUMMARY"
+                ) {
+                    is_gadget_format = true;
                 }
-                Err(_) => parse_errors += 1,
+
+                raw_events.push(val.clone());
+
+                // Also try parsing as old CaptureEvent format
+                if let Ok(ev) = serde_json::from_value::<CaptureEvent>(val) {
+                    old_events.push(ev);
+                }
             }
+            Err(_) => parse_errors += 1,
         }
     }
 
@@ -1069,11 +1606,7 @@ fn pass_3_parse_capture(capture_path: &str) -> (Vec<CaptureEvent>, Vec<serde_jso
     (old_events, raw_events)
 }
 
-fn pass_4_correlate(
-    events: &[CaptureEvent],
-    scored: &[ScoredClass],
-    dump: &Il2cppDump,
-) {
+fn pass_4_correlate(events: &[CaptureEvent], scored: &[ScoredClass], dump: &Il2cppDump) {
     println!("\n{}", "═".repeat(62));
     println!("  Pass 4: Correlate Captures with Metadata");
     println!("{}\n", "═".repeat(62));
@@ -1125,7 +1658,11 @@ fn pass_4_correlate(
                     };
                     full == *class_name
                 }) {
-                    println!("    Score: {} | Reasons: {}", sc.score, sc.reasons.join("; "));
+                    println!(
+                        "    Score: {} | Reasons: {}",
+                        sc.score,
+                        sc.reasons.join("; ")
+                    );
                 }
 
                 // Print captured field values
@@ -1264,7 +1801,10 @@ fn pass_5_extract_stats(events: &[CaptureEvent], output_dir: &str) {
     });
 
     let json_path = format!("{}/character_stats.json", output_dir);
-    match fs::write(&json_path, serde_json::to_string_pretty(&json_output).unwrap_or_default()) {
+    match fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+    ) {
         Ok(()) => println!("\n  Saved: {}", json_path),
         Err(e) => println!("\n  ERROR saving {}: {}", json_path, e),
     }
@@ -1383,10 +1923,38 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
     let mut chars: Vec<_> = characters.values().collect();
     chars.sort_by(|a, b| a.template_id.cmp(&b.template_id));
 
-    for ch in &chars {
+    // Classify characters by data source
+    let table_only_count = chars
+        .iter()
+        .filter(|c| c.sources.iter().all(|s| s == "TABLE_CHARACTER_ENTRY"))
+        .count();
+    let table_plus_runtime = chars
+        .iter()
+        .filter(|c| {
+            c.sources.iter().any(|s| s == "TABLE_CHARACTER_ENTRY")
+                && c.sources.iter().any(|s| s != "TABLE_CHARACTER_ENTRY")
+        })
+        .count();
+    let runtime_only = chars.len() - table_only_count - table_plus_runtime;
+
+    if table_only_count > 0 || table_plus_runtime > 0 {
         println!(
-            "  ╔══ {} (lv{}, break{}, potential{}) ══",
-            ch.template_id, ch.level, ch.break_stage, ch.potential_level
+            "  Sources: {} runtime-only, {} table+runtime, {} table-only\n",
+            runtime_only, table_plus_runtime, table_only_count
+        );
+    }
+
+    for ch in &chars {
+        let source_tag = if ch.sources.iter().all(|s| s == "TABLE_CHARACTER_ENTRY") {
+            " [TABLE ONLY]"
+        } else if ch.sources.iter().any(|s| s == "TABLE_CHARACTER_ENTRY") {
+            " [TABLE + RUNTIME]"
+        } else {
+            ""
+        };
+        println!(
+            "  ╔══ {} (lv{}, break{}, potential{}){} ══",
+            ch.template_id, ch.level, ch.break_stage, ch.potential_level, source_tag
         );
         println!(
             "  ║ instId={}, uid={}, captures={}",
@@ -1404,9 +1972,15 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
 
         // Secondary stats
         let secondary = [
-            "criticalRate", "criticalDamageIncrease", "attackRate",
-            "moveSpeedMultiplier", "hpRecoveryPerSec", "maxPoise",
-            "weight", "healOutputIncrease", "lifeSteal",
+            "criticalRate",
+            "criticalDamageIncrease",
+            "attackRate",
+            "moveSpeedMultiplier",
+            "hpRecoveryPerSec",
+            "maxPoise",
+            "weight",
+            "healOutputIncrease",
+            "lifeSteal",
         ];
         let has_secondary = secondary.iter().any(|s| ch.attributes.contains_key(*s));
         if has_secondary {
@@ -1434,15 +2008,18 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
         }
 
         // Any remaining non-zero attrs
-        let shown: std::collections::HashSet<&str> = core_stats
-            .iter()
-            .chain(secondary.iter())
-            .copied()
-            .collect();
+        let shown: std::collections::HashSet<&str> =
+            core_stats.iter().chain(secondary.iter()).copied().collect();
         let remaining: Vec<_> = ch
             .attributes
             .iter()
-            .filter(|(k, v)| !shown.contains(k.as_str()) && !k.contains("Damage") && !k.contains("Resist") && !k.contains("Infliction") && **v != 0.0)
+            .filter(|(k, v)| {
+                !shown.contains(k.as_str())
+                    && !k.contains("Damage")
+                    && !k.contains("Resist")
+                    && !k.contains("Infliction")
+                    && **v != 0.0
+            })
             .collect();
         if !remaining.is_empty() {
             println!("  ║ Other:");
@@ -1487,20 +2064,37 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
 
             // Scalars
             let s = &cs.scalars;
-            let has_scalars = s.atk_from_main.is_some()
-                || s.atk_from_str.is_some()
-                || s.hp_from_str.is_some();
+            let has_scalars =
+                s.atk_from_main.is_some() || s.atk_from_str.is_some() || s.hp_from_str.is_some();
             if has_scalars {
                 println!("  ║ Cross-attribute scalars:");
-                if let Some(v) = s.atk_from_main { println!("  ║   atkFromMain       = {:.4}", v); }
-                if let Some(v) = s.atk_from_str  { println!("  ║   atkFromStr        = {:.4}", v); }
-                if let Some(v) = s.atk_from_agi  { println!("  ║   atkFromAgi        = {:.4}", v); }
-                if let Some(v) = s.atk_from_wisd { println!("  ║   atkFromWisd       = {:.4}", v); }
-                if let Some(v) = s.atk_from_will { println!("  ║   atkFromWill       = {:.4}", v); }
-                if let Some(v) = s.hp_from_str   { println!("  ║   hpFromStr         = {:.4}", v); }
-                if let Some(v) = s.heal_from_will { println!("  ║   healFromWill      = {:.4}", v); }
-                if let Some(v) = s.phys_resist_from_agi { println!("  ║   physResistFromAgi = {:.4}", v); }
-                if let Some(v) = s.energy_resist_from_wisd { println!("  ║   energyResistWisd  = {:.4}", v); }
+                if let Some(v) = s.atk_from_main {
+                    println!("  ║   atkFromMain       = {:.4}", v);
+                }
+                if let Some(v) = s.atk_from_str {
+                    println!("  ║   atkFromStr        = {:.4}", v);
+                }
+                if let Some(v) = s.atk_from_agi {
+                    println!("  ║   atkFromAgi        = {:.4}", v);
+                }
+                if let Some(v) = s.atk_from_wisd {
+                    println!("  ║   atkFromWisd       = {:.4}", v);
+                }
+                if let Some(v) = s.atk_from_will {
+                    println!("  ║   atkFromWill       = {:.4}", v);
+                }
+                if let Some(v) = s.hp_from_str {
+                    println!("  ║   hpFromStr         = {:.4}", v);
+                }
+                if let Some(v) = s.heal_from_will {
+                    println!("  ║   healFromWill      = {:.4}", v);
+                }
+                if let Some(v) = s.phys_resist_from_agi {
+                    println!("  ║   physResistFromAgi = {:.4}", v);
+                }
+                if let Some(v) = s.energy_resist_from_wisd {
+                    println!("  ║   energyResistWisd  = {:.4}", v);
+                }
             }
 
             // Main/sub attr types
@@ -1530,11 +2124,312 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
         println!();
     }
 
+    // ── AttrPtr Profile Analysis ──
+    // Group ATTR_GET_VALUE + ATTR_VALUE_SNAPSHOT by attrPtr to show stats
+    let mut attr_ptr_profiles: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut attr_ptr_counts: HashMap<String, u32> = HashMap::new();
+    let mut attr_ptr_class: HashMap<String, String> = HashMap::new(); // attrPtr → className
+    for ev in raw_events {
+        let etype = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match etype {
+            "ATTR_GET_VALUE" => {
+                let attr_ptr = ev.get("attrPtr").and_then(|v| v.as_str()).unwrap_or("");
+                if attr_ptr.is_empty() {
+                    continue;
+                }
+                *attr_ptr_counts.entry(attr_ptr.to_string()).or_default() += 1;
+                if let (Some(name), Some(val)) = (
+                    ev.get("attributeName").and_then(|v| v.as_str()),
+                    ev.get("value").and_then(|v| v.as_f64()),
+                ) {
+                    attr_ptr_profiles
+                        .entry(attr_ptr.to_string())
+                        .or_default()
+                        .insert(name.to_string(), val);
+                }
+            }
+            "ATTR_VALUE_SNAPSHOT" => {
+                let attr_ptr = ev.get("attrPtr").and_then(|v| v.as_str()).unwrap_or("");
+                if attr_ptr.is_empty() {
+                    continue;
+                }
+                let call_count = ev.get("callCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                *attr_ptr_counts.entry(attr_ptr.to_string()).or_default() += call_count;
+                if let Some(attrs) = ev.get("attrs").and_then(|v| v.as_object()) {
+                    let profile = attr_ptr_profiles.entry(attr_ptr.to_string()).or_default();
+                    for (key, val) in attrs {
+                        if let Some(n) = val.as_f64() {
+                            profile.insert(key.clone(), n);
+                        }
+                    }
+                }
+            }
+            "ATTR_PTR_FIRST_SEEN" => {
+                // Capture class name for display
+                if let Some(cn) = ev.get("attrClassName").and_then(|v| v.as_str())
+                    && let Some(ap) = ev.get("attrPtr").and_then(|v| v.as_str())
+                {
+                    attr_ptr_class.insert(ap.to_string(), cn.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Also collect ATTR_PTR_FIRST_SEEN events
+    let first_seen_events: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("ATTR_PTR_FIRST_SEEN"))
+        .collect();
+    let ability_init_events: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| {
+            matches!(
+                ev.get("type").and_then(|v| v.as_str()),
+                Some("ABILITY_INIT_DEEP" | "ABILITY_INIT_ATTRIBUTES")
+            )
+        })
+        .collect();
+
+    // Build the attrPtr resolution map (for display)
+    let attr_ptr_map = build_attr_ptr_map(raw_events);
+
+    if !attr_ptr_profiles.is_empty() {
+        // Classify attrPtrs into player/enemy/system
+        let mut players: Vec<&String> = Vec::new();
+        let mut enemies: Vec<&String> = Vec::new();
+        let mut system: Vec<&String> = Vec::new();
+
+        for p in attr_ptr_profiles.keys() {
+            let stats = &attr_ptr_profiles[p];
+            let str_val = stats.get("str").copied().unwrap_or(0.0);
+            let wisd = stats.get("wisd").copied().unwrap_or(0.0);
+            // Player: wisd=0, non-zero damage scalars OR str>=500 at level 1
+            // Enemy: wisd=100 (rawData[3]=100 maps to wisd in GetValue)
+            // System: str=1, agi=10
+            if str_val <= 1.0 {
+                system.push(p);
+            } else if wisd >= 90.0 {
+                enemies.push(p);
+            } else {
+                players.push(p);
+            }
+        }
+
+        println!(
+            "\n  ── AttrPtr Profiles ({} unique: {} player, {} enemy, {} system) ──",
+            attr_ptr_profiles.len(),
+            players.len(),
+            enemies.len(),
+            system.len()
+        );
+        println!(
+            "  AttrPtr→Character resolution: {} mapped",
+            attr_ptr_map.len()
+        );
+
+        // Show players first
+        let display_group = |label: &str, ptrs: &[&String]| {
+            if ptrs.is_empty() {
+                return;
+            }
+            println!("\n  ── {} ({}) ──", label, ptrs.len());
+            let mut sorted = ptrs.to_vec();
+            sorted.sort();
+            for p in &sorted {
+                let stats = &attr_ptr_profiles[*p];
+                let count = attr_ptr_counts.get(*p).copied().unwrap_or(0);
+                let resolved = attr_ptr_map.get(*p);
+                let class_name = attr_ptr_class.get(*p).map(|s| s.as_str()).unwrap_or("");
+
+                let short_ptr = &p[p.len().saturating_sub(10)..];
+                println!(
+                    "\n    ╔══ attrPtr=..{} ({}× GetValue) {} {}",
+                    short_ptr,
+                    count,
+                    resolved
+                        .map(|r| format!("→ {}", r))
+                        .unwrap_or_else(|| "→ ???".to_string()),
+                    if class_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{}]", class_name)
+                    },
+                );
+
+                let core = ["hp", "maxHp", "atk", "def", "str", "agi", "wisd", "will"];
+                for &s in &core {
+                    if let Some(&v) = stats.get(s) {
+                        println!("    ║   {:20} = {:.2}", s, v);
+                    }
+                }
+
+                // Show damage scalars (unique per player character)
+                let scalars = [
+                    "physicalDamageIncrease",
+                    "fireDamageIncrease",
+                    "pulseDamageIncrease",
+                    "crystDamageIncrease",
+                    "naturalDamageIncrease",
+                    "etherDamageIncrease",
+                    "igniteDamageScalar",
+                    "physicalInflictionDamageScalar",
+                ];
+                let has_scalars = scalars
+                    .iter()
+                    .any(|s| stats.get(*s).is_some_and(|v| *v != 0.0));
+                if has_scalars {
+                    println!("    ║   --- damage fingerprint ---");
+                    for &s in &scalars {
+                        if let Some(&v) = stats.get(s)
+                            && v != 0.0
+                        {
+                            println!("    ║   {:40} = {:.4}", s, v);
+                        }
+                    }
+                }
+
+                println!("    ╚══");
+            }
+        };
+
+        display_group("PLAYERS", &players);
+        display_group("ENEMIES", &enemies);
+        display_group("SYSTEM/DEFAULT", &system);
+    }
+
+    // AbilitySystem deep probe results
+    if !ability_init_events.is_empty() {
+        println!(
+            "\n  ── AbilitySystem.InitAttributes: {} events ──",
+            ability_init_events.len()
+        );
+        for (i, ev) in ability_init_events.iter().enumerate() {
+            if let Some(as_data) = ev.get("abilitySystem") {
+                let tid = as_data
+                    .get("templateId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("???");
+                let attr_ptr = as_data
+                    .get("attrPtr")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none");
+                let class_name = as_data
+                    .get("className")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tid_source = as_data
+                    .get("templateIdSource")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let attr_ptrs = as_data.get("attrPtrs").and_then(|v| v.as_array());
+                let n_attr_ptrs = attr_ptrs.map_or(0, |a| a.len());
+
+                println!(
+                    "    [{}] {} → attrPtr={} class={} ({}ptrs) {}",
+                    i,
+                    tid,
+                    &attr_ptr[attr_ptr.len().saturating_sub(10)..],
+                    class_name,
+                    n_attr_ptrs,
+                    if tid_source.is_empty() {
+                        String::new()
+                    } else {
+                        format!("via {}", tid_source)
+                    },
+                );
+
+                // Show string dumps (v7)
+                if let Some(strings) = as_data.get("stringDump").and_then(|v| v.as_array()) {
+                    println!("      String dump ({} strings):", strings.len());
+                    for s in strings.iter().take(20) {
+                        let off = s.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = s.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                        println!("        +{}: \"{}\"", off, val);
+                    }
+                    if strings.len() > 20 {
+                        println!("        ... and {} more", strings.len() - 20);
+                    }
+                }
+                if let Some(attr_strings) = as_data.get("attrStringDump").and_then(|v| v.as_array())
+                {
+                    println!("      Attributes string dump ({}):", attr_strings.len());
+                    for s in attr_strings.iter().take(10) {
+                        let off = s.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = s.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                        println!("        +{}: \"{}\"", off, val);
+                    }
+                }
+
+                // Show reflection fields (only for first event)
+                if i == 0
+                    && let Some(fields) = as_data.get("reflectionFields").and_then(|v| v.as_array())
+                {
+                    println!("    Reflected fields ({}):", fields.len());
+                    for f in fields {
+                        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let offset = f.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let ftype = f.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                        let val_str = f.get("valueStr").and_then(|v| v.as_str());
+                        print!("      {:30} off={:3} type={}", name, offset, ftype);
+                        if let Some(vs) = val_str {
+                            print!("  val=\"{}\"", vs);
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+    }
+
+    // ATTR_PTR_FIRST_SEEN summary
+    if !first_seen_events.is_empty() {
+        println!(
+            "\n  ── ATTR_PTR_FIRST_SEEN: {} unique attrPtrs ──",
+            first_seen_events.len()
+        );
+        for ev in &first_seen_events {
+            let ptr = ev.get("attrPtr").and_then(|v| v.as_str()).unwrap_or("?");
+            let tid = ev.get("templateId").and_then(|v| v.as_str());
+            let during = ev
+                .get("duringInitAttributes")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let back_src = ev
+                .get("backProbeSource")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let class_name = ev
+                .get("attrClassName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let short_ptr = &ptr[ptr.len().saturating_sub(10)..];
+            println!(
+                "    ..{} → {} {} {} {}",
+                short_ptr,
+                tid.unwrap_or("unresolved"),
+                if during { "[initAttr]" } else { "" },
+                if back_src.is_empty() {
+                    String::new()
+                } else {
+                    format!("(via {})", back_src)
+                },
+                if class_name.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", class_name)
+                },
+            );
+        }
+    }
+
     // Save JSON output
     let json_output = serde_json::json!({
         "format": "gadget",
         "character_count": characters.len(),
         "characters": characters,
+        "attr_ptr_map": attr_ptr_map,
+        "attr_ptr_profiles": attr_ptr_profiles.len(),
         "attr_names": ATTR_NAMES,
     });
 
@@ -1572,13 +2467,26 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
     all_final_names.sort();
 
     let scalar_cols = [
-        "atkFromMain", "atkFromStr", "atkFromAgi", "atkFromWisd", "atkFromWill",
-        "hpFromStr", "healFromWill", "physResistFromAgi", "energyResistFromWisd",
+        "atkFromMain",
+        "atkFromStr",
+        "atkFromAgi",
+        "atkFromWisd",
+        "atkFromWill",
+        "hpFromStr",
+        "healFromWill",
+        "physResistFromAgi",
+        "energyResistFromWisd",
     ];
 
     // Header
-    let raw_headers: Vec<String> = all_attr_names.iter().map(|n| format!("raw_{}", n)).collect();
-    let final_headers: Vec<String> = all_final_names.iter().map(|n| format!("final_{}", n)).collect();
+    let raw_headers: Vec<String> = all_attr_names
+        .iter()
+        .map(|n| format!("raw_{}", n))
+        .collect();
+    let final_headers: Vec<String> = all_final_names
+        .iter()
+        .map(|n| format!("final_{}", n))
+        .collect();
     let scalar_headers: Vec<String> = scalar_cols.iter().map(|s| s.to_string()).collect();
 
     csv_lines.push(format!(
@@ -1613,22 +2521,46 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
         let scalar_values: Vec<String> = if let Some(c) = cs {
             let s = &c.scalars;
             vec![
-                s.atk_from_main.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.atk_from_str.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.atk_from_agi.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.atk_from_wisd.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.atk_from_will.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.hp_from_str.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.heal_from_will.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.phys_resist_from_agi.map(|v| format!("{:.6}", v)).unwrap_or_default(),
-                s.energy_resist_from_wisd.map(|v| format!("{:.6}", v)).unwrap_or_default(),
+                s.atk_from_main
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.atk_from_str
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.atk_from_agi
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.atk_from_wisd
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.atk_from_will
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.hp_from_str
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.heal_from_will
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.phys_resist_from_agi
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
+                s.energy_resist_from_wisd
+                    .map(|v| format!("{:.6}", v))
+                    .unwrap_or_default(),
             ]
         } else {
             vec![String::new(); scalar_cols.len()]
         };
 
-        let main_attr = cs.and_then(|c| c.main_attr_type).map(|v| v.to_string()).unwrap_or_default();
-        let sub_attr = cs.and_then(|c| c.sub_attr_type).map(|v| v.to_string()).unwrap_or_default();
+        let main_attr = cs
+            .and_then(|c| c.main_attr_type)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let sub_attr = cs
+            .and_then(|c| c.sub_attr_type)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
 
         csv_lines.push(format!(
             "{},{},{},{},{},{},{},{},{}",
@@ -1647,6 +2579,838 @@ fn pass_gadget_extract(raw_events: &[serde_json::Value], output_dir: &str) {
     match fs::write(&csv_path, csv_lines.join("\n")) {
         Ok(()) => println!("  Saved: {}", csv_path),
         Err(e) => println!("  ERROR saving {}: {}", csv_path, e),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Config Table Analysis (hooks 7-10 events)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Default, Serialize)]
+struct ConfigTableLookup {
+    /// Category/attribute type ID (1=primary, 20=secondary, 6=tertiary)
+    category: i32,
+    sub_index: i32,
+    /// Raw pointer to the Double[103] array (for grouping by character)
+    array_ptr: String,
+    arg3: i32,
+    initialized: bool,
+    /// IL2CPP array length
+    arr_len: Option<i32>,
+    /// Index 55 marker value
+    marker: Option<f64>,
+    /// Number of attribute slots (from index 55 marker)
+    attr_count: Option<f64>,
+    /// Decoded stat values keyed by ATTR_NAMES
+    stats: Option<HashMap<String, f64>>,
+    /// Diagnostic error string
+    error: Option<String>,
+    /// Debug: non-zero doubles from first few events
+    debug_non_zero: Option<Vec<serde_json::Value>>,
+    /// Stack backtrace (first 5 calls)
+    backtrace: Option<Vec<String>>,
+    /// Character ID found on stack probe
+    stack_char_id: Option<String>,
+    retval: i32,
+    timestamp: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CalcBaseEvent {
+    args: Vec<serde_json::Value>,
+    retval: Option<serde_json::Value>,
+    timestamp: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CalcFinalEvent {
+    args: Vec<serde_json::Value>,
+    retval: Option<serde_json::Value>,
+    timestamp: u64,
+}
+
+fn pass_config_table_analysis(raw_events: &[serde_json::Value], output_dir: &str) {
+    println!("\n{}", "═".repeat(62));
+    println!("  Config Table Pipeline Analysis");
+    println!("{}\n", "═".repeat(62));
+
+    let mut table_lookups: Vec<ConfigTableLookup> = Vec::new();
+    let mut base_calcs: Vec<CalcBaseEvent> = Vec::new();
+    let mut final_calcs: Vec<CalcFinalEvent> = Vec::new();
+    let mut table_dumps: Vec<serde_json::Value> = Vec::new();
+
+    for ev in raw_events {
+        let event_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "CONFIG_TABLE_LOOKUP" => {
+                // Decode stats object
+                let stats = ev
+                    .get("stats")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| v.as_f64().map(|val| (k.clone(), val)))
+                            .collect::<HashMap<String, f64>>()
+                    })
+                    .filter(|s| !s.is_empty());
+
+                let lookup = ConfigTableLookup {
+                    category: ev.get("category").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    sub_index: ev.get("subIndex").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    array_ptr: ev
+                        .get("arrayPtr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    arg3: ev.get("arg3").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    initialized: ev
+                        .get("initialized")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    arr_len: ev.get("arrLen").and_then(|v| v.as_i64()).map(|v| v as i32),
+                    marker: ev.get("marker").and_then(|v| v.as_f64()),
+                    attr_count: ev.get("attrCount").and_then(|v| v.as_f64()),
+                    stats,
+                    error: ev
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    debug_non_zero: ev.get("debugNonZero").and_then(|v| v.as_array()).cloned(),
+                    backtrace: ev.get("backtrace").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    }),
+                    stack_char_id: ev
+                        .get("stackCharId")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    retval: ev.get("retval").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                    timestamp: ev.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
+                };
+
+                table_lookups.push(lookup);
+            }
+
+            "CALC_BASE_ATTRIBUTE" => {
+                let mut calc = CalcBaseEvent::default();
+                if let Some(args) = ev.get("args").and_then(|v| v.as_array()) {
+                    calc.args = args.clone();
+                }
+                calc.retval = ev.get("retval").cloned();
+                calc.timestamp = ev.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                base_calcs.push(calc);
+            }
+
+            "CALC_FINAL_ATTRIBUTE" => {
+                let mut calc = CalcFinalEvent::default();
+                if let Some(args) = ev.get("args").and_then(|v| v.as_array()) {
+                    calc.args = args.clone();
+                }
+                calc.retval = ev.get("retval").cloned();
+                calc.timestamp = ev.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+                final_calcs.push(calc);
+            }
+
+            "CHARACTER_ATTRIBUTE_TABLE_DUMP" => {
+                table_dumps.push(ev.clone());
+            }
+
+            _ => {}
+        }
+    }
+
+    // Report TABLE_DEEP_PROBE events (v10)
+    let deep_probes: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("TABLE_DEEP_PROBE"))
+        .collect();
+    if !deep_probes.is_empty() {
+        println!("\n  ── TABLE_DEEP_PROBE (v10 object graph) ──");
+        for probe in &deep_probes {
+            let class_name = probe
+                .get("className")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let table_ptr = probe
+                .get("tablePtr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!("    Table: {} @ {}", class_name, table_ptr);
+
+            if let Some(graph) = probe.get("graph")
+                && let Some(fields) = graph.get("fields").and_then(|v| v.as_array())
+            {
+                println!("    Fields ({}):", fields.len());
+                for f in fields {
+                    let offset = f.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let f_ptr = f.get("ptr").and_then(|v| v.as_str()).unwrap_or("?");
+                    let f_cn = f.get("className").and_then(|v| v.as_str());
+                    let f_str = f.get("stringValue").and_then(|v| v.as_str());
+                    let arr_len = f.get("possibleArrayLen").and_then(|v| v.as_i64());
+
+                    let short_ptr = &f_ptr[f_ptr.len().saturating_sub(10)..];
+                    print!("      +{:3}: ..{}", offset, short_ptr);
+                    if let Some(cn) = f_cn {
+                        print!("  [{}]", cn);
+                    }
+                    if let Some(s) = f_str {
+                        print!("  =\"{}\"", s);
+                    }
+                    if let Some(al) = arr_len {
+                        print!("  arrLen={}", al);
+                    }
+                    println!();
+
+                    // Show children (depth 1)
+                    if let Some(children) = f.get("children").and_then(|v| v.as_array()) {
+                        for child in children.iter().take(10) {
+                            let c_off = child.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let c_cn = child.get("className").and_then(|v| v.as_str());
+                            let c_str = child.get("stringValue").and_then(|v| v.as_str());
+                            let c_arr = child.get("possibleArrayLen").and_then(|v| v.as_i64());
+                            print!("        +{}→+{}", offset, c_off);
+                            if let Some(cn) = c_cn {
+                                print!("  [{}]", cn);
+                            }
+                            if let Some(s) = c_str {
+                                print!("  =\"{}\"", s);
+                            }
+                            if let Some(al) = c_arr {
+                                print!("  arrLen={}", al);
+                            }
+                            println!();
+                        }
+                        if children.len() > 10 {
+                            println!("        ... +{} more", children.len() - 10);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Report TABLE_COLUMN_DUMP events (v11)
+    let column_dumps: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("TABLE_COLUMN_DUMP"))
+        .collect();
+    if !column_dumps.is_empty() {
+        println!("\n  ── TABLE_COLUMN_DUMP (v11 bare pointer recon) ──");
+        for cd in &column_dumps {
+            let col_idx = cd.get("columnIndex").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let col_off = cd.get("columnOffset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let klass_name = cd
+                .get("klassName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(null)");
+            let data_ptr = cd.get("dataPtr").and_then(|v| v.as_str()).unwrap_or("?");
+            let klass_ptr = cd.get("klassPtr").and_then(|v| v.as_str()).unwrap_or("?");
+
+            println!(
+                "\n    Column {} (offset +{}): klass={} @ {}",
+                col_idx, col_off, klass_name, klass_ptr
+            );
+            println!("      dataPtr: {}", data_ptr);
+
+            if let Some(probe) = cd.get("probe") {
+                // Hex dump — format as rows of 16 bytes (32 hex chars + 7 spaces)
+                if let Some(hex) = probe.get("hex").and_then(|v| v.as_str()) {
+                    println!("      Data hex dump (256 bytes):");
+                    // Strip spaces for clean re-chunking
+                    let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+                    for row in 0..16 {
+                        let start = row * 32;
+                        let end = (start + 32).min(clean.len());
+                        if start >= clean.len() {
+                            break;
+                        }
+                        let row_hex = &clean[start..end];
+                        // Insert space every 2 chars for readability
+                        let formatted: String = row_hex
+                            .as_bytes()
+                            .chunks(2)
+                            .map(|c| std::str::from_utf8(c).unwrap_or("??"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("        {:04x}: {}", row * 16, formatted);
+                    }
+                }
+
+                // Header hex (64 bytes before data ptr)
+                if let Some(hdr) = probe.get("headerHex").and_then(|v| v.as_str())
+                    && !hdr.is_empty()
+                    && !hdr.starts_with('(')
+                {
+                    let clean: String = hdr.chars().filter(|c| !c.is_whitespace()).collect();
+                    println!("      Header hex (64B before dataPtr):");
+                    for row in 0..4 {
+                        let start = row * 32;
+                        let end = (start + 32).min(clean.len());
+                        if start >= clean.len() {
+                            break;
+                        }
+                        let row_hex = &clean[start..end];
+                        let formatted: String = row_hex
+                            .as_bytes()
+                            .chunks(2)
+                            .map(|c| std::str::from_utf8(c).unwrap_or("??"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("        -{:04x}: {}", (4 - row) * 16, formatted);
+                    }
+                }
+
+                // Array header detection
+                if let Some(ak) = probe.get("arrayHeaderKlass").and_then(|v| v.as_str()) {
+                    let al = probe
+                        .get("arrayHeaderLen")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    println!("      Array header: klass={} len={}", ak, al);
+                }
+
+                // Pointer fields
+                if let Some(pfs) = probe.get("pointerFields").and_then(|v| v.as_array())
+                    && !pfs.is_empty()
+                {
+                    println!("      Pointer fields ({}):", pfs.len());
+                    for pf in pfs.iter().take(16) {
+                        let off = pf.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let p = pf.get("ptr").and_then(|v| v.as_str()).unwrap_or("?");
+                        let short_p = &p[p.len().saturating_sub(12)..];
+                        print!("        +{:3}: ..{}", off, short_p);
+                        if let Some(cn) = pf.get("className").and_then(|v| v.as_str()) {
+                            print!("  obj=[{}]", cn);
+                        }
+                        if let Some(kn) = pf.get("klassName").and_then(|v| v.as_str()) {
+                            print!("  klass=[{}]", kn);
+                        }
+                        if let Some(sv) = pf.get("stringValue").and_then(|v| v.as_str()) {
+                            print!("  str=\"{}\"", sv);
+                        }
+                        println!();
+                    }
+                    if pfs.len() > 16 {
+                        println!("        ... +{} more", pfs.len() - 16);
+                    }
+                }
+
+                // String fields
+                if let Some(sfs) = probe.get("stringFields").and_then(|v| v.as_array())
+                    && !sfs.is_empty()
+                {
+                    println!("      String fields ({}):", sfs.len());
+                    for sf in sfs.iter().take(10) {
+                        let off = sf.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = sf.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                        println!("        +{}: \"{}\"", off, val);
+                    }
+                }
+
+                // Double values (stat-like)
+                if let Some(dvs) = probe.get("doubleValues").and_then(|v| v.as_array())
+                    && !dvs.is_empty()
+                {
+                    println!("      Double values ({}):", dvs.len());
+                    for dv in dvs.iter().take(20) {
+                        let off = dv.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let idx = dv.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = dv.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        println!("        +{} [{}]: {:.6}", off, idx, val);
+                    }
+                    if dvs.len() > 20 {
+                        println!("        ... +{} more", dvs.len() - 20);
+                    }
+                }
+
+                // Int32 fields
+                if let Some(ifs) = probe.get("int32Fields").and_then(|v| v.as_array())
+                    && !ifs.is_empty()
+                {
+                    println!("      Int32 fields ({}):", ifs.len());
+                    for i32f in ifs.iter().take(16) {
+                        let off = i32f.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = i32f.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
+                        println!("        +{}: {} (0x{:X})", off, val, val as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    // Report TABLE_BLOCK_HEADER events (v11)
+    let block_headers: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("TABLE_BLOCK_HEADER"))
+        .collect();
+    if !block_headers.is_empty() {
+        println!("\n  ── TABLE_BLOCK_HEADER (v11 contiguous allocation) ──");
+        for bh in &block_headers {
+            let lowest = bh
+                .get("lowestDataPtr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let highest = bh
+                .get("highestDataPtr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let klass_name = bh
+                .get("klassName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(null)");
+            let arr_len = bh
+                .get("possibleArrayLen")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            println!("    Range: {} .. {}", lowest, highest);
+            println!(
+                "    Block klass: {} | possibleArrayLen: {}",
+                klass_name, arr_len
+            );
+
+            if let Some(hex) = bh.get("headerHex").and_then(|v| v.as_str()) {
+                let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+                println!("    Header hex (32B before lowest dataPtr):");
+                for row in 0..2 {
+                    let start = row * 32;
+                    let end = (start + 32).min(clean.len());
+                    if start >= clean.len() {
+                        break;
+                    }
+                    let row_hex = &clean[start..end];
+                    let formatted: String = row_hex
+                        .as_bytes()
+                        .chunks(2)
+                        .map(|c| std::str::from_utf8(c).unwrap_or("??"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("      -{:04x}: {}", (2 - row) * 16, formatted);
+                }
+
+                // Interpret as pointers
+                if clean.len() >= 32 {
+                    println!("    Interpreted as qwords:");
+                    for qi in 0..4 {
+                        let qstart = qi * 16;
+                        let qend = (qstart + 16).min(clean.len());
+                        if qstart >= clean.len() {
+                            break;
+                        }
+                        let qhex = &clean[qstart..qend];
+                        // Reverse bytes for little-endian qword
+                        let le_bytes: String = qhex
+                            .as_bytes()
+                            .chunks(2)
+                            .rev()
+                            .map(|c| std::str::from_utf8(c).unwrap_or("??"))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        println!("      qword[{}]: 0x{} (LE: {})", qi, le_bytes, qhex);
+                    }
+                }
+            }
+        }
+    }
+
+    // Report TABLE_DICT_SUMMARY events (v10)
+    let dict_summaries: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("TABLE_DICT_SUMMARY"))
+        .collect();
+    if !dict_summaries.is_empty() {
+        println!("\n  ── Dictionary Summaries (v10) ──");
+        for ds in &dict_summaries {
+            let offset = ds
+                .get("dictOffset")
+                .and_then(|v| v.as_str())
+                .or_else(|| ds.get("dictOffset").and_then(|v| v.as_i64()).map(|_| ""));
+            let offset_str = offset.unwrap_or("?");
+            // Handle both string and int offset
+            let offset_display = if offset_str.is_empty() {
+                ds.get("dictOffset")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            } else {
+                offset_str.to_string()
+            };
+            let dict_cn = ds
+                .get("dictClassName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let count = ds.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            let stride = ds.get("stride").and_then(|v| v.as_i64()).unwrap_or(0);
+            let chr_count = ds
+                .get("chrEntryCount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            println!(
+                "    Dict at +{}: {} entries (stride={}), {} chr_ keys [{}]",
+                offset_display, count, stride, chr_count, dict_cn
+            );
+
+            if let Some(keys) = ds.get("sampleKeys").and_then(|v| v.as_array()) {
+                let key_strs: Vec<&str> = keys.iter().filter_map(|v| v.as_str()).take(10).collect();
+                if !key_strs.is_empty() {
+                    println!("      Sample keys: {}", key_strs.join(", "));
+                }
+            }
+        }
+    }
+
+    // Report TABLE_CHARACTER_ENTRY events (v10)
+    let table_entries: Vec<_> = raw_events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some("TABLE_CHARACTER_ENTRY"))
+        .collect();
+    if !table_entries.is_empty() {
+        // Separate chr_ entries from others
+        let chr_entries: Vec<_> = table_entries
+            .iter()
+            .filter(|ev| {
+                ev.get("charId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.starts_with("chr_"))
+            })
+            .collect();
+        let other_entries: Vec<_> = table_entries
+            .iter()
+            .filter(|ev| {
+                !ev.get("charId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.starts_with("chr_"))
+            })
+            .collect();
+
+        println!(
+            "\n  ── Table Character Entries (v10): {} total ({} chr_, {} other) ──",
+            table_entries.len(),
+            chr_entries.len(),
+            other_entries.len()
+        );
+
+        for entry in &chr_entries {
+            let char_id = entry.get("charId").and_then(|v| v.as_str()).unwrap_or("?");
+            let val_cn = entry
+                .get("valueClassName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            print!("    {} [{}]", char_id, val_cn);
+
+            if let Some(stats) = entry.get("stats").and_then(|v| v.as_object()) {
+                let core = ["hp", "str", "agi", "wisd", "will", "atk", "def", "maxHp"];
+                let mut shown = Vec::new();
+                for &s in &core {
+                    if let Some(v) = stats.get(s).and_then(|v| v.as_f64())
+                        && v != 0.0
+                    {
+                        shown.push(format!("{}={:.0}", s, v));
+                    }
+                }
+                if !shown.is_empty() {
+                    print!(" — {}", shown.join(", "));
+                }
+                let total_stats = stats.len();
+                if total_stats > shown.len() {
+                    print!(" (+{} more)", total_stats - shown.len());
+                }
+            } else {
+                print!(" — no stats");
+            }
+            println!();
+
+            // Show string fields for identification
+            if let Some(strings) = entry.get("stringFields").and_then(|v| v.as_array()) {
+                for s in strings.iter().take(3) {
+                    let soff = s.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let sval = s.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!("      +{}: \"{}\"", soff, sval);
+                }
+            }
+        }
+
+        if !other_entries.is_empty() {
+            println!("    ({} non-chr_ entries omitted)", other_entries.len());
+        }
+    }
+
+    // Report table dumps
+    if !table_dumps.is_empty() {
+        println!("  Character Attribute Table Dumps: {}", table_dumps.len());
+        for (i, dump) in table_dumps.iter().enumerate() {
+            let status = dump.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("\n  ── Table Dump #{} (status: {}) ──", i + 1, status);
+
+            if let Some(table) = dump.get("table") {
+                if let Some(cn) = table.get("className").and_then(|v| v.as_str()) {
+                    let ns = table
+                        .get("classNamespace")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    println!("    Class: {}.{}", ns, cn);
+                }
+                if let Some(ptr_str) = table.get("ptr").and_then(|v| v.as_str()) {
+                    println!("    Ptr: {}", ptr_str);
+                }
+
+                // Show fields from reflection
+                if let Some(fields) = table.get("fields").and_then(|v| v.as_array()) {
+                    println!("    Fields ({}):", fields.len());
+                    for f in fields {
+                        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let offset = f.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let arr_len = f.get("arrayLength").and_then(|v| v.as_i64());
+                        let val_ptr = f.get("valuePtr").and_then(|v| v.as_str());
+
+                        print!("      {:30} offset={}", name, offset);
+                        if let Some(vp) = val_ptr {
+                            print!("  ptr={}", vp);
+                        }
+                        if let Some(al) = arr_len {
+                            print!("  arrayLen={}", al);
+                        }
+                        println!();
+                    }
+                }
+
+                // Show string fields from table scan
+                if let Some(strings) = table.get("stringFields").and_then(|v| v.as_array()) {
+                    println!("    String fields ({}):", strings.len());
+                    for s in strings {
+                        let off = s.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let val = s.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                        println!("      +{}: \"{}\"", off, val);
+                    }
+                }
+
+                // Show dictionary probe results
+                if let Some(count) = table.get("possibleDictEntries").and_then(|v| v.as_i64()) {
+                    println!("    Possible dictionary entries: {}", count);
+                }
+                if let Some(samples) = table.get("sampleEntries").and_then(|v| v.as_array()) {
+                    println!("    Sample entries ({}):", samples.len());
+                    for (si, entry) in samples.iter().enumerate() {
+                        let hash = entry.get("hashCode").and_then(|v| v.as_i64()).unwrap_or(0);
+                        // Check multiple key offsets
+                        let mut keys = Vec::new();
+                        for koff in [8, 16, 24] {
+                            let field = format!("keyAt{}", koff);
+                            if let Some(k) = entry.get(&field).and_then(|v| v.as_str()) {
+                                keys.push(format!("+{}=\"{}\"", koff, k));
+                            }
+                        }
+                        // Fallback to old field name
+                        if keys.is_empty()
+                            && let Some(k) = entry.get("keyAsString").and_then(|v| v.as_str())
+                        {
+                            keys.push(format!("key=\"{}\"", k));
+                        }
+                        let key_str = if keys.is_empty() {
+                            "(no string key)".to_string()
+                        } else {
+                            keys.join(" ")
+                        };
+                        println!("      [{}] hash={} {}", si, hash, key_str);
+                        if let Some(vh) = entry.get("valueHex").and_then(|v| v.as_str()) {
+                            println!("           valueHex: {}...", &vh[..vh.len().min(96)]);
+                        }
+                    }
+                }
+
+                // Show hex dump (truncated)
+                if let Some(hex) = table.get("hexDump256").and_then(|v| v.as_str()) {
+                    println!(
+                        "    Hex dump (first 64 bytes): {}...",
+                        &hex[..hex.len().min(192)]
+                    );
+                }
+            }
+
+            if let Some(err) = dump.get("error").and_then(|v| v.as_str()) {
+                println!("    Error: {}", err);
+            }
+        }
+    } else {
+        println!("  No CHARACTER_ATTRIBUTE_TABLE_DUMP events.");
+        println!("  DataManager.OnInit may not have fired yet.");
+    }
+
+    // Report table lookups
+    println!("\n  Config Table Lookups: {}", table_lookups.len());
+    if !table_lookups.is_empty() {
+        let init_count = table_lookups.iter().filter(|l| l.initialized).count();
+        let uninit_count = table_lookups.len() - init_count;
+        println!(
+            "    {} initialized, {} uninitialized",
+            init_count, uninit_count
+        );
+
+        // Group by arrayPtr (each unique ptr = a distinct character's data)
+        let mut by_ptr: HashMap<&str, Vec<&ConfigTableLookup>> = HashMap::new();
+        for lookup in &table_lookups {
+            by_ptr.entry(&lookup.array_ptr).or_default().push(lookup);
+        }
+        println!("    {} unique array pointers (≈ characters)", by_ptr.len());
+
+        // Category distribution
+        let mut cat_counts: HashMap<i32, usize> = HashMap::new();
+        for lookup in &table_lookups {
+            *cat_counts.entry(lookup.category).or_default() += 1;
+        }
+        let mut cats: Vec<_> = cat_counts.iter().collect();
+        cats.sort_by_key(|(k, _)| **k);
+        print!("    Categories:");
+        for (cat, count) in &cats {
+            print!(" {}(×{})", cat, count);
+        }
+        println!();
+
+        // Print stat tables for initialized lookups
+        for lookup in table_lookups.iter().filter(|l| l.initialized) {
+            println!(
+                "\n    ── Config Stats (cat={} ptr={}) ──",
+                lookup.category,
+                &lookup.array_ptr[lookup.array_ptr.len().saturating_sub(10)..]
+            );
+            if let Some(stats) = &lookup.stats {
+                let mut entries: Vec<_> = stats.iter().collect();
+                entries.sort_by_key(|(k, _)| k.to_string());
+                for (name, val) in &entries {
+                    if **val != 0.0 {
+                        println!("      {:40} = {:.6}", name, val);
+                    }
+                }
+            }
+            println!(
+                "      attrCount={:.0} retval=0x{:X}",
+                lookup.attr_count.unwrap_or(0.0),
+                lookup.retval as u32
+            );
+        }
+
+        // Show first few lookup summaries with diagnostics
+        println!(
+            "\n    First {} lookup details:",
+            table_lookups.len().min(10)
+        );
+        for (i, lookup) in table_lookups.iter().take(10).enumerate() {
+            let stat_count = lookup.stats.as_ref().map_or(0, |s| s.len());
+            println!(
+                "      [{}] cat={} sub={} init={} stats={} arrLen={:?} marker={:?} ptr=..{} ret=0x{:X}",
+                i,
+                lookup.category,
+                lookup.sub_index,
+                lookup.initialized,
+                stat_count,
+                lookup.arr_len,
+                lookup.marker,
+                &lookup.array_ptr[lookup.array_ptr.len().saturating_sub(8)..],
+                lookup.retval as u32,
+            );
+            if let Some(char_id) = &lookup.stack_char_id {
+                println!("             >>> STACK CHAR ID: {}", char_id);
+            }
+            if let Some(bt) = &lookup.backtrace {
+                println!("             backtrace:");
+                for frame in bt.iter().take(5) {
+                    println!("               {}", frame);
+                }
+            }
+            if let Some(err) = &lookup.error {
+                println!("             error: {}", err);
+            }
+            if let Some(nz) = &lookup.debug_non_zero {
+                println!("             non-zero doubles ({}):", nz.len());
+                for entry in nz.iter().take(20) {
+                    let idx = entry.get("idx").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    let val = entry.get("val").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let name = if idx >= 56 && (idx - 56) < ATTR_NAMES.len() as i64 {
+                        ATTR_NAMES[(idx - 56) as usize]
+                    } else {
+                        ""
+                    };
+                    if name.is_empty() {
+                        println!("               [{:3}] = {:.6}", idx, val);
+                    } else {
+                        println!("               [{:3}] = {:.6}  ({})", idx, val, name);
+                    }
+                }
+                if nz.len() > 20 {
+                    println!("               ... and {} more", nz.len() - 20);
+                }
+            }
+        }
+    }
+
+    // Report base attribute calculations
+    println!("\n  Base Attribute Calculations: {}", base_calcs.len());
+    if !base_calcs.is_empty() {
+        println!("    First {} events:", base_calcs.len().min(5));
+        for (i, calc) in base_calcs.iter().take(5).enumerate() {
+            println!("      [{}] {} args:", i, calc.args.len());
+            for (ai, arg) in calc.args.iter().enumerate() {
+                let raw = arg.get("raw").and_then(|v| v.as_str()).unwrap_or("?");
+                let as_int = arg.get("asInt32").and_then(|v| v.as_i64());
+                print!("        arg[{}]: raw={}", ai, raw);
+                if let Some(i) = as_int {
+                    print!(" int32={}", i);
+                }
+                println!();
+            }
+            if let Some(ret) = &calc.retval {
+                let raw = ret.get("raw").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("        retval: raw={}", raw);
+            }
+        }
+    }
+
+    // Report final attribute calculations
+    println!("\n  Final Attribute Calculations: {}", final_calcs.len());
+    if !final_calcs.is_empty() {
+        println!("    First {} events:", final_calcs.len().min(5));
+        for (i, calc) in final_calcs.iter().take(5).enumerate() {
+            println!("      [{}] {} args:", i, calc.args.len());
+            for (ai, arg) in calc.args.iter().enumerate() {
+                let raw = arg.get("raw").and_then(|v| v.as_str()).unwrap_or("?");
+                let as_int = arg.get("asInt32").and_then(|v| v.as_i64());
+                print!("        arg[{}]: raw={}", ai, raw);
+                if let Some(i) = as_int {
+                    print!(" int32={}", i);
+                }
+                println!();
+            }
+            if let Some(ret) = &calc.retval {
+                let raw = ret.get("raw").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("        retval: raw={}", raw);
+            }
+        }
+    }
+
+    // Save config table analysis JSON
+    let unique_ptrs: std::collections::HashSet<&str> =
+        table_lookups.iter().map(|l| l.array_ptr.as_str()).collect();
+    let analysis = serde_json::json!({
+        "table_dumps": table_dumps,
+        "table_lookups": table_lookups,
+        "base_calculations": base_calcs.len(),
+        "final_calculations": final_calcs.len(),
+        "initialized_lookups": table_lookups.iter().filter(|l| l.initialized).count(),
+        "unique_array_ptrs": unique_ptrs.len(),
+    });
+
+    let _ = fs::create_dir_all(output_dir);
+    let json_path = format!("{}/config_table_analysis.json", output_dir);
+    match fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&analysis).unwrap_or_default(),
+    ) {
+        Ok(()) => println!("\n  Saved: {}", json_path),
+        Err(e) => println!("\n  ERROR saving {}: {}", json_path, e),
     }
 }
 
@@ -1698,7 +3462,9 @@ fn main() {
                 println!("Options:");
                 println!("  --dump, -d <path>       IL2CPP dump JSON (from frida_il2cpp_scan.js)");
                 println!("  --capture, -c <path>    Capture log (from frida_char_data.js)");
-                println!("  --output-dir, -o <dir>  Output directory [default: ./output/character_stats]");
+                println!(
+                    "  --output-dir, -o <dir>  Output directory [default: ./output/character_stats]"
+                );
                 println!("  --suggest, -s           Generate hook target suggestions from dump");
                 println!("  --help, -h              Show this help");
                 println!();
@@ -1714,8 +3480,13 @@ fn main() {
                 return;
             }
             other => {
-                // Positional: first = dump, second = capture
-                if dump_path.is_none() {
+                // Positional: auto-detect by extension
+                if other.ends_with(".jsonl") || other.ends_with(".log") {
+                    // Capture log or JSONL events file
+                    if capture_path.is_none() {
+                        capture_path = Some(other.to_string());
+                    }
+                } else if dump_path.is_none() {
                     dump_path = Some(other.to_string());
                 } else if capture_path.is_none() {
                     capture_path = Some(other.to_string());
@@ -1725,29 +3496,33 @@ fn main() {
         i += 1;
     }
 
-    if dump_path.is_none() {
-        eprintln!("ERROR: --dump <path> is required");
+    if dump_path.is_none() && capture_path.is_none() {
+        eprintln!("ERROR: --dump <path> and/or --capture <path> is required");
         eprintln!("Run with --help for usage info");
         std::process::exit(1);
     }
 
     let _ = fs::create_dir_all(&output_dir);
 
-    // Pass 1: Parse dump
-    let dump = match pass_1_parse_dump(dump_path.as_ref().unwrap()) {
-        Some(d) => d,
-        None => {
-            eprintln!("Failed to parse IL2CPP dump. Aborting.");
-            std::process::exit(1);
+    // Pass 1+2: Parse dump (optional — skip if only capture provided)
+    let dump;
+    let scored;
+    if let Some(dp) = &dump_path {
+        dump = match pass_1_parse_dump(dp) {
+            Some(d) => Some(d),
+            None => {
+                eprintln!("Failed to parse IL2CPP dump. Continuing without dump.");
+                None
+            }
+        };
+        scored = dump.as_ref().map(pass_2_rank);
+
+        if suggest_mode && let Some(s) = &scored {
+            suggest_targets(s, &output_dir);
         }
-    };
-
-    // Pass 2: Rank classes
-    let scored = pass_2_rank(&dump);
-
-    // Suggest mode
-    if suggest_mode {
-        suggest_targets(&scored, &output_dir);
+    } else {
+        dump = None;
+        scored = None;
     }
 
     // If no capture log, we're done (dump-only mode)
@@ -1784,21 +3559,54 @@ fn main() {
                 | "ATTR_REFRESH_ALL"
                 | "ATTR_DUMP"
                 | "ABILITY_INIT_ATTRIBUTES"
+                | "ABILITY_INIT_DEEP"
                 | "ATTR_GET_VALUE"
+                | "ATTR_PTR_FIRST_SEEN"
                 | "FINAL_ATTRIBUTES"
                 | "SCAN_CHAR_DATA"
+                | "CONFIG_TABLE_LOOKUP"
+                | "CALC_BASE_ATTRIBUTE"
+                | "TABLE_DEEP_PROBE"
+                | "TABLE_CHARACTER_ENTRY"
+                | "TABLE_DICT_SUMMARY"
+                | "CALC_FINAL_ATTRIBUTE"
+                | "CHARACTER_ATTRIBUTE_TABLE_DUMP"
+                | "FULL_CHARACTER_CAPTURE"
+                | "INIT_ATTRIBUTES_UNRESOLVED"
+                | "ATTR_REFRESH_UPDATE"
         )
     });
 
     if has_gadget_events {
         // Pass 4+5 (gadget): Direct stat extraction
         pass_gadget_extract(&raw_events, &output_dir);
-    } else {
-        // Pass 4: Correlate (legacy)
-        pass_4_correlate(&old_events, &scored, &dump);
+
+        // Pass 6: Config table pipeline analysis (hooks 7-10)
+        let has_config_events = raw_events.iter().any(|ev| {
+            let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(
+                t,
+                "CONFIG_TABLE_LOOKUP"
+                    | "CALC_BASE_ATTRIBUTE"
+                    | "CALC_FINAL_ATTRIBUTE"
+                    | "CHARACTER_ATTRIBUTE_TABLE_DUMP"
+                    | "TABLE_DEEP_PROBE"
+                    | "TABLE_CHARACTER_ENTRY"
+                    | "TABLE_DICT_SUMMARY"
+            )
+        });
+        if has_config_events {
+            pass_config_table_analysis(&raw_events, &output_dir);
+        }
+    } else if let (Some(s), Some(d)) = (&scored, &dump) {
+        // Pass 4: Correlate (legacy — requires dump)
+        pass_4_correlate(&old_events, s, d);
 
         // Pass 5: Extract stats (legacy)
         pass_5_extract_stats(&old_events, &output_dir);
+    } else {
+        println!("  Legacy format but no IL2CPP dump provided — skipping passes 4+5.");
+        println!("  Provide --dump <path> for full legacy analysis.");
     }
 
     println!("\n{}", "═".repeat(62));

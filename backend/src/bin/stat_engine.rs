@@ -143,24 +143,53 @@ struct ModifierSummary {
 
 /// Attribute names indexed by position
 const ATTR_NAMES: &[&str] = &[
-    "hp", "str", "agi", "wisd", "will", "atk", "def", "maxHp",
-    "maxUltimateSp", "maxPoise", "poiseRecTime", "poiseRecTimeScalar",
-    "physicalDamageTakenScalar", "fireDamageTakenScalar",
-    "pulseDamageTakenScalar", "crystDamageTakenScalar",
-    "naturalDamageTakenScalar", "etherDamageTakenScalar",
-    "weight", "criticalRate", "criticalDamageIncrease",
-    "moveSpeedMultiplier", "turnRateMultiplier", "attackRate",
-    "skillCooldownScalar", "normalAttackRange",
-    "hpRecoveryPerSec", "hpRecoveryPerSecByHpRatio",
-    "poiseTakenScalar", "poiseOutputScalar",
-    "breakingAttackDamageTakenScalar", "knockDownTimeAddition",
-    "healOutputIncrease", "healTakenIncrease", "lifeSteal",
-    "ultimateSpGainScalar", "atbCostAddition", "skillCooldownAddition",
-    "comboSkillCooldownScalar", "igniteDamageScalar",
+    "hp",
+    "str",
+    "agi",
+    "wisd",
+    "will",
+    "atk",
+    "def",
+    "maxHp",
+    "maxUltimateSp",
+    "maxPoise",
+    "poiseRecTime",
+    "poiseRecTimeScalar",
+    "physicalDamageTakenScalar",
+    "fireDamageTakenScalar",
+    "pulseDamageTakenScalar",
+    "crystDamageTakenScalar",
+    "naturalDamageTakenScalar",
+    "etherDamageTakenScalar",
+    "weight",
+    "criticalRate",
+    "criticalDamageIncrease",
+    "moveSpeedMultiplier",
+    "turnRateMultiplier",
+    "attackRate",
+    "skillCooldownScalar",
+    "normalAttackRange",
+    "hpRecoveryPerSec",
+    "hpRecoveryPerSecByHpRatio",
+    "poiseTakenScalar",
+    "poiseOutputScalar",
+    "breakingAttackDamageTakenScalar",
+    "knockDownTimeAddition",
+    "healOutputIncrease",
+    "healTakenIncrease",
+    "lifeSteal",
+    "ultimateSpGainScalar",
+    "atbCostAddition",
+    "skillCooldownAddition",
+    "comboSkillCooldownScalar",
+    "igniteDamageScalar",
     "physicalInflictionDamageScalar",
-    "physicalDamageIncrease", "fireDamageIncrease",
-    "pulseDamageIncrease", "crystDamageIncrease",
-    "naturalDamageIncrease", "etherDamageIncrease",
+    "physicalDamageIncrease",
+    "fireDamageIncrease",
+    "pulseDamageIncrease",
+    "crystDamageIncrease",
+    "naturalDamageIncrease",
+    "etherDamageIncrease",
 ];
 
 fn attr_name(idx: usize) -> String {
@@ -200,7 +229,10 @@ fn named_from_array(arr: &[f64]) -> HashMap<String, f64> {
 ///   value *= product(1 + finalMultipliers[i])
 fn apply_modifiers(raw_value: f64, attr_idx: usize, modifiers: &[ModifierData]) -> f64 {
     let get_layer = |layer: &Option<Vec<f64>>, idx: usize| -> f64 {
-        layer.as_ref().and_then(|v| v.get(idx).copied()).unwrap_or(0.0)
+        layer
+            .as_ref()
+            .and_then(|v| v.get(idx).copied())
+            .unwrap_or(0.0)
     };
 
     let mut base = raw_value;
@@ -253,18 +285,16 @@ fn apply_modifiers(raw_value: f64, attr_idx: usize, modifiers: &[ModifierData]) 
 }
 
 /// Apply cross-attribute scaling (STR -> HP add, mainAttr -> ATK scalar, etc.)
-fn apply_cross_attribute_scaling(
-    stats: &mut HashMap<String, f64>,
-    scalars: &HashMap<String, f64>,
-) {
+fn apply_cross_attribute_scaling(stats: &mut HashMap<String, f64>, scalars: &HashMap<String, f64>) {
     // HP bonus from STR
     if let Some(&hp_from_str) = scalars.get("hpFromStr")
-        && hp_from_str != 0.0 {
-            let current_hp = stats.get("hp").copied().unwrap_or(0.0);
-            stats.insert("hp".into(), current_hp + hp_from_str);
-            let current_max = stats.get("maxHp").copied().unwrap_or(0.0);
-            stats.insert("maxHp".into(), current_max + hp_from_str);
-        }
+        && hp_from_str != 0.0
+    {
+        let current_hp = stats.get("hp").copied().unwrap_or(0.0);
+        stats.insert("hp".into(), current_hp + hp_from_str);
+        let current_max = stats.get("maxHp").copied().unwrap_or(0.0);
+        stats.insert("maxHp".into(), current_max + hp_from_str);
+    }
 
     // ATK scaling from main + sub attributes
     let total_atk_scalar = {
@@ -281,13 +311,17 @@ fn apply_cross_attribute_scaling(
     };
 
     if total_atk_scalar != 0.0
-        && let Some(atk) = stats.get_mut("atk") {
-            *atk *= 1.0 + total_atk_scalar;
-        }
+        && let Some(atk) = stats.get_mut("atk")
+    {
+        *atk *= 1.0 + total_atk_scalar;
+    }
 }
 
 /// Build a full stat sheet from a calibration snapshot.
-fn build_stat_sheet(record: &CalibrationRecord, snapshot_idx: Option<usize>) -> Option<CharacterStatSheet> {
+fn build_stat_sheet(
+    record: &CalibrationRecord,
+    snapshot_idx: Option<usize>,
+) -> Option<CharacterStatSheet> {
     let snap = if let Some(idx) = snapshot_idx {
         record.snapshots.get(idx)?
     } else {
@@ -299,7 +333,9 @@ fn build_stat_sheet(record: &CalibrationRecord, snapshot_idx: Option<usize>) -> 
     let break_stage = snap.break_stage.unwrap_or(0);
 
     // Raw stats from m_rawData
-    let raw_stats = snap.raw_data.as_ref()
+    let raw_stats = snap
+        .raw_data
+        .as_ref()
         .map(|d| named_from_array(d))
         .unwrap_or_default();
 
@@ -330,7 +366,9 @@ fn build_stat_sheet(record: &CalibrationRecord, snapshot_idx: Option<usize>) -> 
     let scalars = snap.scalars.clone().unwrap_or_default();
 
     // Main/sub attr types
-    let main_attr = snap.main_attr_type.as_ref()
+    let main_attr = snap
+        .main_attr_type
+        .as_ref()
         .filter(|t| t.has_value)
         .map(|t| {
             if (t.value as usize) < ATTR_NAMES.len() {
@@ -339,7 +377,9 @@ fn build_stat_sheet(record: &CalibrationRecord, snapshot_idx: Option<usize>) -> 
                 format!("attr_{}", t.value)
             }
         });
-    let sub_attr = snap.sub_attr_type.as_ref()
+    let sub_attr = snap
+        .sub_attr_type
+        .as_ref()
         .filter(|t| t.has_value)
         .map(|t| {
             if (t.value as usize) < ATTR_NAMES.len() {
@@ -359,27 +399,40 @@ fn build_stat_sheet(record: &CalibrationRecord, snapshot_idx: Option<usize>) -> 
         if let Some(ba) = &m.base_additions {
             for (i, &v) in ba.iter().enumerate() {
                 if v != 0.0 {
-                    *mod_summary.total_base_additions.entry(attr_name(i)).or_insert(0.0) += v;
+                    *mod_summary
+                        .total_base_additions
+                        .entry(attr_name(i))
+                        .or_insert(0.0) += v;
                 }
             }
         }
         if let Some(ml) = &m.multipliers {
             for (i, &v) in ml.iter().enumerate() {
                 if v != 0.0 {
-                    *mod_summary.total_multipliers.entry(attr_name(i)).or_insert(0.0) += v;
+                    *mod_summary
+                        .total_multipliers
+                        .entry(attr_name(i))
+                        .or_insert(0.0) += v;
                 }
             }
         }
         if let Some(fa) = &m.final_additions {
             for (i, &v) in fa.iter().enumerate() {
                 if v != 0.0 {
-                    *mod_summary.total_final_additions.entry(attr_name(i)).or_insert(0.0) += v;
+                    *mod_summary
+                        .total_final_additions
+                        .entry(attr_name(i))
+                        .or_insert(0.0) += v;
                 }
             }
         }
     }
 
-    let data_source = if snap.final_cached_data.as_ref().is_some_and(|f| f.data.is_some()) {
+    let data_source = if snap
+        .final_cached_data
+        .as_ref()
+        .is_some_and(|f| f.data.is_some())
+    {
         "finalCachedData (direct capture)"
     } else if !snap.modifiers.is_empty() {
         "computed (raw + modifiers)"
@@ -415,7 +468,9 @@ struct GrowthCurve {
 
 fn estimate_growth_curve(record: &CalibrationRecord) -> Option<GrowthCurve> {
     // Need at least 2 snapshots at different levels
-    let mut level_snaps: Vec<(i64, &CalibrationSnapshot)> = record.snapshots.iter()
+    let mut level_snaps: Vec<(i64, &CalibrationSnapshot)> = record
+        .snapshots
+        .iter()
         .filter_map(|s| s.level.map(|l| (l, s)))
         .collect();
     level_snaps.sort_by_key(|(l, _)| *l);
@@ -435,10 +490,16 @@ fn estimate_growth_curve(record: &CalibrationRecord) -> Option<GrowthCurve> {
     let first = level_snaps.first()?;
     let last = level_snaps.last()?;
 
-    let first_raw = first.1.base_non_converted.as_ref()
+    let first_raw = first
+        .1
+        .base_non_converted
+        .as_ref()
         .and_then(|c| c.data.as_ref())
         .or(first.1.raw_data.as_ref())?;
-    let last_raw = last.1.base_non_converted.as_ref()
+    let last_raw = last
+        .1
+        .base_non_converted
+        .as_ref()
         .and_then(|c| c.data.as_ref())
         .or(last.1.raw_data.as_ref())?;
 
@@ -473,7 +534,10 @@ fn estimate_growth_curve(record: &CalibrationRecord) -> Option<GrowthCurve> {
 // ══════════════════════════════════════════════════════════════
 
 fn display_stat_sheet(sheet: &CharacterStatSheet) {
-    println!("  ╔══ {} (Lv{}, Break{}) ══", sheet.template_id, sheet.level, sheet.break_stage);
+    println!(
+        "  ╔══ {} (Lv{}, Break{}) ══",
+        sheet.template_id, sheet.level, sheet.break_stage
+    );
     println!("  ║ Data source: {}", sheet.data_source);
 
     if let Some(ref mat) = sheet.main_attr_type {
@@ -486,20 +550,28 @@ fn display_stat_sheet(sheet: &CharacterStatSheet) {
     // Core stats comparison
     let core = ["hp", "maxHp", "atk", "def", "str", "agi", "wisd", "will"];
     println!("  ║");
-    println!("  ║ {:20} {:>12} {:>12} {:>8}", "Stat", "Raw", "Final", "Ratio");
+    println!(
+        "  ║ {:20} {:>12} {:>12} {:>8}",
+        "Stat", "Raw", "Final", "Ratio"
+    );
     println!("  ║ {}", "-".repeat(56));
     for &stat in &core {
         let raw = sheet.raw_stats.get(stat).copied().unwrap_or(0.0);
         let fin = sheet.final_stats.get(stat).copied().unwrap_or(0.0);
         if raw != 0.0 || fin != 0.0 {
             let ratio = if raw != 0.0 { fin / raw } else { 0.0 };
-            println!("  ║ {:20} {:>12.2} {:>12.2} {:>8.3}x", stat, raw, fin, ratio);
+            println!(
+                "  ║ {:20} {:>12.2} {:>12.2} {:>8.3}x",
+                stat, raw, fin, ratio
+            );
         }
     }
 
     // Secondary stats
     let shown: std::collections::HashSet<&str> = core.iter().copied().collect();
-    let mut other: Vec<_> = sheet.final_stats.iter()
+    let mut other: Vec<_> = sheet
+        .final_stats
+        .iter()
         .filter(|(k, _)| !shown.contains(k.as_str()))
         .collect();
     other.sort_by(|a, b| a.0.cmp(b.0));
@@ -593,9 +665,15 @@ fn main() {
                 println!("Usage: {} [OPTIONS]", args[0]);
                 println!();
                 println!("Options:");
-                println!("  --calibration, -C <path>   Calibration data JSON (from frida_calibration.js)");
-                println!("  --char, -c <id>            Query specific character (e.g., chr_0004_pelica)");
-                println!("  --output-dir, -o <dir>     Output directory [default: ./output/stat_engine]");
+                println!(
+                    "  --calibration, -C <path>   Calibration data JSON (from frida_calibration.js)"
+                );
+                println!(
+                    "  --char, -c <id>            Query specific character (e.g., chr_0004_pelica)"
+                );
+                println!(
+                    "  --output-dir, -o <dir>     Output directory [default: ./output/stat_engine]"
+                );
                 println!("  --export, -e               Export full stat tables as JSON + CSV");
                 println!("  --help, -h                 Show this help");
                 println!();
@@ -604,7 +682,10 @@ fn main() {
                 println!("     {} -C calibration_data.json", args[0]);
                 println!();
                 println!("  2. Query one character:");
-                println!("     {} -C calibration_data.json -c chr_0004_pelica", args[0]);
+                println!(
+                    "     {} -C calibration_data.json -c chr_0004_pelica",
+                    args[0]
+                );
                 println!();
                 println!("  3. Export stat tables:");
                 println!("     {} -C calibration_data.json --export", args[0]);
@@ -668,7 +749,8 @@ fn main() {
         })
     };
 
-    println!("  Loaded: {} ({} characters, {} calculator calls, v{})",
+    println!(
+        "  Loaded: {} ({} characters, {} calculator calls, v{})",
         cal_path,
         cal.characters.len(),
         cal.calculator_interceptions.len(),
@@ -693,9 +775,10 @@ fn main() {
     for record in &records {
         // Filter by query if specified
         if let Some(ref qc) = query_char
-            && !record.template_id.contains(qc.as_str()) {
-                continue;
-            }
+            && !record.template_id.contains(qc.as_str())
+        {
+            continue;
+        }
 
         if let Some(sheet) = build_stat_sheet(record, None) {
             sheets.push(sheet);
@@ -727,16 +810,20 @@ fn main() {
     let mut curves: Vec<GrowthCurve> = Vec::new();
     for record in &records {
         if let Some(ref qc) = query_char
-            && !record.template_id.contains(qc.as_str()) {
-                continue;
-            }
+            && !record.template_id.contains(qc.as_str())
+        {
+            continue;
+        }
         if let Some(curve) = estimate_growth_curve(record) {
             curves.push(curve);
         }
     }
 
     if !curves.is_empty() {
-        println!("\n  Growth curves ({} characters with multi-level data):\n", curves.len());
+        println!(
+            "\n  Growth curves ({} characters with multi-level data):\n",
+            curves.len()
+        );
         for curve in &curves {
             println!("  {} (levels: {:?})", curve.template_id, curve.levels);
             println!("    Per-level growth:");
@@ -762,7 +849,10 @@ fn main() {
             "calculator_interceptions": cal.calculator_interceptions.len(),
         });
         let json_path = format!("{}/stat_sheets.json", output_dir);
-        match fs::write(&json_path, serde_json::to_string_pretty(&json_output).unwrap_or_default()) {
+        match fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+        ) {
             Ok(()) => println!("  Exported: {}", json_path),
             Err(e) => println!("  ERROR: {}: {}", json_path, e),
         }
@@ -772,7 +862,8 @@ fn main() {
         let mut csv = Vec::new();
 
         // Collect all stat names
-        let mut all_stats: Vec<String> = sheets.iter()
+        let mut all_stats: Vec<String> = sheets
+            .iter()
             .flat_map(|s| s.final_stats.keys().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -780,27 +871,52 @@ fn main() {
         all_stats.sort();
 
         let scalar_keys = [
-            "atkFromMain", "atkFromStr", "atkFromAgi", "atkFromWisd", "atkFromWill",
-            "hpFromStr", "healFromWill", "physResistFromAgi", "energyResistFromWisd",
+            "atkFromMain",
+            "atkFromStr",
+            "atkFromAgi",
+            "atkFromWisd",
+            "atkFromWill",
+            "hpFromStr",
+            "healFromWill",
+            "physResistFromAgi",
+            "energyResistFromWisd",
         ];
 
         csv.push(format!(
             "templateId,level,breakStage,mainAttr,subAttr,dataSource,{},{}",
-            all_stats.iter().map(|s| format!("final_{}", s)).collect::<Vec<_>>().join(","),
+            all_stats
+                .iter()
+                .map(|s| format!("final_{}", s))
+                .collect::<Vec<_>>()
+                .join(","),
             scalar_keys.join(","),
         ));
 
         for s in &sheets {
-            let stat_vals: Vec<String> = all_stats.iter()
-                .map(|name| s.final_stats.get(name).map(|v| format!("{:.4}", v)).unwrap_or_default())
+            let stat_vals: Vec<String> = all_stats
+                .iter()
+                .map(|name| {
+                    s.final_stats
+                        .get(name)
+                        .map(|v| format!("{:.4}", v))
+                        .unwrap_or_default()
+                })
                 .collect();
-            let scalar_vals: Vec<String> = scalar_keys.iter()
-                .map(|k| s.scalars.get(*k).map(|v| format!("{:.6}", v)).unwrap_or_default())
+            let scalar_vals: Vec<String> = scalar_keys
+                .iter()
+                .map(|k| {
+                    s.scalars
+                        .get(*k)
+                        .map(|v| format!("{:.6}", v))
+                        .unwrap_or_default()
+                })
                 .collect();
 
             csv.push(format!(
                 "{},{},{},{},{},{},{},{}",
-                s.template_id, s.level, s.break_stage,
+                s.template_id,
+                s.level,
+                s.break_stage,
                 s.main_attr_type.as_deref().unwrap_or(""),
                 s.sub_attr_type.as_deref().unwrap_or(""),
                 s.data_source,
@@ -819,7 +935,8 @@ fn main() {
 
     println!("\n{}", "═".repeat(62));
     println!("  Stat Engine Complete");
-    println!("  {} characters, {} growth curves",
+    println!(
+        "  {} characters, {} growth curves",
         sheets.len(),
         curves.len(),
     );
