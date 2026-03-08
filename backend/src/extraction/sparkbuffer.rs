@@ -35,7 +35,10 @@ impl SparkType {
             8 => Ok(Self::Bean),
             9 => Ok(Self::Array),
             10 => Ok(Self::Map),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown SparkType {v}"))),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown SparkType {v}"),
+            )),
         }
     }
 
@@ -142,7 +145,9 @@ impl<'a> SparkReader<'a> {
         let mut bytes = Vec::new();
         loop {
             let b = self.read_u8()?;
-            if b == 0 { break; }
+            if b == 0 {
+                break;
+            }
             bytes.push(b);
         }
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -151,7 +156,9 @@ impl<'a> SparkReader<'a> {
     // String via i32 offset indirection
     fn read_string_offset(&mut self) -> io::Result<String> {
         let offset = self.read_i32()?;
-        if offset == -1 { return Ok(String::new()); }
+        if offset == -1 {
+            return Ok(String::new());
+        }
         let saved = self.pos();
         self.seek_to(offset as u64);
         let s = self.read_string()?;
@@ -161,14 +168,18 @@ impl<'a> SparkReader<'a> {
 
     fn align4(&mut self) {
         let p = self.pos();
-        if p == 0 { return; }
+        if p == 0 {
+            return;
+        }
         let aligned = (p - 1) + (4 - ((p - 1) % 4));
         self.seek_to(aligned);
     }
 
     fn align8(&mut self) {
         let p = self.pos();
-        if p == 0 { return; }
+        if p == 0 {
+            return;
+        }
         let aligned = (p - 1) + (8 - ((p - 1) % 8));
         self.seek_to(aligned);
     }
@@ -185,10 +196,10 @@ impl<'a> SparkReader<'a> {
 
     fn read_enum_value(&mut self, type_hash: i32) -> io::Result<Value> {
         let val = self.read_i32()?;
-        if let Some(et) = self.enum_types.get(&type_hash) {
-            if let Some(item) = et.enums.iter().find(|e| e.value == val) {
-                return Ok(Value::String(item.name.clone()));
-            }
+        if let Some(et) = self.enum_types.get(&type_hash)
+            && let Some(item) = et.enums.iter().find(|e| e.value == val)
+        {
+            return Ok(Value::String(item.name.clone()));
         }
         Ok(Value::Number(Number::from(val)))
     }
@@ -207,8 +218,12 @@ impl<'a> SparkReader<'a> {
                     let bt = self.read_bean_type()?;
                     self.bean_types.insert(bt.type_hash, bt);
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("unexpected type {spark_type:?} in type definitions"))),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected type {spark_type:?} in type definitions"),
+                    ));
+                }
             }
         }
         Ok(())
@@ -224,9 +239,16 @@ impl<'a> SparkReader<'a> {
             let item_name = self.read_string()?;
             self.align4();
             let value = self.read_i32()?;
-            enums.push(EnumItem { name: item_name, value });
+            enums.push(EnumItem {
+                name: item_name,
+                value,
+            });
         }
-        Ok(EnumType { type_hash, name, enums })
+        Ok(EnumType {
+            type_hash,
+            name,
+            enums,
+        })
     }
 
     fn read_bean_type(&mut self) -> io::Result<BeanType> {
@@ -270,23 +292,42 @@ impl<'a> SparkReader<'a> {
                 _ => {}
             }
 
-            fields.push(BeanField { name: field_name, typ, type2, type3, type_hash, type_hash2 });
+            fields.push(BeanField {
+                name: field_name,
+                typ,
+                type2,
+                type3,
+                type_hash,
+                type_hash2,
+            });
         }
-        Ok(BeanType { type_hash, name, fields })
+        Ok(BeanType {
+            type_hash,
+            name,
+            fields,
+        })
     }
 
     fn read_bean_value(&mut self, type_hash: i32, pointer: bool) -> io::Result<Value> {
         let mut pointer_origin = None;
         if pointer {
             let offset = self.read_i32()?;
-            if offset == -1 { return Ok(Value::Null); }
+            if offset == -1 {
+                return Ok(Value::Null);
+            }
             pointer_origin = Some(self.pos());
             self.seek_to(offset as u64);
         }
 
-        let bean = self.bean_types.get(&type_hash)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
-                format!("unknown bean type hash {type_hash}")))?
+        let bean = self
+            .bean_types
+            .get(&type_hash)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown bean type hash {type_hash}"),
+                )
+            })?
             .clone();
 
         let mut obj = Map::new();
@@ -320,9 +361,7 @@ impl<'a> SparkReader<'a> {
                     json_number_f64(v)
                 }
                 SparkType::String => Value::String(self.read_string_offset()?),
-                SparkType::Bean => {
-                    self.read_bean_value(field.type_hash.unwrap_or(0), true)?
-                }
+                SparkType::Bean => self.read_bean_value(field.type_hash.unwrap_or(0), true)?,
                 SparkType::Bool => {
                     let v = self.read_bool()?;
                     // Align after bool if next field is not bool
@@ -338,14 +377,27 @@ impl<'a> SparkReader<'a> {
                     for _ in 0..item_count {
                         let item = match item_type {
                             SparkType::String => Value::String(self.read_string_offset()?),
-                            SparkType::Bean => self.read_bean_value(field.type_hash.unwrap_or(0), true)?,
+                            SparkType::Bean => {
+                                self.read_bean_value(field.type_hash.unwrap_or(0), true)?
+                            }
                             SparkType::Float => json_number_f64(self.read_f32()? as f64),
-                            SparkType::Long => Value::Number(Number::from(self.read_long_aligned()?)),
-                            SparkType::Int | SparkType::Enum => Value::Number(Number::from(self.read_i32()?)),
+                            SparkType::Long => {
+                                Value::Number(Number::from(self.read_long_aligned()?))
+                            }
+                            SparkType::Int | SparkType::Enum => {
+                                Value::Number(Number::from(self.read_i32()?))
+                            }
                             SparkType::Bool => Value::Bool(self.read_bool()?),
                             SparkType::Double => json_number_f64(self.read_double_aligned()?),
-                            other => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                format!("unsupported array element type {other:?} at pos {}", self.pos()))),
+                            other => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "unsupported array element type {other:?} at pos {}",
+                                        self.pos()
+                                    ),
+                                ));
+                            }
                         };
                         arr.push(item);
                     }
@@ -359,8 +411,12 @@ impl<'a> SparkReader<'a> {
                     self.seek_to(map_origin);
                     v
                 }
-                SparkType::Byte => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("byte type not supported at pos {}", self.pos()))),
+                SparkType::Byte => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("byte type not supported at pos {}", self.pos()),
+                    ));
+                }
             };
 
             obj.insert(field.name.clone(), value);
@@ -392,8 +448,12 @@ impl<'a> SparkReader<'a> {
                 SparkType::String => self.read_string_offset()?,
                 SparkType::Int => self.read_i32()?.to_string(),
                 SparkType::Long => self.read_long_aligned()?.to_string(),
-                other => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("unsupported map key type {other:?}"))),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported map key type {other:?}"),
+                    ));
+                }
             };
             let value = match val_type {
                 SparkType::Bean => self.read_bean_value(field.type_hash2.unwrap_or(0), true)?,
@@ -406,8 +466,12 @@ impl<'a> SparkReader<'a> {
                     self.align4();
                     Value::Bool(v)
                 }
-                other => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("unsupported map value type {other:?}"))),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported map value type {other:?}"),
+                    ));
+                }
             };
             obj.insert(key, value);
         }
@@ -454,9 +518,7 @@ impl<'a> SparkReader<'a> {
         // Read data
         self.seek_to(data_offset as u64);
         match root_type {
-            SparkType::Bean => {
-                self.read_bean_value(root_type_hash.unwrap_or(0), false)
-            }
+            SparkType::Bean => self.read_bean_value(root_type_hash.unwrap_or(0), false),
             SparkType::Map => {
                 let field = BeanField {
                     name: String::new(),
@@ -468,8 +530,10 @@ impl<'a> SparkReader<'a> {
                 };
                 self.read_map_value(&field)
             }
-            other => Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("unsupported root type {other:?}"))),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported root type {other:?}"),
+            )),
         }
     }
 }
@@ -481,7 +545,10 @@ fn json_number_f64(v: f64) -> Value {
 /// Parse a SparkBuffer .bytes file and return JSON.
 pub fn parse_sparkbuffer(data: &[u8]) -> io::Result<Value> {
     if data.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small for SparkBuffer"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too small for SparkBuffer",
+        ));
     }
     SparkReader::new(data).parse()
 }

@@ -9,7 +9,7 @@ edition = "2024"
 name = "endfield"
 path = "src/bin/endfield.rs"
 
-# ── Standalone RE probes ─────────────────────────────────
+# ── Standalone utilities ─────────────────────────────────
 
 [[bin]]
 name = "auth-test"
@@ -22,34 +22,6 @@ path = "src/bin/resource_test.rs"
 [[bin]]
 name = "gameassembly-extract"
 path = "src/bin/gameassembly_extract.rs"
-
-[[bin]]
-name = "smiley-decrypt-test"
-path = "src/bin/smiley_decrypt_test.rs"
-
-[[bin]]
-name = "char-data-probe"
-path = "src/bin/char_data_probe.rs"
-
-[[bin]]
-name = "stat-engine"
-path = "src/bin/stat_engine.rs"
-
-[[bin]]
-name = "vfs-decrypt-probe"
-path = "src/bin/vfs_decrypt_probe.rs"
-
-[[bin]]
-name = "vfs-reconstruct"
-path = "src/bin/vfs_reconstruct.rs"
-
-[[bin]]
-name = "memdump-analyze"
-path = "src/bin/memdump_analyze.rs"
-
-[[bin]]
-name = "cdn-probe"
-path = "src/bin/cdn_probe.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
@@ -71,7 +43,5 @@ unity-asset = "0.2.0"
 unity-asset-binary = "0.2.0"
 unity-asset-core = "0.2.0"
 aes = "0.8"
-goblin = "0.8"
-iced-x86 = { version = "1.21", features = ["decoder", "intel"] }
 texture2ddecoder = "0.1"
 image = "0.25"

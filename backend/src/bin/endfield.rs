@@ -2,10 +2,13 @@
 ///
 /// Subcommands:
 ///   info          — show game config, version, patch info
-///   extract       — full extraction pipeline (JSON, textures, gamedata)
+///   extract       — extract Unity assets (JSON, textures, gamedata) from AES dirs
 ///   extract-file  — extract a single .chk by name
+///   decrypt       — decrypt ChaCha20-encrypted VFS directories (tables, configs, lua)
+///   list          — list all VFS directories and files
 ///   scan          — scan for asset names/paths
 ///   survey        — survey all Unity objects, types, counts
+use backend::extraction::blc;
 use backend::extraction::pipeline::{self, VFS_DIRS};
 use backend::extraction::texture;
 use backend::extraction::unity_extract::{
@@ -65,6 +68,17 @@ enum Commands {
         #[arg(long, default_value = "./output")]
         output: String,
     },
+    /// Decrypt ChaCha20-encrypted VFS directories (game data tables, JSON configs, Lua)
+    Decrypt {
+        /// Specific directory hash to decrypt (default: all encrypted dirs)
+        #[arg(long)]
+        dir: Option<String>,
+        /// Output directory
+        #[arg(long, default_value = "./output/decrypted")]
+        output: String,
+    },
+    /// List all VFS directories and files in the CDN archive
+    List,
     /// Scan for asset names/paths
     Scan {
         /// Process ALL .chk files
@@ -116,6 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir,
             output,
         } => cmd_extract_file(&client, &chk_name, dir, &output).await,
+        Commands::Decrypt { dir, output } => cmd_decrypt(&client, dir, &output).await,
+        Commands::List => cmd_list(&client).await,
         Commands::Scan { scan_all } => cmd_scan(&client, scan_all).await,
         Commands::Survey { scan_all } => cmd_survey(&client, scan_all).await,
     }
@@ -512,6 +528,127 @@ async fn cmd_extract_file(
         let save_path = format!("{}/{}", output, sanitize_filename(&asset.vfs_name));
         std::fs::write(&save_path, &asset.data)?;
         println!("  → saved to {}", save_path);
+    }
+
+    println!("\n=== Done ===");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
+// decrypt — ChaCha20-encrypted VFS directories
+// ═══════════════════════════════════════════════════════════
+
+async fn cmd_decrypt(
+    client: &Client,
+    dir_filter: Option<String>,
+    output: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== ChaCha20 VFS Decryption ===\n");
+
+    let resolved = pipeline::resolve_pipeline(client, true).await?;
+    println!("Version: {}", resolved.config.version);
+    println!("ZIP entries: {}\n", resolved.cd.len());
+
+    let output_path = std::path::Path::new(output);
+    std::fs::create_dir_all(output_path)?;
+
+    let dirs: Vec<&str> = if let Some(ref d) = dir_filter {
+        blc::ENCRYPTED_DIRS
+            .iter()
+            .filter(|h| h == &&d.as_str())
+            .copied()
+            .collect()
+    } else {
+        blc::ENCRYPTED_DIRS.to_vec()
+    };
+
+    if dirs.is_empty() {
+        println!("No matching directories found.");
+        if let Some(d) = &dir_filter {
+            println!("Available: {:?}", blc::ENCRYPTED_DIRS);
+            println!("You specified: {}", d);
+        }
+        return Ok(());
+    }
+
+    let mut total_extracted = 0usize;
+    let mut total_sparkbuffer = 0usize;
+
+    for dir_hash in &dirs {
+        println!("{}", "=".repeat(60));
+        println!("=== {} ===", dir_hash);
+
+        match blc::extract_directory(client, &resolved, dir_hash, output_path).await {
+            Ok(result) => {
+                println!(
+                    "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON",
+                    result.group_name,
+                    result.dir_hash,
+                    result.extracted,
+                    result.total_files,
+                    result.sparkbuffer_parsed,
+                );
+                if !result.errors.is_empty() {
+                    println!("  {} errors:", result.errors.len());
+                    for e in result.errors.iter().take(5) {
+                        println!("    {}", e);
+                    }
+                    if result.errors.len() > 5 {
+                        println!("    ... and {} more", result.errors.len() - 5);
+                    }
+                }
+                total_extracted += result.extracted;
+                total_sparkbuffer += result.sparkbuffer_parsed;
+            }
+            Err(e) => {
+                println!("  Error: {}", e);
+            }
+        }
+    }
+
+    println!("\n=== Decryption Summary ===");
+    println!("  Directories: {}", dirs.len());
+    println!("  Files extracted: {}", total_extracted);
+    println!("  SparkBuffer→JSON: {}", total_sparkbuffer);
+    println!("  Output: {}", output);
+    println!("\n=== Done ===");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
+// list — VFS directory listing
+// ═══════════════════════════════════════════════════════════
+
+async fn cmd_list(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== VFS Directory Listing ===\n");
+
+    let resolved = pipeline::resolve_pipeline(client, true).await?;
+    println!("Version: {}", resolved.config.version);
+    println!("ZIP entries: {}\n", resolved.cd.len());
+
+    let dirs = pipeline::list_vfs_directories(&resolved.cd);
+    println!("VFS directories ({}):\n", dirs.len());
+
+    for dir in &dirs {
+        let files = pipeline::list_vfs_dir_files(&resolved.cd, dir);
+        let total_size: u64 = files.iter().map(|(_, s)| *s).sum();
+        println!(
+            "  {}/  ({} files, {})",
+            dir,
+            files.len(),
+            format_bytes(total_size)
+        );
+        for (name, size) in &files {
+            let short = name.rsplit('/').next().unwrap_or(name);
+            println!("    {} ({})", short, format_bytes(*size));
+        }
+    }
+
+    if let Some(patch) = &resolved.patch_index {
+        println!("\nPatch files ({}):", patch.files.len());
+        for pf in &patch.files {
+            println!("  {} ({})", pf.name, format_bytes(pf.size));
+        }
     }
 
     println!("\n=== Done ===");

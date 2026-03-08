@@ -98,10 +98,10 @@ pub fn list_vfs_dir_files(cd: &ZipCentralDirectory, dir: &str) -> Vec<(String, u
 pub fn list_vfs_directories(cd: &ZipCentralDirectory) -> Vec<String> {
     let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for f in cd.filenames() {
-        if let Some(rest) = f.strip_prefix("Endfield_Data/StreamingAssets/VFS/") {
-            if let Some(slash) = rest.find('/') {
-                dirs.insert(rest[..slash].to_string());
-            }
+        if let Some(rest) = f.strip_prefix("Endfield_Data/StreamingAssets/VFS/")
+            && let Some(slash) = rest.find('/')
+        {
+            dirs.insert(rest[..slash].to_string());
         }
     }
     dirs.into_iter().collect()
