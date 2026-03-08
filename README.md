@@ -1,31 +1,33 @@
-# Arknights: Endfield — Asset Extraction Backend
+# fluorite.moe
 
-Rust toolkit for extracting and decrypting game assets from the Arknights: Endfield CDN. Downloads, decrypts, and parses VFS archives, Unity asset bundles, textures, game data tables, and more — all without needing the game installed.
+Rust toolkit for extracting and decrypting game assets from the Arknights: Endfield CDN. Downloads, decrypts, and parses VFS archives, Unity asset bundles, textures, game data tables, and more without needing the game installed.
 
-## Quick Start
+## Installation
+
+Requires Rust 2024 edition (nightly or recent stable) and an internet connection. No game installation needed since all data is fetched from the public CDN.
 
 ```bash
-# Build
+git clone https://github.com/eltik/fluorite.moe.git
+cd fluorite.moe/backend
 cargo build --release
-
-# Show game version and CDN info
-cargo run --release --bin endfield -- info
-
-# Extract everything (JSON configs, textures, gamedata)
-cargo run --release --bin endfield -- extract --all --scan-all --output ./output
-
-# Decrypt all ChaCha20-encrypted VFS directories (tables, configs, Lua)
-cargo run --release --bin endfield -- decrypt --output ./output/decrypted
-
-# List all VFS directories and files on the CDN
-cargo run --release --bin endfield -- list
 ```
 
-## CLI Reference — `endfield`
+## How It Works
+
+1. **Config Resolution** queries the Hypergryph launcher API to get the current game version, CDN URLs, and resource manifest.
+2. **ZIP Central Directory** is fetched via HTTP range requests from the game's split ZIP archive across multiple CDN files to locate all asset files.
+3. **VFS Containers** are downloaded as `.chk` files and decrypted with AES-128 CTR to reveal Unity asset bundles and SerializedFiles.
+4. **ChaCha20 Directories** use ChaCha20 encryption with per-file IV seeds stored in BLC catalogs. Nine directories contain game data tables, JSON configs, and Lua scripts.
+5. **Asset Extraction** parses Unity SerializedFiles to extract TextAssets (JSON configs), Texture2D (PNG images), and MonoBehaviour objects (gamedata).
+6. **SparkBuffer Parsing** converts binary `.bytes` table files into human-readable JSON using the SparkBuffer format parser.
+
+## Usage
+
+### endfield CLI
 
 The unified CLI for all extraction tasks. All subcommands fetch data directly from the CDN.
 
-### `endfield info`
+#### `endfield info`
 
 Display game configuration, version, patch info, and CDN resource URLs.
 
@@ -33,7 +35,7 @@ Display game configuration, version, patch info, and CDN resource URLs.
 cargo run --release --bin endfield -- info
 ```
 
-### `endfield extract`
+#### `endfield extract`
 
 Extract Unity assets (TextAssets, Texture2D, MonoBehaviour) from AES-encrypted VFS directories.
 
@@ -67,17 +69,17 @@ cargo run --release --bin endfield -- extract --all --output ./my-output
 | `--output <PATH>` | Output directory (default: `./output`) |
 | `--scan-all` | Process all `.chk` files (default: smallest per directory) |
 
-**Output structure:**
+Output structure:
 ```
 output/
-  gamedata/           # TextAssets — JSON configs, text files, binary data
+  gamedata/           # TextAssets: JSON configs, text files, binary data
   gamedata/monobehaviour/
     <TypeName>/       # MonoBehaviours grouped by script type
       <ObjectName>.json
   textures/           # Texture2D extracted as PNG
 ```
 
-### `endfield extract-file`
+#### `endfield extract-file`
 
 Extract a single `.chk` file by name or substring match.
 
@@ -89,9 +91,9 @@ cargo run --release --bin endfield -- extract-file "CAB-abc123"
 cargo run --release --bin endfield -- extract-file "CAB-abc123" --dir 7064D8E2
 ```
 
-### `endfield decrypt`
+#### `endfield decrypt`
 
-Decrypt all ChaCha20-encrypted VFS directories. These contain the game data tables (SparkBuffer `.bytes`), JSON configs, Lua scripts, and other encrypted content.
+Decrypt all ChaCha20-encrypted VFS directories. These contain game data tables (SparkBuffer `.bytes`), JSON configs, Lua scripts, and other encrypted content.
 
 ```bash
 # Decrypt all 9 encrypted directories
@@ -109,7 +111,7 @@ cargo run --release --bin endfield -- decrypt --output ./my-decrypted
 | `--dir <HASH>` | Decrypt a specific directory (default: all 9 encrypted dirs) |
 | `--output <PATH>` | Output directory (default: `./output/decrypted`) |
 
-**Encrypted VFS directories:**
+Encrypted VFS directories:
 
 | Hash | Contents |
 |------|----------|
@@ -123,7 +125,7 @@ cargo run --release --bin endfield -- decrypt --output ./my-decrypted
 | `1EBAF5C6` | Audio (English) |
 | `E1E7D7CE` | Audio (Chinese) |
 
-**Output structure:**
+Output structure:
 ```
 output/decrypted/
   42A8FCA6/              # One folder per directory hash
@@ -135,7 +137,7 @@ output/decrypted/
 
 SparkBuffer `.bytes` files are automatically parsed into human-readable JSON alongside the raw binary.
 
-### `endfield list`
+#### `endfield list`
 
 List all VFS directories on the CDN with file counts, sizes, and patch files.
 
@@ -143,9 +145,9 @@ List all VFS directories on the CDN with file counts, sizes, and patch files.
 cargo run --release --bin endfield -- list
 ```
 
-### `endfield scan`
+#### `endfield scan`
 
-Scan VFS archives for asset names, bundle paths, and embedded strings. Searches for keywords like `character`, `texture`, `model`, `weapon`, etc.
+Scan VFS archives for asset names, bundle paths, and embedded strings.
 
 ```bash
 # Quick scan (smallest .chk per directory)
@@ -155,7 +157,7 @@ cargo run --release --bin endfield -- scan
 cargo run --release --bin endfield -- scan --scan-all
 ```
 
-### `endfield survey`
+#### `endfield survey`
 
 Census of all Unity object types, class IDs, counts, and sizes across VFS directories.
 
@@ -163,24 +165,12 @@ Census of all Unity object types, class IDs, counts, and sizes across VFS direct
 cargo run --release --bin endfield -- survey --scan-all
 ```
 
-## Other Binaries
+### auth-test
 
-| Binary | Description |
-|--------|-------------|
-| `auth-test` | Interactive Hypergryph account login, OAuth2 flow, gacha history, and character roster via the web API |
-| `resource-test` | CDN resource discovery, launcher API probing, and version diffing across regions/platforms |
-| `gameassembly-extract` | Extract files (e.g. `GameAssembly.dll`) from the game's split ZIP archive on the CDN |
+Interactive Hypergryph account login, OAuth2 flow, gacha history, and character roster via the web API.
 
 ```bash
-# Login and pull gacha history
 cargo run --release --bin auth-test
-
-# Probe CDN resources across all platforms/regions
-cargo run --release --bin resource-test
-
-# Extract GameAssembly.dll (or any file by pattern)
-cargo run --release --bin gameassembly-extract
-cargo run --release --bin gameassembly-extract -- "global-metadata.dat"
 ```
 
 ## Project Structure
@@ -193,9 +183,7 @@ backend/
 │   ├── main.rs
 │   ├── bin/
 │   │   ├── endfield.rs         # Unified extraction CLI
-│   │   ├── auth_test.rs        # Account/gacha/roster tool
-│   │   ├── resource_test.rs    # CDN resource prober
-│   │   └── gameassembly_extract.rs  # Split ZIP file extractor
+│   │   └── auth_test.rs        # Account/gacha/roster tool
 │   ├── core/
 │   │   ├── endfield/
 │   │   │   ├── config.rs       # Game config resolution
@@ -229,38 +217,30 @@ backend/
 
 ## Extraction Modules
 
-### Encryption & Decryption
-- **`chacha20`** — RFC7539 ChaCha20 stream cipher used for VFS file encryption. Static 32-byte key.
-- **`blc`** — BLC catalog parser. Each encrypted VFS directory has a `.blc` file listing all chunks with offsets, sizes, encryption flags, and IV seeds. Handles full download-decrypt-extract pipeline.
-- **`vfs_aes`** — Custom AES-128 implementation with a non-standard S-box permutation used by the game's VFS layer.
-- **`vfs_decrypt`** — AES-128 CTR mode decryption for VFS container headers and asset bundle data.
-- **`crypto_constants`** — All encryption keys, S-boxes, and cipher constants.
-- **`wwise_pck`** — Decryption for Wwise audio `.pck` files (`:)xD` magic format).
+### Encryption and Decryption
+
+- **chacha20** is an RFC7539 ChaCha20 stream cipher used for VFS file encryption with a static 32-byte key.
+- **blc** parses BLC catalogs. Each encrypted VFS directory has a `.blc` file listing all chunks with offsets, sizes, encryption flags, and IV seeds. Handles the full download-decrypt-extract pipeline.
+- **vfs_aes** is a custom AES-128 implementation with a non-standard S-box permutation used by the game's VFS layer.
+- **vfs_decrypt** handles AES-128 CTR mode decryption for VFS container headers and asset bundle data.
+- **crypto_constants** stores all encryption keys, S-boxes, and cipher constants.
+- **wwise_pck** decrypts Wwise audio `.pck` files using the `:)xD` magic format.
 
 ### Asset Parsing
-- **`unityfs_header`** — UnityFS bundle format parser. Handles LZMA/LZ4 decompression, block info, directory entries.
-- **`unity_extract`** — `.chk` container extraction (VFS header → decrypted assets → SerializedFile parsing). TextAsset and MonoBehaviour extraction.
-- **`sparkbuffer`** — Binary table format used by Endfield for game data (character stats, item tables, quest configs, etc.). Parses type definitions, enums, beans, arrays, maps → JSON.
-- **`texture`** — Texture2D extraction with GPU format decoding (BC7, ASTC, ETC2, DXT, etc.) → PNG output. Resolves `.resS` streaming data from VFS resources.
+
+- **unityfs_header** parses the UnityFS bundle format, handling LZMA/LZ4 decompression, block info, and directory entries.
+- **unity_extract** handles `.chk` container extraction (VFS header to decrypted assets to SerializedFile parsing) with TextAsset and MonoBehaviour extraction.
+- **sparkbuffer** parses the binary table format used by Endfield for game data (character stats, item tables, quest configs). Converts type definitions, enums, beans, arrays, and maps to JSON.
+- **texture** extracts Texture2D with GPU format decoding (BC7, ASTC, ETC2, DXT) to PNG output, resolving `.resS` streaming data from VFS resources.
 
 ### Infrastructure
-- **`pipeline`** — Shared download pipeline. Resolves game config → ZIP central directory → chunk download. Used by all extraction commands.
-- **`zip_range`** — HTTP range-request based extraction from the game's split ZIP archive (multiple `.zip` parts on CDN).
-- **`lz4_inv`** — Custom LZ4 decompression variant used by some game assets.
-- **`fair_guard_utils`** — Helpers for handling FairGuard anti-cheat obfuscated data.
-- **`utils`** — Shared utilities: `format_bytes()`, `hex_dump()`, `sanitize_filename()`.
 
-## How It Works
+- **pipeline** is the shared download pipeline that resolves game config to ZIP central directory to chunk download, used by all extraction commands.
+- **zip_range** handles HTTP range-request based extraction from the game's split ZIP archive (multiple `.zip` parts on CDN).
+- **lz4_inv** is a custom LZ4 decompression variant used by some game assets.
+- **fair_guard_utils** provides helpers for handling FairGuard anti-cheat obfuscated data.
+- **utils** contains shared utilities: `format_bytes()`, `hex_dump()`, `sanitize_filename()`.
 
-1. **Config Resolution** — Queries the Hypergryph launcher API to get the current game version, CDN URLs, and resource manifest.
-2. **ZIP Central Directory** — The game's assets are stored as a split ZIP archive across multiple CDN files. The pipeline fetches the central directory via HTTP range requests to know what files exist and where.
-3. **VFS Containers** — Individual `.chk` files are downloaded and decrypted (AES-128 CTR) to reveal Unity asset bundles and SerializedFiles.
-4. **ChaCha20 Directories** — 9 VFS directories use ChaCha20 encryption with per-file IV seeds stored in BLC catalogs. These contain game data tables, JSON configs, and Lua scripts.
-5. **Asset Extraction** — Unity SerializedFiles are parsed to extract TextAssets (JSON configs), Texture2D (PNG images), and MonoBehaviour objects (gamedata).
-6. **SparkBuffer Parsing** — Binary `.bytes` table files are automatically converted to human-readable JSON using the SparkBuffer format parser.
+## Conclusion
 
-## Requirements
-
-- Rust 2024 edition (nightly or recent stable)
-- Internet connection (all data is fetched from the public CDN)
-- No game installation required
+fluorite.moe provides complete access to Arknights: Endfield game assets through reverse-engineered encryption and file format parsers. The `endfield` CLI handles the full pipeline from CDN download through decryption to structured output.
