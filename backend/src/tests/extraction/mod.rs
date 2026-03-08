@@ -1,0 +1,11 @@
+mod chacha20;
+mod fair_guard_utils;
+mod lz4_inv;
+mod sparkbuffer;
+mod unity_extract;
+mod unityfs_header;
+mod utils;
+mod vfs_aes;
+mod vfs_decrypt;
+mod wwise_pck;
+mod zip_range;

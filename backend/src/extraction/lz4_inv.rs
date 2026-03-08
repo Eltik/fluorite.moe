@@ -6,7 +6,7 @@
 //! Source: AnimeStudio — LZ4/LZ4Inv.cs
 
 /// Parse the bit-interleaved token byte into (literal_count, match_count).
-fn parse_token(val: u8) -> (u8, u8) {
+pub(crate) fn parse_token(val: u8) -> (u8, u8) {
     let lit = val & 0b0011_0011; // bits 0,1,4,5
     let enc = (val & 0b1100_1100) >> 2; // bits 2,3,6,7 shifted down by 2
 
@@ -19,7 +19,7 @@ fn parse_token(val: u8) -> (u8, u8) {
 }
 
 /// Read a big-endian u16 back-reference offset.
-fn read_back_offset(data: &[u8], pos: usize) -> u16 {
+pub(crate) fn read_back_offset(data: &[u8], pos: usize) -> u16 {
     ((data[pos] as u16) << 8) | (data[pos + 1] as u16)
 }
 
@@ -146,47 +146,4 @@ pub fn decompress(
     }
 
     Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_token() {
-        // Token 0x00 -> (0, 0)
-        assert_eq!(parse_token(0x00), (0, 0));
-
-        // Token 0xFF -> (15, 15)
-        assert_eq!(parse_token(0xFF), (15, 15));
-
-        // Token where lit=5, enc=10:
-        // lit=5 = 0b0101, interleaved into bits 0,1,4,5: bit0=1, bit1=0, bit4=1, bit5=0 = 0b00_01_0000 | 0b01 = 0x11
-        // enc=10 = 0b1010, interleaved into bits 2,3,6,7 (shifted <<2): bit2=0, bit3=1, bit6=0, bit7=1 = 0b1000_0100 << was shifted
-        // This gets complex — just verify round-trip properties
-        for lit in 0..16u8 {
-            for enc in 0..16u8 {
-                // Encode: reverse the parse to build a token
-                let lit_interleaved = (lit & 0b11) | ((lit & 0b1100) << 2);
-                let enc_interleaved = ((enc & 0b11) | ((enc & 0b1100) << 2)) << 2;
-                let token = lit_interleaved | enc_interleaved;
-                let (parsed_lit, parsed_enc) = parse_token(token);
-                assert_eq!(
-                    (parsed_lit, parsed_enc),
-                    (lit, enc),
-                    "Failed for lit={}, enc={}, token=0x{:02X}",
-                    lit,
-                    enc,
-                    token
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_read_back_offset_big_endian() {
-        assert_eq!(read_back_offset(&[0x00, 0x01], 0), 1);
-        assert_eq!(read_back_offset(&[0x01, 0x00], 0), 256);
-        assert_eq!(read_back_offset(&[0xFF, 0xFF], 0), 65535);
-    }
 }

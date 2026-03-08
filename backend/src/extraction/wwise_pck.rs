@@ -371,34 +371,3 @@ pub fn extract_audio(pck_data: &[u8], entry: &WwiseFileEntry) -> Result<Vec<u8>,
 
     Ok(audio)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cipher_key_word() {
-        let k0 = cipher_key_word(0);
-        let k1 = cipher_key_word(1);
-        assert_ne!(k0, k1);
-        assert_eq!(cipher_key_word(0), k0);
-        assert_eq!(cipher_key_word(852), cipher_key_word(852));
-    }
-
-    #[test]
-    fn test_decipher_roundtrip() {
-        let original = [0x41u8, 0x4B, 0x50, 0x4B, 0x01, 0x00, 0x00, 0x00];
-        let mut data = original;
-        decipher_inplace(&mut data, 100, 0);
-        assert_ne!(data, original);
-        decipher_inplace(&mut data, 100, 0);
-        assert_eq!(data, original);
-    }
-
-    #[test]
-    fn test_is_smiley_format() {
-        assert!(is_smiley_format(b":)xD\x00\x00\x00\x00"));
-        assert!(!is_smiley_format(b"AKPK\x00\x00\x00\x00"));
-        assert!(!is_smiley_format(b":)xD")); // too short
-    }
-}
