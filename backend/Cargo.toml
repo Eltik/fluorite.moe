@@ -3,6 +3,14 @@ name = "backend"
 version = "0.1.0"
 edition = "2024"
 
+# ── Unified CLI ──────────────────────────────────────────
+
+[[bin]]
+name = "endfield"
+path = "src/bin/endfield.rs"
+
+# ── Standalone RE probes ─────────────────────────────────
+
 [[bin]]
 name = "auth-test"
 path = "src/bin/auth_test.rs"
@@ -12,108 +20,12 @@ name = "resource-test"
 path = "src/bin/resource_test.rs"
 
 [[bin]]
-name = "endfield-config-test"
-path = "src/bin/endfield_config_test.rs"
-
-[[bin]]
-name = "zip-range-test"
-path = "src/bin/zip_range_test.rs"
-
-[[bin]]
-name = "fairguard-test"
-path = "src/bin/fairguard_test.rs"
-
-[[bin]]
-name = "vfs-test"
-path = "src/bin/vfs_test.rs"
-
-[[bin]]
 name = "gameassembly-extract"
 path = "src/bin/gameassembly_extract.rs"
 
 [[bin]]
-name = "magic-search"
-path = "src/bin/magic_search.rs"
-
-[[bin]]
 name = "smiley-decrypt-test"
 path = "src/bin/smiley_decrypt_test.rs"
-
-[[bin]]
-name = "index-test"
-path = "src/bin/index_test.rs"
-
-[[bin]]
-name = "scan-assets"
-path = "src/bin/scan_assets.rs"
-
-[[bin]]
-name = "extract-json"
-path = "src/bin/extract_json.rs"
-
-[[bin]]
-name = "decrypt-probe"
-path = "src/bin/decrypt_probe.rs"
-
-[[bin]]
-name = "dll-analyze"
-path = "src/bin/dll_analyze.rs"
-
-[[bin]]
-name = "dll-investigate"
-path = "src/bin/dll_investigate.rs"
-
-[[bin]]
-name = "dll-dispatch"
-path = "src/bin/dll_dispatch.rs"
-
-[[bin]]
-name = "dll-descriptor"
-path = "src/bin/dll_descriptor.rs"
-
-[[bin]]
-name = "asset-probe"
-path = "src/bin/asset_probe.rs"
-
-[[bin]]
-name = "game-data-probe"
-path = "src/bin/game_data_probe.rs"
-
-[[bin]]
-name = "encrypted-dir-probe"
-path = "src/bin/encrypted_dir_probe.rs"
-
-[[bin]]
-name = "vm-disasm"
-path = "src/bin/vm_disasm.rs"
-
-[[bin]]
-name = "frida-companion"
-path = "src/bin/frida_companion.rs"
-
-[[bin]]
-name = "full-config-scan"
-path = "src/bin/full_config_scan.rs"
-
-[[bin]]
-name = "stat-analyzer"
-path = "src/bin/stat_analyzer.rs"
-
-[[bin]]
-name = "config-stat-probe"
-path = "src/bin/config_stat_probe.rs"
-
-[[bin]]
-name = "hgp-probe"
-path = "src/bin/hgp_probe.rs"
-
-[[bin]]
-name = "tcp-dissect"
-path = "src/bin/tcp_dissect.rs"
-
-[[bin]]
-name = "crypto-crack"
-path = "src/bin/crypto_crack.rs"
 
 [[bin]]
 name = "char-data-probe"
@@ -131,11 +43,20 @@ path = "src/bin/vfs_decrypt_probe.rs"
 name = "vfs-reconstruct"
 path = "src/bin/vfs_reconstruct.rs"
 
+[[bin]]
+name = "memdump-analyze"
+path = "src/bin/memdump_analyze.rs"
+
+[[bin]]
+name = "cdn-probe"
+path = "src/bin/cdn_probe.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+clap = { version = "4", features = ["derive"] }
 comfy-table = "7.2.2"
 chrono = "0.4.43"
 regex = "1.12.3"
@@ -154,7 +75,3 @@ goblin = "0.8"
 iced-x86 = { version = "1.21", features = ["decoder", "intel"] }
 texture2ddecoder = "0.1"
 image = "0.25"
-
-[patch.crates-io]
-unity-asset-binary = { path = "unity-asset-binary-local" }
-unity-asset = { path = "unity-asset-local" }

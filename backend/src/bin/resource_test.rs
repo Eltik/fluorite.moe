@@ -7,6 +7,7 @@ use backend::core::hypergryph::launcher::{
     LauncherLatestGame, LauncherLatestGameResources, Platform, Region, latest_game,
     latest_game_resources, latest_launcher, latest_launcher_exe,
 };
+use backend::extraction::utils::format_bytes;
 use chrono::{DateTime, FixedOffset, Utc};
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
@@ -234,30 +235,16 @@ fn url_filename(u: &str) -> String {
         .unwrap_or_default()
 }
 
-fn format_bytes(bytes: i64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut size = bytes as f64;
-    let mut i = 0;
-    while size.abs() >= 1024.0 && i < UNITS.len() - 1 {
-        size /= 1024.0;
-        i += 1;
-    }
-    format!("{:.2} {}", size, UNITS[i])
-}
-
 fn size_table_html(unpacked: i64, packed: i64) -> Vec<String> {
     vec![
         "<table>".into(),
         format!(
             "  <tr><td>Unpacked Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(unpacked)
+            format_bytes(unpacked as u64)
         ),
         format!(
             "  <tr><td>Packed Size</td><td style=\"text-align: right;\"><b>{}</b></td></tr>",
-            format_bytes(packed)
+            format_bytes(packed as u64)
         ),
         "</table>\n".into(),
     ]
@@ -269,7 +256,7 @@ fn file_row_md(
     package_size: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let name = url_filename(url);
-    let size = format_bytes(package_size.parse()?);
+    let size = format_bytes(package_size.parse::<i64>()? as u64);
     Ok(format!("|[{name}]({url})|`{md5}`|{size}|"))
 }
 
@@ -644,8 +631,8 @@ async fn generate_launcher_md(
                             version.into(),
                             file_link,
                             format!("`{md5}`"),
-                            format_bytes(total - packed),
-                            format_bytes(packed),
+                            format_bytes((total - packed) as u64),
+                            format_bytes(packed as u64),
                         ]
                     }
                     LauncherType::Exe => {
@@ -654,7 +641,12 @@ async fn generate_launcher_md(
                             .and_then(|v| v.as_str())
                             .unwrap_or("0")
                             .parse()?;
-                        vec![date_str, version.into(), file_link, format_bytes(exe_size)]
+                        vec![
+                            date_str,
+                            version.into(),
+                            file_link,
+                            format_bytes(exe_size as u64),
+                        ]
                     }
                 };
 
@@ -702,7 +694,7 @@ async fn fetch_and_save_latest_game(
             "Fetched latest game ({}): v{}, {}",
             target.name,
             rsp.version,
-            format_bytes(total_size - packed_size)
+            format_bytes((total_size - packed_size) as u64)
         );
 
         let pretty_rsp = SaveData {
@@ -822,7 +814,7 @@ async fn fetch_and_save_latest_game_patches(
                         target.name,
                         pretty_rsp.rsp.request_version,
                         pretty_rsp.rsp.version,
-                        format_bytes(total - packed)
+                        format_bytes((total - packed) as u64)
                     );
 
                     Some(StoredData {

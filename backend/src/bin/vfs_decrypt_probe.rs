@@ -10,6 +10,7 @@
 //! Pass 4: HGP.dll analysis (export usage patterns)
 //! Pass 5: Export results (classified decrypts → JSON)
 
+use backend::extraction::utils::format_bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -176,18 +177,6 @@ struct AnalysisReport {
 // ══════════════════════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════════════════════
-
-fn format_bytes(n: u64) -> String {
-    if n >= 1_073_741_824 {
-        format!("{:.2} GB", n as f64 / 1_073_741_824.0)
-    } else if n >= 1_048_576 {
-        format!("{:.2} MB", n as f64 / 1_048_576.0)
-    } else if n >= 1024 {
-        format!("{:.1} KB", n as f64 / 1024.0)
-    } else {
-        format!("{n} B")
-    }
-}
 
 fn median(values: &mut [u64]) -> u64 {
     if values.is_empty() {

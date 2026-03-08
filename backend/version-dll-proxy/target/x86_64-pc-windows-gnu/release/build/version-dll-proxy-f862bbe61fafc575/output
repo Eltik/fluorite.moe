@@ -1,2 +1,0 @@
-cargo:rustc-link-arg=/Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/defs/zlib.def
-cargo:rerun-if-changed=/Users/eltik/Documents/Coding/fluorite.moe/backend/version-dll-proxy/defs/zlib.def

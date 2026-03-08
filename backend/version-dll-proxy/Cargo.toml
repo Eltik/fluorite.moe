@@ -5,12 +5,14 @@ edition = "2021"
 
 [features]
 default = []
+version = []
 winmm = []
 zlib = []
+nghttp2 = []
 
 [lib]
 crate-type = ["cdylib"]
-name = "version"
+name = "spdlog"
 
 [profile.release]
 panic = "abort"

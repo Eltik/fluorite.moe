@@ -1,7 +1,12 @@
 pub mod crypto_constants;
+pub mod sparkbuffer;
 pub mod fair_guard_utils;
 pub mod lz4_inv;
+pub mod pipeline;
+pub mod texture;
+pub mod unity_extract;
 pub mod unityfs_header;
+pub mod utils;
 pub mod vfs_aes;
 pub mod vfs_decrypt;
 pub mod wwise_pck;

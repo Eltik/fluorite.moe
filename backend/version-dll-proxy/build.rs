@@ -1,12 +1,16 @@
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    let def_name = if cfg!(feature = "zlib") {
-        "defs/zlib.def"
+    let def_name = if cfg!(feature = "version") {
+        "defs/version.def"
     } else if cfg!(feature = "winmm") {
         "defs/winmm.def"
+    } else if cfg!(feature = "zlib") {
+        "defs/zlib.def"
+    } else if cfg!(feature = "nghttp2") {
+        "defs/nghttp2.def"
     } else {
-        "version.def"
+        "defs/spdlog.def"
     };
 
     let def_path = std::path::PathBuf::from(&manifest_dir).join(def_name);

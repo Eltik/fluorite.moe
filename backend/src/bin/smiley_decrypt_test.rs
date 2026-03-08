@@ -1,49 +1,6 @@
 /// Test decryption of :)xD format (encrypted Wwise PCK) files.
+use backend::extraction::utils::{format_bytes, hex_dump};
 use backend::extraction::wwise_pck;
-
-fn hex_dump(data: &[u8], max_bytes: usize) {
-    let dump_len = data.len().min(max_bytes);
-    for row in 0..dump_len.div_ceil(16) {
-        let off = row * 16;
-        if off >= dump_len {
-            break;
-        }
-        print!("  {:04x}: ", off);
-        for i in 0..16 {
-            if off + i < dump_len {
-                print!("{:02x} ", data[off + i]);
-            } else {
-                print!("   ");
-            }
-        }
-        print!(" |");
-        for i in 0..16 {
-            if off + i < dump_len {
-                let b = data[off + i];
-                if b.is_ascii_graphic() || b == b' ' {
-                    print!("{}", b as char);
-                } else {
-                    print!(".");
-                }
-            }
-        }
-        println!("|");
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut size = bytes as f64;
-    let mut i = 0;
-    while size >= 1024.0 && i < UNITS.len() - 1 {
-        size /= 1024.0;
-        i += 1;
-    }
-    format!("{:.2} {}", size, UNITS[i])
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let files = [

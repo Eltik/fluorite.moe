@@ -2,5 +2,7 @@
 .claude/
 /PLANS
 CLAUDE.md
-/output
+backend/data/
 /tasks
+**/target/
+*.exe

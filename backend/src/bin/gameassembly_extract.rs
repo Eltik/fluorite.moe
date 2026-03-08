@@ -1,28 +1,15 @@
-/// Extract files from the game's split ZIP archive.
-/// Usage: gameassembly-extract [filename_pattern]
-/// Without args: extracts GameAssembly.dll
-/// With args: extracts files matching the pattern
 use backend::core::endfield::{
     config::{ResolveParams, resolve_game_config},
     constants::{app_code, channel, sub_channel},
 };
 use backend::core::hypergryph::launcher::Platform;
+/// Extract files from the game's split ZIP archive.
+/// Usage: gameassembly-extract [filename_pattern]
+/// Without args: extracts GameAssembly.dll
+/// With args: extracts files matching the pattern
+use backend::extraction::utils::format_bytes;
 use backend::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    if bytes == 0 {
-        return "0 B".into();
-    }
-    let mut size = bytes as f64;
-    let mut i = 0;
-    while size >= 1024.0 && i < UNITS.len() - 1 {
-        size /= 1024.0;
-        i += 1;
-    }
-    format!("{:.2} {}", size, UNITS[i])
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -107,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("No matching files found".into());
     }
 
-    let output_dir = "./output";
+    let output_dir = "./data/game-binaries";
     std::fs::create_dir_all(output_dir)?;
 
     for (i, target) in targets.iter().enumerate() {

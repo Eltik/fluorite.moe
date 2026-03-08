@@ -14,13 +14,12 @@ use std::path::{Path, PathBuf};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!(
-            "Usage: {} <summary.json> <dump_dir> [output_dir]",
-            args[0]
-        );
+        eprintln!("Usage: {} <summary.json> <dump_dir> [output_dir]", args[0]);
         eprintln!("  summary.json: vfs_decrypt_summary.json from Frida capture");
         eprintln!("  dump_dir:     directory containing decrypt_NNNN.bin files");
-        eprintln!("  output_dir:   where to write reconstructed files (default: ./vfs_reconstructed)");
+        eprintln!(
+            "  output_dir:   where to write reconstructed files (default: ./vfs_reconstructed)"
+        );
         std::process::exit(1);
     }
 
@@ -113,7 +112,8 @@ fn main() {
     let mut best_per_file: BTreeMap<String, usize> = BTreeMap::new(); // key → index in handles
 
     for (i, h) in handles.iter().enumerate() {
-        let filename = h.path
+        let filename = h
+            .path
             .rsplit(['\\', '/'])
             .next()
             .filter(|s| !s.is_empty())
@@ -123,7 +123,12 @@ fn main() {
 
         println!(
             "{:>8} {:>8} {:>8} {:>12} {:>12}  {}",
-            h.handle, h.dir_hash, h.chunks.len(), chunk_bytes, h.total_read, filename
+            h.handle,
+            h.dir_hash,
+            h.chunks.len(),
+            chunk_bytes,
+            h.total_read,
+            filename
         );
 
         let key = format!("{}:{}", h.dir_hash, filename);
@@ -150,7 +155,8 @@ fn main() {
         }
 
         // Extract filename from Windows path (backslashes not parsed by Unix Path)
-        let filename = h.path
+        let filename = h
+            .path
             .rsplit(['\\', '/'])
             .next()
             .filter(|s| !s.is_empty())
@@ -264,7 +270,10 @@ fn main() {
 
     println!("\n── Results ──");
     println!("  Reconstructed files: {total_files}");
-    println!("  Total bytes written: {total_bytes} ({:.1} MB)", total_bytes as f64 / 1024.0 / 1024.0);
+    println!(
+        "  Total bytes written: {total_bytes} ({:.1} MB)",
+        total_bytes as f64 / 1024.0 / 1024.0
+    );
     println!("  Total gaps (zero-filled): {total_gaps}");
     println!("  Output directory: {}", output_dir.display());
 }
