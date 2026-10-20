@@ -51,6 +51,8 @@ pub fn content_type(name: &str) -> &'static str {
         "mp4" => "video/mp4",
         "ogg" => "audio/ogg",
         "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "opus" => "audio/ogg",
         _ => "application/octet-stream",
     }
 }

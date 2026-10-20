@@ -13,6 +13,8 @@ use std::time::Duration;
 /// | `FLUORITE_CACHE_DIR` | `<output>/.cache` |
 /// | `FLUORITE_STATE` | `<output>/../data/update-state.json` |
 /// | `FLUORITE_INDEX_POLL_SECS` | `60` |
+/// | `FLUORITE_AUDIO_REMOTE` | `1` (read voice packages from the game CDN; `0` disables) |
+/// | `FLUORITE_AUDIO_DIRS` | extra directories of `.pck` files (path-list separated) |
 #[derive(Debug, Clone)]
 pub struct Config {
     pub addr: SocketAddr,
@@ -20,6 +22,8 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub state_file: PathBuf,
     pub index_poll: Duration,
+    pub audio_remote: bool,
+    pub audio_dirs: Vec<PathBuf>,
 }
 
 impl Config {
@@ -31,6 +35,8 @@ impl Config {
             cache_dir: output.join(".cache"),
             state_file: output.join("..").join("data").join("update-state.json"),
             index_poll: Duration::from_secs(60),
+            audio_remote: true,
+            audio_dirs: Vec::new(),
             output,
         }
     }
@@ -66,6 +72,12 @@ impl Config {
                 .parse()
                 .map_err(|e| format!("FLUORITE_INDEX_POLL_SECS={v:?}: {e}"))?;
             config.index_poll = Duration::from_secs(secs.max(1));
+        }
+        if let Some(v) = var("FLUORITE_AUDIO_REMOTE") {
+            config.audio_remote = !matches!(v.trim(), "0" | "false" | "off" | "no");
+        }
+        if let Some(v) = var("FLUORITE_AUDIO_DIRS") {
+            config.audio_dirs = std::env::split_paths(&v).collect();
         }
         Ok(config)
     }

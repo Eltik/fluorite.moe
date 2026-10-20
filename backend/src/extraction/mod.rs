@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod blc;
 pub mod chacha20;
 pub mod crypto_constants;

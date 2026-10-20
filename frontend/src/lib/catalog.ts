@@ -11,6 +11,7 @@ import {
 	type CatalogTag,
 	getJson,
 } from "@/lib/api";
+import type { AudioSources, VoiceLanguage } from "@/lib/audio";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "@/lib/settings";
 
 const MINUTE = 60_000;
@@ -195,7 +196,14 @@ export interface OperatorDetail extends DetailBase {
 		text: Rich;
 		unlock: { type: string; value: number };
 	}[];
-	voiceLines: { id: string; title: string; text: Rich; voId: string }[];
+	voiceLines: {
+		id: string;
+		title: string;
+		text: Rich;
+		voId: string;
+		/** Per voice language, when the API resolved the recording. */
+		audio?: Partial<Record<VoiceLanguage, AudioSources>>;
+	}[];
 	art: OperatorArt;
 	model?: CatalogModel | null;
 }

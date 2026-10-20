@@ -711,10 +711,13 @@ async fn detail(
     let (lang, gender) = q.parse()?;
     let texts = texts(&state, &lang, gender).await?;
     let label = format!("{}/{id}", kind.name());
-    detail_value(&state, kind, id, texts)
+    let mut value = detail_value(&state, kind, id, texts)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found(format!("no catalog entry {label:?}")))
+        .ok_or_else(|| ApiError::not_found(format!("no catalog entry {label:?}")))?;
+    if kind == Kind::Operators {
+        crate::api::audio::annotate_operator(&state, &mut value);
+    }
+    Ok(Json(value))
 }
 
 /// Shared helper: compact numeric output (3 decimals, integral values as integers).

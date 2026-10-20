@@ -1,3 +1,4 @@
+pub mod audio;
 mod blc;
 mod chacha20;
 mod fair_guard_utils;

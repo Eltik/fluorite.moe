@@ -38,7 +38,6 @@ export const NAV: NavSection[] = [
 				icon: BoxesIcon,
 				link: { to: "/studio" },
 				href: "/studio",
-				badge: "Soon",
 			},
 		],
 	},
@@ -109,8 +108,8 @@ export const NAV: NavSection[] = [
 			{
 				label: ROOT_META.audio.label,
 				icon: ROOT_META.audio.icon,
-				link: { to: "/browse/$root", params: { root: "audio" } },
-				href: "/browse/audio",
+				link: { to: "/audio" },
+				href: "/audio",
 			},
 		],
 	},

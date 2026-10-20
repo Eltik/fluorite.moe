@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { BoxesIcon, LockIcon, MicIcon, SearchIcon } from "lucide-react";
 import * as React from "react";
+import { AudioButton } from "@/components/audio/audio-button";
 import { ArtGallery } from "@/components/catalog/art-gallery";
 import { AttributeExplorer } from "@/components/catalog/attribute-explorer";
 import { CostList } from "@/components/catalog/cost-list";
@@ -26,11 +27,18 @@ import {
 	InputGroupAddon,
 	InputGroupInput,
 } from "@/components/ui/input-group";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import {
+	AUDIO_LANGUAGE_LABELS,
+	VOICE_LANGUAGES,
+	type VoiceLanguage,
+} from "@/lib/audio";
 import {
 	attrLabel,
 	type OperatorDetail as Operator,
 	richToPlain,
 } from "@/lib/catalog";
+import { useSettings } from "@/lib/settings";
 import { studioLink } from "@/lib/studio";
 
 const SKILL_ORDER = [
@@ -411,12 +419,39 @@ function Talents({ data }: { data: Operator }): React.ReactElement {
  * `<AudioButton src=… />` from `@/components/audio/`; render it here once
  * voice lines carry an audio URL. Intentionally renders nothing for now.
  */
-function VoiceAudioSlot(_props: { voId: string }): React.ReactElement | null {
-	return null;
+function VoiceAudioSlot({
+	line,
+	lang,
+	speaker,
+}: {
+	line: Operator["voiceLines"][number];
+	lang: VoiceLanguage;
+	speaker: string;
+}): React.ReactElement {
+	return (
+		<AudioButton
+			src={line.audio?.[lang]}
+			subtitle={`${speaker} · ${lang}`}
+			title={line.title}
+		/>
+	);
+}
+
+/** The voice language matching the text language, when the game records one. */
+function defaultVoiceLanguage(textLanguage: string): VoiceLanguage {
+	const lang = textLanguage === "TC" ? "CN" : textLanguage;
+	return (VOICE_LANGUAGES as readonly string[]).includes(lang)
+		? (lang as VoiceLanguage)
+		: "EN";
 }
 
 function VoiceLines({ data }: { data: Operator }): React.ReactElement {
 	const [filter, setFilter] = React.useState("");
+	const { textLanguage } = useSettings();
+	const [voiceLang, setVoiceLang] = React.useState<VoiceLanguage>(() =>
+		defaultVoiceLanguage(textLanguage),
+	);
+	const hasAudio = data.voiceLines.some((l) => l.audio);
 	const needle = filter.trim().toLowerCase();
 	const lines = needle
 		? data.voiceLines.filter(
@@ -427,19 +462,43 @@ function VoiceLines({ data }: { data: Operator }): React.ReactElement {
 		: data.voiceLines;
 	return (
 		<div className="flex flex-col gap-4">
-			<InputGroup className="max-w-sm">
-				<InputGroupInput
-					aria-label="Filter voice lines"
-					onChange={(e) => setFilter(e.target.value)}
-					placeholder="Filter voice lines…"
-					size="sm"
-					type="search"
-					value={filter}
-				/>
-				<InputGroupAddon>
-					<SearchIcon />
-				</InputGroupAddon>
-			</InputGroup>
+			<div className="flex flex-wrap items-center gap-3">
+				<InputGroup className="max-w-sm">
+					<InputGroupInput
+						aria-label="Filter voice lines"
+						onChange={(e) => setFilter(e.target.value)}
+						placeholder="Filter voice lines…"
+						size="sm"
+						type="search"
+						value={filter}
+					/>
+					<InputGroupAddon>
+						<SearchIcon />
+					</InputGroupAddon>
+				</InputGroup>
+				{hasAudio && (
+					<ToggleGroup
+						aria-label="Voice language"
+						onValueChange={(next) => {
+							const v = next[0];
+							if (v) setVoiceLang(v as VoiceLanguage);
+						}}
+						size="sm"
+						value={[voiceLang]}
+						variant="outline"
+					>
+						{VOICE_LANGUAGES.map((lang) => (
+							<ToggleGroupItem
+								key={lang}
+								title={AUDIO_LANGUAGE_LABELS[lang] ?? lang}
+								value={lang}
+							>
+								{lang}
+							</ToggleGroupItem>
+						))}
+					</ToggleGroup>
+				)}
+			</div>
 			<ul className="divide-y overflow-hidden rounded-xl border bg-card">
 				{lines.map((line) => (
 					<li
@@ -447,7 +506,11 @@ function VoiceLines({ data }: { data: Operator }): React.ReactElement {
 						key={line.id}
 					>
 						<div className="flex shrink-0 items-start gap-2 sm:w-44">
-							<VoiceAudioSlot voId={line.voId} />
+							<VoiceAudioSlot
+								lang={voiceLang}
+								line={line}
+								speaker={data.name}
+							/>
 							<span className="font-medium text-muted-foreground text-xs leading-5">
 								{line.title}
 							</span>

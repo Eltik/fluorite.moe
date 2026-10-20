@@ -1,3 +1,4 @@
+mod audio;
 mod catalog;
 mod files;
 mod i18n;

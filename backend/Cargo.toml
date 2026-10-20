@@ -20,7 +20,7 @@ name = "fluorite-api"
 path = "src/bin/fluorite-api.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "net", "signal", "sync", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "net", "signal", "sync", "io-util", "process"] }
 reqwest = { version = "0.13.2", features = ["json", "query"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

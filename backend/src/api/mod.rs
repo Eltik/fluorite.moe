@@ -4,6 +4,7 @@
 //! holds everything handlers share (config, search index, listing/i18n caches, thumbnail
 //! limiter, catalog/story caches).
 
+pub mod audio;
 pub mod catalog;
 pub mod config;
 pub mod error;
@@ -41,6 +42,7 @@ pub struct AppState {
     pub i18n: i18n::I18nCache,
     pub thumbs: thumbs::ThumbLimiter,
     pub catalog: catalog::Catalog,
+    pub audio: audio::AudioState,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -57,6 +59,7 @@ impl AppState {
             i18n: i18n::I18nCache::new(5),
             thumbs: thumbs::ThumbLimiter::new(threads),
             catalog: catalog::Catalog::new(),
+            audio: audio::AudioState::new(),
         })
     }
 }
@@ -91,6 +94,9 @@ pub fn router(state: SharedState) -> Router {
         .nest("/catalog", catalog::router())
         .route("/story", get(story::list))
         .route("/story/{id}", get(story::dialog))
+        .route("/audio", get(audio::summary))
+        .route("/audio/entries", get(audio::entries))
+        .route("/voice/{char_id}", get(audio::voice))
         .layer(compress);
 
     let cors = CorsLayer::new()
@@ -109,6 +115,7 @@ pub fn router(state: SharedState) -> Router {
         .nest("/api", api)
         .route("/files/{root}/{*path}", get(files::file))
         .route("/thumb/{*path}", get(thumbs::thumb))
+        .route("/audio/{pack}/{file}", get(audio::clip))
         .fallback(|| async { ApiError::not_found("no such route") })
         .with_state(state)
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -134,6 +141,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     let addr = config.addr;
     let state = AppState::new(config);
     search::spawn_maintenance(state.clone());
+    audio::spawn_maintenance(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(

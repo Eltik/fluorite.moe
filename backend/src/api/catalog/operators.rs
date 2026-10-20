@@ -310,6 +310,26 @@ pub struct VoiceOut {
     pub vo_id: String,
 }
 
+/// Add `audio` (`{CN: {ogg, m4a}, ...}`) to each serialized voice line whose `voId`
+/// `audio_for` resolves; lines without audio keep their shape.
+pub fn attach_voice_audio(detail: &mut Value, audio_for: impl Fn(&str) -> Option<Value>) {
+    let Some(lines) = detail.get_mut("voiceLines").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for line in lines {
+        let Some(audio) = line
+            .get("voId")
+            .and_then(Value::as_str)
+            .and_then(&audio_for)
+        else {
+            continue;
+        };
+        if let Value::Object(o) = line {
+            o.insert("audio".into(), audio);
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NamedRef {
