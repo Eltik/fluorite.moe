@@ -289,6 +289,10 @@ cargo run --release --features acl --bin endfield-models -- export \
   --filter postmodels/characters --output output/models \
   --anims uiteam_idle,dialog_single_idle,idle --max-anims 2
 
+# Every clip of every exported operator/NPC/enemy as its own animation-only GLB
+cargo run --release --features acl --bin endfield-models -- clips \
+  --store output/models/.store --models output/models
+
 # Delete stored files the store's relevance rules no longer keep
 cargo run --release --bin endfield-models -- prune --store output/models/.store
 
@@ -304,6 +308,7 @@ cargo run --release --bin endfield-models -- anim-survey --store output/models/.
 | `chunks` | List the bundle `.chk` files with their sizes |
 | `scan` | Download chunks into the store (`--chk`, `--jobs`, `--cache-dir`) |
 | `export` | Write GLBs for prefabs matching `--filter` (see below) |
+| `clips` | Write one animation-only GLB per clip of every exported model (see below; `--kind`, `--id`, `--jobs`, `--skip-existing`, `--no-root-motion`) |
 | `prune` | Delete stored files the relevance rules no longer keep, and print the space freed |
 | `inspect` | Summarize Unity objects and container paths of chunks |
 | `anim-survey` | Summarize clips and animators in a store, as JSON |
@@ -319,7 +324,9 @@ cargo build --release --features acl --bin endfield-models
 
 ACL v2.1 (and RTM) is vendored in `backend/vendor/acl` under the MIT license (`LICENSE-acl`, `LICENSE-rtm`); `VERSION.txt` records the pinned commits. Default builds need no C++ and export models without clips. Clips are found by container path (`.../<code>/animations/**/*<keyword>*.fbx`, where `<code>` is the entity id's last `_` segment, e.g. `chr_0005_chen` is `chen`).
 
-**In the catalog.** The API links a rigged GLB as `model.rigged` (path relative to the `models` root, served at `/files/models/...`) on the catalog detail of operators, enemies and weapons; the Studio loads it when present. The lookup matches the id against the GLB file names listed in `index.json`, then tries `<kind>/<id>.glb` (also the singular and `characters/`). If neither exists it falls back to a variant prefab of the id: templates such as `eny_0054_hsmino` only have `eny_0054_hsmino1` or `eny_0054_hsmino_chrdg`, and some weapons only `<id>_refined`. A digit suffix counts only after a letter (`wpn_x_0009` never matches `wpn_x_00091`); digit variants win over `_` variants, then the shortest name. Without `index.json`, no model is linked. The API re-reads the index when its mtime changes.
+**Per-clip GLBs.** `clips` reads `<models>/index.json` and writes, for each operator, NPC and enemy (not weapons), every clip found the same way as `--anims` (minus additive clips) to `<models>/clips/<kind>/<id>/<clip>.glb`, plus `index.json` (one entry per clip: `file`, display `name`, `clip`, `source` (`3c`, `battle`, `dialog`, `interact`, `ui` or `other`, from the animation folder), `duration`, `samples`, `fps`, `loop` (the clip's Loop Time), `humanoid`, `tracks`, `matched`, `size`, `rootMotion`, `rootNode`, `rootStart`, `rootEnd`). A clip GLB has no meshes: only the nodes its channels target (and their ancestors below the Animator's node) and one animation, so three.js' `AnimationMixer` on the loaded model plays it by node name. Node names are the ones three.js gives the model's nodes (it suffixes repeated names `_1`, `_2`…), so tracks resolve to exactly one node. Most Endfield clips are Unity Humanoid clips: the body is stored as muscle curves, which are turned into bone rotations through the model's Avatar (Endfield's legs have three extra muscles each). Root motion is played by `rootNode`: for humanoid clips it becomes translation/rotation channels on the Animator's node, for generic clips it is already the travel of the Avatar's root motion bone (`Root`). To play in place, hold `rootNode`'s position at `rootStart`. Keys are reduced within 0.1 mm / 0.001 rad and rotations stored as normalized shorts; clips identical across models (NPC variants of operators, enemy variants) are hard-linked. `<models>/clips/summary.json` lists counts and every skipped clip with its reason (additive, other skeleton, plain Mecanim curves, Avatar not found).
+
+**In the catalog.** The API links a rigged GLB as `model.rigged` (path relative to the `models` root, served at `/files/models/...`) on the catalog detail of operators, enemies and weapons; the Studio loads it when present. The lookup matches the id against the GLB file names listed in `index.json`, then tries `<kind>/<id>.glb` (also the singular and `characters/`). If neither exists it falls back to a variant prefab of the id: templates such as `eny_0054_hsmino` only have `eny_0054_hsmino1` or `eny_0054_hsmino_chrdg`, and some weapons only `<id>_refined`. A digit suffix counts only after a letter (`wpn_x_0009` never matches `wpn_x_00091`); digit variants win over `_` variants, then the shortest name. Without `index.json`, no model is linked. The API re-reads the index when its mtime changes. When `clips` wrote a non-empty clip index for that GLB, `model.clips` is its path (e.g. `clips/operator/chr_0005_chen/index.json`, served at `/files/models/clips/...`, with each clip's `file` next to it).
 
 ### auth-test
 

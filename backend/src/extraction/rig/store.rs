@@ -38,6 +38,23 @@ pub const SKIPPED_PREFIXES: &[&str] = &[
     "assets/beyond/dynamicassets/gameplay/ui/",
 ];
 
+/// Container prefixes of character-screen light rigs (additional lights, camera tracks with
+/// their light volumes, the default volume), kept for per-character light data.
+pub const CHARINFO_LIGHT_PREFIXES: &[&str] = &[
+    "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/additionallights/",
+    "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/cameratracks/",
+    "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/charinfo_volume",
+];
+
+/// Whether a bundle holds a character-screen light rig (see [`CHARINFO_LIGHT_PREFIXES`]).
+#[must_use]
+pub fn is_charinfo_light_bundle(containers: &[(String, i64, i64)]) -> bool {
+    containers.iter().any(|(p, _, _)| {
+        let p = p.to_ascii_lowercase();
+        CHARINFO_LIGHT_PREFIXES.iter().any(|s| p.starts_with(s))
+    })
+}
+
 fn is_entity_bundle(containers: &[(String, i64, i64)]) -> bool {
     containers.iter().any(|(p, _, _)| {
         ENTITY_HINTS
@@ -47,13 +64,14 @@ fn is_entity_bundle(containers: &[(String, i64, i64)]) -> bool {
 }
 
 /// Whether a SerializedFile is worth keeping: an entity bundle, or one holding shared assets
-/// (shaders, materials, textures, meshes) that is not purely a scene/UI/dialog bundle.
+/// (shaders, materials, textures, meshes) that is not purely a scene/UI/dialog bundle, or a
+/// character-screen light rig.
 ///
 /// Everything else (MonoBehaviour-only data, cutscenes, level sequences — gigabytes per run) is
 /// indexed but not stored.
 #[must_use]
 pub fn is_rig_relevant(classes: &BTreeMap<i32, usize>, containers: &[(String, i64, i64)]) -> bool {
-    if is_entity_bundle(containers) {
+    if is_entity_bundle(containers) || is_charinfo_light_bundle(containers) {
         return true;
     }
     let scene_only = !containers.is_empty()

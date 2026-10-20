@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::assets::{ModelInfo, UI, model_info};
+use super::assets::{self, ModelInfo, UI, model_info};
 use super::tables::*;
 use super::text::Texts;
 use super::{BaseItem, BaseTag, Env, TagName, dep, finish_detail, sort_id};
@@ -139,15 +139,19 @@ pub fn detail(t: &Tables, env: &Env, texts: &Texts, id: &str) -> Option<Value> {
         data_key: n.data_key.clone(),
         group_id: n.npc_group_id.clone(),
         icon: npc_icon(env, &npc_icon_names(env), id, &n.data_key),
-        model: ModelInfo {
-            rigged: env.rig.find_npc(&env.output, id, &n.data_key),
-            ..model_info(
-                &env.output,
-                &env.rig,
-                "npcs",
-                id,
-                env.meshes.npc(&n.data_key),
-            )
+        model: {
+            let rigged = env.rig.find_npc(&env.output, id, &n.data_key);
+            ModelInfo {
+                clips: assets::clips_index(&env.output, rigged.as_deref()),
+                rigged,
+                ..model_info(
+                    &env.output,
+                    &env.rig,
+                    "npcs",
+                    id,
+                    env.meshes.npc(&n.data_key),
+                )
+            }
         },
     };
     Some(finish_detail(&d, texts))

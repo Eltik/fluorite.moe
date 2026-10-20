@@ -134,3 +134,8 @@ pub fn floats(data: &[u8]) -> Result<(AclInfo, Vec<f32>), String> {
 pub fn transforms(_data: &[u8]) -> Result<(AclInfo, Vec<f32>), String> {
     Err("built without the `acl` feature (cargo build --features acl)".into())
 }
+
+#[cfg(not(feature = "acl"))]
+pub fn floats(_data: &[u8]) -> Result<(AclInfo, Vec<f32>), String> {
+    Err("built without the `acl` feature (cargo build --features acl)".into())
+}

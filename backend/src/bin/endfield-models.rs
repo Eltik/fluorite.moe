@@ -5,6 +5,7 @@
 //!   inspect  — summarize the Unity objects and container paths of chunks
 //!   scan     — download chunks once and keep what rig export needs in a small store
 //!   export   — write one self-contained GLB per entity prefab matching a filter
+//!   clips    — write one animation-only GLB per clip of every exported model
 use backend::extraction::pipeline::{self, VFS_DIRS};
 use backend::extraction::rig::{self, ChunkFiles};
 use backend::extraction::zip_range::ZipCentralDirectory;
@@ -151,6 +152,38 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         max_anims: usize,
     },
+    /// Write every clip of each exported model (operators, NPCs, enemies) as an
+    /// animation-only GLB: <models>/clips/<kind>/<id>/<clip>.glb plus index.json, bound by
+    /// node name to <models>/<kind>/<id>.glb. Needs `--features acl`.
+    Clips {
+        /// Store of scanned chunks
+        #[arg(long)]
+        store: PathBuf,
+        /// Models directory holding index.json and <kind>/<id>.glb
+        #[arg(long, default_value = "output/models")]
+        models: PathBuf,
+        /// Only these kinds (operator, npc, enemy); repeatable
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        /// Only entities whose id contains one of these (repeatable)
+        #[arg(long = "id")]
+        ids: Vec<String>,
+        /// Worker threads (default: available cores)
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Leave entities that already have a clips index.json
+        #[arg(long)]
+        skip_existing: bool,
+        /// Don't add root-motion channels to the clip root
+        #[arg(long)]
+        no_root_motion: bool,
+        /// Key reduction: largest rotation error in radians
+        #[arg(long, default_value_t = rig::clips::TOLERANCE.rotation)]
+        rotation_tolerance: f32,
+        /// Key reduction: largest translation error in metres
+        #[arg(long, default_value_t = rig::clips::TOLERANCE.position)]
+        position_tolerance: f32,
+    },
 }
 
 #[tokio::main]
@@ -253,6 +286,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_dir.as_deref(),
             )
             .await
+        }
+        Commands::Clips {
+            store,
+            models,
+            kinds,
+            ids,
+            jobs,
+            skip_existing,
+            no_root_motion,
+            rotation_tolerance,
+            position_tolerance,
+        } => {
+            if !rig::acl::available() {
+                return Err("clips needs a build with `--features acl`".into());
+            }
+            cmd_clips(&ClipsArgs {
+                store,
+                models,
+                kinds,
+                ids,
+                jobs: jobs.unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+                }),
+                skip_existing,
+                root_motion: !no_root_motion,
+                tolerance: rig::clips::Tolerance {
+                    rotation: rotation_tolerance,
+                    position: position_tolerance,
+                    ..rig::clips::TOLERANCE
+                },
+            })
         }
         Commands::Export {
             filter,
@@ -941,36 +1005,7 @@ fn select_clips(
     keywords: &[String],
     max: usize,
 ) -> Vec<(String, i64)> {
-    let code = clip_code(id);
-    let in_folder = |prefix: bool| -> Vec<&(String, String, i64)> {
-        index
-            .iter()
-            .filter(|(path, _, _)| {
-                let Some(at) = path.find("/animations/") else {
-                    return false;
-                };
-                let before = path[..at].rsplit('/').next().unwrap_or("");
-                let after = path[at + "/animations/".len()..]
-                    .split('/')
-                    .next()
-                    .unwrap_or("");
-                clip_folder_matches(before, &code, prefix)
-                    || clip_folder_matches(after, &code, prefix)
-            })
-            .collect()
-    };
-    // Exact folders first, so `chen` never picks up `chenpast/`; prefixes only as a fallback.
-    let mut owned = in_folder(false);
-    if owned.is_empty() {
-        // A prefix match is only trusted when it names exactly one folder.
-        let folder_of = |path: &str| path.find("/animations/").map(|at| path[..at].to_string());
-        let candidates = in_folder(true);
-        let folders: BTreeSet<Option<String>> =
-            candidates.iter().map(|(p, _, _)| folder_of(p)).collect();
-        if folders.len() == 1 {
-            owned = candidates;
-        }
-    }
+    let owned = owned_clips(index, id);
     for keyword in keywords
         .iter()
         .flat_map(|k| k.split(','))
@@ -1002,6 +1037,41 @@ fn select_clips(
     Vec::new()
 }
 
+/// Every animation container entry belonging to an entity (see [`select_clips`]).
+fn owned_clips<'a>(index: &'a [(String, String, i64)], id: &str) -> Vec<&'a (String, String, i64)> {
+    let code = clip_code(id);
+    let in_folder = |prefix: bool| -> Vec<&(String, String, i64)> {
+        index
+            .iter()
+            .filter(|(path, _, _)| {
+                let Some(at) = path.find("/animations/") else {
+                    return false;
+                };
+                let before = path[..at].rsplit('/').next().unwrap_or("");
+                let after = path[at + "/animations/".len()..]
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                clip_folder_matches(before, &code, prefix)
+                    || clip_folder_matches(after, &code, prefix)
+            })
+            .collect()
+    };
+    // Exact folders first, so `chen` never picks up `chenpast/`; prefixes only as a fallback.
+    let mut owned = in_folder(false);
+    if owned.is_empty() {
+        // A prefix match is only trusted when it names exactly one folder.
+        let folder_of = |path: &str| path.find("/animations/").map(|at| path[..at].to_string());
+        let candidates = in_folder(true);
+        let folders: BTreeSet<Option<String>> =
+            candidates.iter().map(|(p, _, _)| folder_of(p)).collect();
+        if folders.len() == 1 {
+            owned = candidates;
+        }
+    }
+    owned
+}
+
 /// The model code an entity's animation folders are named after: the id's third `_` segment
 /// (`chr_0005_chen` -> `chen`, `eny_0054_hsmino_chrdg` -> `hsmino`), else its last segment.
 fn clip_code(id: &str) -> String {
@@ -1018,6 +1088,222 @@ fn clip_code(id: &str) -> String {
 fn clip_folder_matches(folder: &str, code: &str, prefix: bool) -> bool {
     let base = code.trim_end_matches(|c: char| c.is_ascii_digit());
     !folder.is_empty() && (folder == code || folder == base || (prefix && folder.starts_with(code)))
+}
+
+struct ClipsArgs {
+    store: PathBuf,
+    models: PathBuf,
+    kinds: Vec<String>,
+    ids: Vec<String>,
+    jobs: usize,
+    skip_existing: bool,
+    root_motion: bool,
+    tolerance: rig::clips::Tolerance,
+}
+
+/// One entity's line in `clips/summary.json`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipsSummary {
+    kind: String,
+    id: String,
+    index: String,
+    candidates: usize,
+    /// Why no human description was found (humanoid clips are then skipped).
+    avatar_error: Option<String>,
+    seconds: f64,
+    error: Option<String>,
+    #[serde(flatten)]
+    report: rig::clips::EntityClips,
+}
+
+/// `endfield-models clips`: per-clip GLBs for every exported (non-weapon) model, on `jobs`
+/// threads. Each worker keeps its own bundle cache, cleared between entities.
+fn cmd_clips(args: &ClipsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let started = Instant::now();
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(args.models.join("index.json"))?)?;
+    let mut entities: Vec<(String, String, String)> = index["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let glb = e.get("glb")?.as_str()?.to_string();
+            let kind = e.get("kind")?.as_str()?.to_string();
+            let id = e.get("id")?.as_str()?.to_string();
+            Some((kind, id, glb))
+        })
+        .filter(|(kind, _, _)| kind != "weapon")
+        .filter(|(kind, _, _)| args.kinds.is_empty() || args.kinds.contains(kind))
+        .filter(|(_, id, _)| {
+            args.ids.is_empty() || args.ids.iter().any(|f| id.contains(f.as_str()))
+        })
+        .collect();
+    entities.sort();
+    entities.dedup_by(|a, b| a.2 == b.2);
+    let records = rig::store::read_index(&args.store)?;
+    let clip_index = animation_containers(&records, Some(&args.store));
+    let avatars = rig::humanoid::avatar_containers(&records, &args.store);
+    drop(records);
+    eprintln!(
+        "clips: {} entities, {} stored animation container entries, {} job(s)",
+        entities.len(),
+        clip_index.len(),
+        args.jobs
+    );
+    let clips_root = args.models.join("clips");
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<ClipsSummary>> = Mutex::new(Vec::new());
+    let written: Mutex<rig::clips::WrittenFiles> = Mutex::new(HashMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..args.jobs.max(1) {
+            scope.spawn(|| {
+                let mut src = rig::store::CabSource::new(
+                    Some(args.store.clone()),
+                    rig::ChunkFiles::default(),
+                );
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((kind, id, glb)) = entities.get(i) else {
+                        break;
+                    };
+                    let t0 = Instant::now();
+                    let stem = glb.strip_suffix(".glb").unwrap_or(glb);
+                    let out_dir = clips_root.join(stem);
+                    if args.skip_existing && out_dir.join("index.json").is_file() {
+                        continue;
+                    }
+                    let sources: Vec<(String, String, i64)> =
+                        owned_clips(&clip_index, id).into_iter().cloned().collect();
+                    let mut avatar_error = None;
+                    let outcome = rig::clips::read_glb_json(&args.models.join(glb))
+                        .and_then(|doc| {
+                            let mut model = rig::clips::ModelRig::from_document(&doc)?;
+                            let human = match rig::humanoid::find_avatar(&mut src, &avatars, &doc) {
+                                Ok(avatar) => {
+                                    model.choose_root(&rig::humanoid::skeleton_ids(&avatar));
+                                    model.set_motion_bone(rig::humanoid::root_motion_bone(&avatar));
+                                    rig::humanoid::Humanoid::from_avatar(&avatar)
+                                        .map_err(|e| avatar_error = Some(e))
+                                        .ok()
+                                }
+                                Err(e) => {
+                                    avatar_error = Some(e);
+                                    None
+                                }
+                            };
+                            Ok((model, human))
+                        })
+                        .and_then(|(model, human)| {
+                            let code = clip_code(id);
+                            let job = rig::clips::EntityJob {
+                                id,
+                                kind,
+                                code: &code,
+                                rig: &model,
+                                sources: &sources,
+                                out_dir: &out_dir,
+                                root_motion: args.root_motion,
+                                tolerance: args.tolerance,
+                                human: human.as_ref(),
+                                written: Some(&written),
+                            };
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                rig::clips::export_entity(&mut src, &job)
+                            }))
+                            .unwrap_or_else(|_| Err("clip export panicked".into()))
+                        });
+                    src.clear();
+                    let seconds = t0.elapsed().as_secs_f64();
+                    let (report, error) = match outcome {
+                        Ok(r) => (r, None),
+                        Err(e) => (rig::clips::EntityClips::default(), Some(e)),
+                    };
+                    eprintln!(
+                        "[{}/{}] {kind}/{id}: {} clips ({} humanoid, {} linked), {:.1} MB, skipped {} (additive {}, other skeleton {}, non-ACL {}, no avatar {}, duplicate {}, failed {}){} in {seconds:.1}s",
+                        i + 1,
+                        entities.len(),
+                        report.clips,
+                        report.humanoid,
+                        report.linked,
+                        report.bytes as f64 / 1e6,
+                        report.skipped.len(),
+                        report.additive,
+                        report.other_skeleton,
+                        report.non_acl,
+                        report.no_avatar,
+                        report.duplicates,
+                        report.failed,
+                        error.as_ref().map(|e| format!(" ERROR {e}")).unwrap_or_default(),
+                    );
+                    results
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(ClipsSummary {
+                            kind: kind.clone(),
+                            id: id.clone(),
+                            index: format!("clips/{stem}/index.json"),
+                            candidates: sources.len(),
+                            avatar_error,
+                            seconds,
+                            error,
+                            report,
+                        });
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    results.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+    // Merge with earlier runs (other kinds / ids) by index path.
+    std::fs::create_dir_all(&clips_root)?;
+    let summary_path = clips_root.join("summary.json");
+    let mut entries: BTreeMap<String, serde_json::Value> = std::fs::read(&summary_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("entities").and_then(|e| e.as_array()).cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e.get("index")?.as_str()?.to_string(), e)))
+        .collect();
+    for r in &results {
+        entries.insert(r.index.clone(), serde_json::to_value(r)?);
+    }
+    let total = |key: &str| -> u64 {
+        entries
+            .values()
+            .map(|e| e.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0))
+            .sum()
+    };
+    let summary = serde_json::json!({
+        "generator": "endfield-models clips",
+        "totals": {
+            "entities": entries.len(),
+            "clips": total("clips"),
+            "bytes": total("bytes"),
+            "nonAcl": total("nonAcl"),
+            "additive": total("additive"),
+            "otherSkeleton": total("otherSkeleton"),
+            "duplicates": total("duplicates"),
+            "failed": total("failed"),
+            "linked": total("linked"),
+            "humanoid": total("humanoid"),
+            "noAvatar": total("noAvatar"),
+        },
+        "entities": entries.into_values().collect::<Vec<_>>(),
+    });
+    rig::store::write_atomic(&summary_path, &serde_json::to_vec_pretty(&summary)?)?;
+    let clips: usize = results.iter().map(|r| r.report.clips).sum();
+    let bytes: u64 = results.iter().map(|r| r.report.bytes).sum();
+    eprintln!(
+        "wrote {clips} clips for {} entities, {:.1} MB, in {:.0}s",
+        results.len(),
+        bytes as f64 / 1e6,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Export an Avatar-only model import: its bundle's Avatar plus every Mesh of the container.

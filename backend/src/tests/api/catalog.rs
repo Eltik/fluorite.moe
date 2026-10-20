@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Fixture, body_json, get};
-use crate::api::catalog::assets::{MeshIndex, RigIndex, model_parts, split_lod};
+use crate::api::catalog::assets::{MeshIndex, RigIndex, clips_index, model_parts, split_lod};
 use crate::api::story::{natural_cmp, replace_non_finite};
 
 const UI: &str = "textures/beyond/dynamicassets/gameplay/ui/sprites";
@@ -308,6 +308,14 @@ pub fn catalog_fixture() -> Fixture {
         br#"{"models":[{"kind":"operators","id":"chr_0005_chen","path":"models/operators/chr_0005_chen.glb"}]}"#,
     );
     write("models/operators/chr_0005_chen.glb", b"glTF");
+    write(
+        "models/clips/operators/chr_0005_chen/index.json",
+        br#"[{"file":"a_actor_chen_idle.glb","name":"idle","clip":"A_actor_chen_idle","source":"3c","duration":2.0,"samples":121,"fps":60.0,"loop":true,"humanoid":true,"tracks":300,"matched":300,"size":4,"rootMotion":false}]"#,
+    );
+    write(
+        "models/clips/operators/chr_0005_chen/a_actor_chen_idle.glb",
+        b"glTF",
+    );
 
     // Dialog: line -> (spliced ExActor) -> option(2) -> line / finish. Contains a bare
     // `Infinity` like Unity's serializer emits.
@@ -587,6 +595,26 @@ async fn operator_detail() {
     assert_eq!(v["model"]["rigged"], "operators/chr_0005_chen.glb");
     let rigged = get(&app, "/files/models/operators/chr_0005_chen.glb").await;
     assert_eq!(rigged.status(), StatusCode::OK);
+    // Per-clip animation GLBs: the index sits next to the clips under the models root.
+    assert_eq!(
+        v["model"]["clips"],
+        "clips/operators/chr_0005_chen/index.json"
+    );
+    let clips = body_json(
+        get(
+            &app,
+            "/files/models/clips/operators/chr_0005_chen/index.json",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(clips[0]["file"], "a_actor_chen_idle.glb");
+    let clip = get(
+        &app,
+        "/files/models/clips/operators/chr_0005_chen/a_actor_chen_idle.glb",
+    )
+    .await;
+    assert_eq!(clip.status(), StatusCode::OK);
 
     // CN: localized description, profession from CN, name from CN.
     let v = body_json(get(&app, "/api/catalog/operators/chr_0005_chen?lang=CN").await).await;
@@ -763,7 +791,7 @@ async fn models_root_is_browsable() {
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["operators", "index.json"]);
+    assert_eq!(names, vec!["clips", "operators", "index.json"]);
 }
 
 /// Catalog ids resolve to rigged variant prefabs when no exact GLB exists.
@@ -901,5 +929,24 @@ fn rig_index_scopes_kinds_and_maps_npc_data_keys() {
         rig.find_npc(&out, "dajiang", "npc_gentleman_riverbandits_a_01"),
         None
     );
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The clip index is reported only when `endfield-models clips` wrote a non-empty one.
+#[test]
+fn clips_index_needs_a_non_empty_index() {
+    let out = std::env::temp_dir().join(format!("fluorite-clips-{}", std::process::id()));
+    let dir = out.join("models/clips/enemy");
+    std::fs::create_dir_all(dir.join("eny_a")).unwrap();
+    std::fs::create_dir_all(dir.join("eny_b")).unwrap();
+    std::fs::write(dir.join("eny_a/index.json"), br#"[{"file":"x.glb"}]"#).unwrap();
+    std::fs::write(dir.join("eny_b/index.json"), b"[]").unwrap();
+    assert_eq!(
+        clips_index(&out, Some("enemy/eny_a.glb")).as_deref(),
+        Some("clips/enemy/eny_a/index.json")
+    );
+    assert_eq!(clips_index(&out, Some("enemy/eny_b.glb")), None);
+    assert_eq!(clips_index(&out, Some("enemy/eny_c.glb")), None);
+    assert_eq!(clips_index(&out, None), None);
     let _ = std::fs::remove_dir_all(&out);
 }

@@ -420,6 +420,20 @@ pub struct ModelInfo {
     /// Rigged GLB under the `models` root, when the exporter produced one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rigged: Option<String>,
+    /// Clip index of the rigged GLB under the `models` root (`clips/<kind>/<id>/index.json`,
+    /// written by `endfield-models clips`): one animation-only GLB per clip next to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clips: Option<String>,
+}
+
+/// Clip index (models-root relative) of a rigged GLB, when `endfield-models clips` wrote a
+/// non-empty one: `operator/chr_0005_chen.glb` → `clips/operator/chr_0005_chen/index.json`.
+pub fn clips_index(output: &Path, rigged: Option<&str>) -> Option<String> {
+    let stem = rigged?.strip_suffix(".glb")?;
+    let rel = format!("clips/{stem}/index.json");
+    let meta = std::fs::metadata(Root::Models.dir(output).join(&rel)).ok()?;
+    // An entity without clips gets `[]` (2 bytes).
+    (meta.is_file() && meta.len() > 2).then_some(rel)
 }
 
 pub fn model_info(
@@ -434,9 +448,11 @@ pub fn model_info(
         Some((dir, code)) => (Some(dir.to_string()), model_parts(&meshes, dir, &code)),
         None => (None, Vec::new()),
     };
+    let rigged = rig.find(output, kind, id);
     ModelInfo {
         dir,
         parts,
-        rigged: rig.find(output, kind, id),
+        clips: clips_index(output, rigged.as_deref()),
+        rigged,
     }
 }
