@@ -2,7 +2,9 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Fixture, body_json, get};
-use crate::api::catalog::assets::{MeshIndex, RigIndex, clips_index, model_parts, split_lod};
+use crate::api::catalog::assets::{
+    MeshIndex, RigIndex, clips_index, lights_file, model_parts, split_lod,
+};
 use crate::api::story::{natural_cmp, replace_non_finite};
 
 const UI: &str = "textures/beyond/dynamicassets/gameplay/ui/sprites";
@@ -316,6 +318,10 @@ pub fn catalog_fixture() -> Fixture {
         "models/clips/operators/chr_0005_chen/a_actor_chen_idle.glb",
         b"glTF",
     );
+    write(
+        "models/lights/chr_0005_chen.json",
+        br#"{"id":"chr_0005_chen","volume":{"multiplier":1.0},"lights":[{"name":"RimLight_1","npr":"rim"}]}"#,
+    );
 
     // Dialog: line -> (spliced ExActor) -> option(2) -> line / finish. Contains a bare
     // `Infinity` like Unity's serializer emits.
@@ -615,6 +621,10 @@ async fn operator_detail() {
     )
     .await;
     assert_eq!(clip.status(), StatusCode::OK);
+    // Menu lighting written by the exporter, also under the models root.
+    assert_eq!(v["model"]["lights"], "lights/chr_0005_chen.json");
+    let lights = body_json(get(&app, "/files/models/lights/chr_0005_chen.json").await).await;
+    assert_eq!(lights["lights"][0]["npr"], "rim");
 
     // CN: localized description, profession from CN, name from CN.
     let v = body_json(get(&app, "/api/catalog/operators/chr_0005_chen?lang=CN").await).await;
@@ -791,7 +801,7 @@ async fn models_root_is_browsable() {
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["clips", "operators", "index.json"]);
+    assert_eq!(names, vec!["clips", "lights", "operators", "index.json"]);
 }
 
 /// Catalog ids resolve to rigged variant prefabs when no exact GLB exists.
@@ -948,5 +958,20 @@ fn clips_index_needs_a_non_empty_index() {
     assert_eq!(clips_index(&out, Some("enemy/eny_b.glb")), None);
     assert_eq!(clips_index(&out, Some("enemy/eny_c.glb")), None);
     assert_eq!(clips_index(&out, None), None);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Light data is reported only when the exporter wrote `lights/<id>.json`.
+#[test]
+fn lights_file_needs_an_exported_file() {
+    let out = std::env::temp_dir().join(format!("fluorite-lights-{}", std::process::id()));
+    std::fs::create_dir_all(out.join("models/lights")).unwrap();
+    std::fs::write(out.join("models/lights/chr_a.json"), b"{}").unwrap();
+    assert_eq!(
+        lights_file(&out, Some("operator/chr_a.glb")).as_deref(),
+        Some("lights/chr_a.json")
+    );
+    assert_eq!(lights_file(&out, Some("operator/chr_b.glb")), None);
+    assert_eq!(lights_file(&out, None), None);
     let _ = std::fs::remove_dir_all(&out);
 }

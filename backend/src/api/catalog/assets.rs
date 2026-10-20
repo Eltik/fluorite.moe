@@ -424,6 +424,10 @@ pub struct ModelInfo {
     /// written by `endfield-models clips`): one animation-only GLB per clip next to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clips: Option<String>,
+    /// Menu lighting of the rigged GLB under the `models` root (`lights/<id>.json`, written by
+    /// `endfield-models export` for operators): key-light volume and additional NPR lights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lights: Option<String>,
 }
 
 /// Clip index (models-root relative) of a rigged GLB, when `endfield-models clips` wrote a
@@ -434,6 +438,15 @@ pub fn clips_index(output: &Path, rigged: Option<&str>) -> Option<String> {
     let meta = std::fs::metadata(Root::Models.dir(output).join(&rel)).ok()?;
     // An entity without clips gets `[]` (2 bytes).
     (meta.is_file() && meta.len() > 2).then_some(rel)
+}
+
+/// Light data (models-root relative) of a rigged GLB, when the exporter wrote one:
+/// `operator/chr_0004_pelica.glb` → `lights/chr_0004_pelica.json`.
+pub fn lights_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+    let stem = rigged?.strip_suffix(".glb")?;
+    let id = stem.rsplit('/').next()?;
+    let rel = format!("lights/{id}.json");
+    Root::Models.dir(output).join(&rel).is_file().then_some(rel)
 }
 
 pub fn model_info(
@@ -453,6 +466,7 @@ pub fn model_info(
         dir,
         parts,
         clips: clips_index(output, rigged.as_deref()),
+        lights: lights_file(output, rigged.as_deref()),
         rigged,
     }
 }

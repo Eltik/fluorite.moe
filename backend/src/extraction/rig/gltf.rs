@@ -130,12 +130,25 @@ impl Builder {
 
     /// Embed an encoded image (PNG/WebP) and return its texture index.
     pub fn texture(&mut self, bytes: &[u8], mime: &str, name: &str) -> usize {
+        self.texture_with_sampler(bytes, mime, name, false)
+    }
+
+    /// A texture sampled at exact texels (ramps, LUTs): LINEAR without mipmaps, clamped.
+    pub fn clamped_texture(&mut self, bytes: &[u8], mime: &str, name: &str) -> usize {
+        self.texture_with_sampler(bytes, mime, name, true)
+    }
+
+    fn texture_with_sampler(&mut self, bytes: &[u8], mime: &str, name: &str, clamp: bool) -> usize {
         if self.samplers.is_empty() {
-            // LINEAR_MIPMAP_LINEAR / LINEAR, REPEAT.
+            // 0: LINEAR_MIPMAP_LINEAR / LINEAR, REPEAT. 1: LINEAR / LINEAR, CLAMP_TO_EDGE.
             self.samplers.push(
                 json!({"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}),
             );
+            self.samplers.push(
+                json!({"magFilter": 9729, "minFilter": 9729, "wrapS": 33071, "wrapT": 33071}),
+            );
         }
+        let sampler = usize::from(clamp);
         let view = self.view(bytes, None);
         self.images
             .push(json!({"name": name, "mimeType": mime, "bufferView": view}));
@@ -144,9 +157,9 @@ impl Builder {
             if !self.extensions_used.iter().any(|e| e == "EXT_texture_webp") {
                 self.extensions_used.push("EXT_texture_webp".into());
             }
-            json!({"name": name, "sampler": 0, "extensions": {"EXT_texture_webp": {"source": image}}})
+            json!({"name": name, "sampler": sampler, "extensions": {"EXT_texture_webp": {"source": image}}})
         } else {
-            json!({"name": name, "sampler": 0, "source": image})
+            json!({"name": name, "sampler": sampler, "source": image})
         };
         self.textures.push(texture);
         self.textures.len() - 1

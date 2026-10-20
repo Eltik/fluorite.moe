@@ -884,3 +884,115 @@ fn clips_for_other_skeletons_are_detected() {
     let nodes: std::collections::HashMap<u32, usize> = [(1, 0)].into_iter().collect();
     assert!((anim::matched_fraction(&clip, &nodes) - 0.25).abs() < 1e-6);
 }
+
+mod npr {
+    use crate::extraction::rig::export::is_shadow_proxy;
+    use crate::extraction::rig::lights::{euler_to_quat, normalize_tint, volume};
+    use crate::extraction::rig::material::{
+        NPR_DATA_SLOTS, TextureRole, color_arrays, is_npr_shader, is_srgb_slot, npr_alpha_mode,
+    };
+    use crate::extraction::rig::store::is_rig_relevant;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    /// Warfarin's alpha rules: alpha test → MASK, SrcAlpha blending → BLEND, else OPAQUE
+    /// (render queue 2450 hair stays opaque; premultiplied cloth is blended by the client).
+    #[test]
+    fn npr_alpha_modes_follow_alpha_test_and_blend_factors() {
+        let hair = json!({"_EnableAlphaTest": 0.0, "_AlphaClip": 0.0, "_SurfaceType": 0.0});
+        assert_eq!(npr_alpha_mode(&hair), ("OPAQUE", None));
+        let cloth = json!({"_EnableAlphaTest": 1.0, "_AlphaClipThreshold": 0.177});
+        assert_eq!(npr_alpha_mode(&cloth), ("MASK", Some(0.177)));
+        let hair_pass = json!({"_SurfaceType": 1.0, "_SrcBlend": 5.0, "_DstBlend": 10.0});
+        assert_eq!(npr_alpha_mode(&hair_pass), ("BLEND", None));
+        let premultiplied = json!({"_SurfaceType": 1.0, "_SrcBlend": 1.0, "_DstBlend": 10.0});
+        assert_eq!(npr_alpha_mode(&premultiplied), ("OPAQUE", None));
+    }
+
+    #[test]
+    fn npr_data_slots_are_linear_and_lossless() {
+        assert!(is_npr_shader("HGRP/CharacterNPR_Hair"));
+        assert!(!is_npr_shader("HGRP/Effect/VFXBaseV2"));
+        for slot in [
+            "_DiffRampMap",
+            "_MetallicGlossMap",
+            "_SDFLightmap",
+            "_ShadowLutTex",
+        ] {
+            assert!(NPR_DATA_SLOTS.contains(&slot));
+            assert!(!is_srgb_slot(slot), "{slot}");
+        }
+        assert!(is_srgb_slot("_BaseMap") && is_srgb_slot("_FurDyeMap"));
+        assert!(TextureRole::Ramp.is_data() && TextureRole::Data.is_data());
+        assert!(!TextureRole::BaseColor.is_data());
+    }
+
+    #[test]
+    fn colors_become_arrays() {
+        let c = color_arrays(Some(
+            &json!({"_BaseColor": {"r": 1.0, "g": 0.5, "b": 0.25, "a": 1.0}}),
+        ));
+        assert_eq!(c, json!({"_BaseColor": [1.0, 0.5, 0.25, 1.0]}));
+    }
+
+    #[test]
+    fn shadow_proxies_are_recognized() {
+        assert!(is_shadow_proxy("S_actor_pelica_body_01_shadowProxyDesktop"));
+        assert!(!is_shadow_proxy("S_actor_pelica_body_01_lod0"));
+    }
+
+    /// Pelica's tint: (.5792, .6791, 1) / .7896 = (.7336, .86, 1.2664), as warfarin ships it.
+    #[test]
+    fn shadow_tints_are_normalized_by_mid_range() {
+        let t = normalize_tint([0.579_245_3, 0.679_093, 1.0]);
+        for (a, b) in t.iter().zip([0.7336, 0.86, 1.2664]) {
+            assert!((a - b).abs() < 1e-3, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn volume_falls_back_to_defaults_without_override() {
+        let own = json!({
+            "charMainLightMultiplier": {"m_Value": 1.0, "overrideState": 1},
+            "charEnvLightMultiplier": {"m_Value": 0.3, "overrideState": 0},
+            "charIgnoreMainLightShadow": {"m_Value": 1, "overrideState": 1},
+            "charCameraFollowMainLightBias": {"m_Value": {"x": 32.0, "y": 12.0}, "overrideState": 1},
+        });
+        let defaults = json!({
+            "charMainLightMultiplier": {"m_Value": 0.9, "overrideState": 1},
+            "charEnvLightMultiplier": {"m_Value": 0.8, "overrideState": 1},
+        });
+        let v = volume(&own, Some(&defaults));
+        assert_eq!(v["multiplier"], 1.0);
+        assert_eq!(v["envMul"], 0.8);
+        assert_eq!(v["yawBias"], 12.0);
+        assert_eq!(v["mainLightShadow"], false);
+    }
+
+    /// Unity applies Z, then X, then Y.
+    #[test]
+    fn euler_angles_compose_like_unity() {
+        let q = euler_to_quat([90.0, 90.0, 0.0]);
+        // Ry(90) * Rx(90) = (0.5, 0.5, -0.5, 0.5)
+        for (a, b) in q.iter().zip([0.5, 0.5, -0.5, 0.5]) {
+            assert!((a - b).abs() < 1e-9, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn charinfo_light_rigs_are_stored() {
+        let classes: BTreeMap<i32, usize> = [(1, 55), (4, 55), (108, 48), (114, 72)].into();
+        let lights = vec![(
+            "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/additionallights/light_chr_0004_pelica.prefab".to_string(),
+            0,
+            1,
+        )];
+        assert!(is_rig_relevant(&classes, &lights));
+        let other = vec![(
+            "assets/beyond/dynamicassets/gameplay/prefabs/misc/x.prefab".to_string(),
+            0,
+            1,
+        )];
+        assert!(!is_rig_relevant(&classes, &other));
+    }
+}

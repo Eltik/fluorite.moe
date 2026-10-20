@@ -22,6 +22,7 @@ pub mod export;
 pub mod gltf;
 pub mod humanoid;
 pub mod inspect;
+pub mod lights;
 pub mod material;
 pub mod skin;
 pub mod store;

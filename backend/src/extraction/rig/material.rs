@@ -22,8 +22,11 @@ pub enum TextureRole {
     BaseColor,
     Normal,
     Emission,
-    /// Any other map, embedded as-is (only with `all_textures`).
+    /// A non-colour map (masks, P maps, SDFs), embedded as lossless PNG at full size.
     Data,
+    /// A ramp or LUT sampled at exact texels: like [`Self::Data`], with a clamped,
+    /// non-mipmapped sampler.
+    Ramp,
 }
 
 impl TextureRole {
@@ -34,7 +37,14 @@ impl TextureRole {
             Self::Normal => "normal",
             Self::Emission => "emission",
             Self::Data => "data",
+            Self::Ramp => "ramp",
         }
+    }
+
+    /// Whether the image is shading data that must stay lossless and full size.
+    #[must_use]
+    pub fn is_data(&self) -> bool {
+        matches!(self, Self::Data | Self::Ramp)
     }
 }
 
@@ -50,6 +60,77 @@ pub const BASE_COLOR_NAMES: &[&str] = &[
 ];
 pub const NORMAL_NAMES: &[&str] = &["_BumpMap", "_NormalMap", "_NormalTex", "_BumpTex"];
 pub const EMISSION_NAMES: &[&str] = &["_EmissionMap", "_EmissiveMap", "_EmissiveTex"];
+
+/// Data maps the game's NPR character shaders (`HGRP/CharacterNPR*`) sample, embedded by
+/// default: ramps, the P (metal/gloss) map, outline and SDF masks, the skin shadow LUT,
+/// fur dye and UV2 colour masks, parallax.
+pub const NPR_DATA_SLOTS: &[&str] = &[
+    "_DiffRampMap",
+    "_SpecRampMap",
+    "_MetallicGlossMap",
+    "_OutlineMask",
+    "_SDFLightmap",
+    "_SDFMask",
+    "_HighlightMap",
+    "_ShadowLutTex",
+    "_ExtraAlphaMask",
+    "_FurDyeMap",
+    "_ParallaxTex",
+];
+
+/// Slots sampled at exact texels (ramp rows, the 2D-unwrapped 3D LUT).
+pub const RAMP_SLOTS: &[&str] = &["_DiffRampMap", "_SpecRampMap", "_ShadowLutTex"];
+
+/// Extras texture slots holding colour (sRGB) data; every other slot is linear data.
+pub const SRGB_DATA_SLOTS: &[&str] = &["_FurDyeMap", "_ParallaxTex"];
+
+/// Whether a texture slot holds sRGB colour (albedo, emission, dye) rather than linear data.
+#[must_use]
+pub fn is_srgb_slot(name: &str) -> bool {
+    BASE_COLOR_NAMES.contains(&name)
+        || EMISSION_NAMES.contains(&name)
+        || SRGB_DATA_SLOTS.contains(&name)
+}
+
+/// Whether a shader is one of the game's NPR character shaders.
+#[must_use]
+pub fn is_npr_shader(shader: &str) -> bool {
+    shader.starts_with("HGRP/CharacterNPR")
+}
+
+/// glTF alpha mode of an NPR character material, mirroring warfarin's exporter (checked on
+/// all 456 materials of their 34 operators): `_EnableAlphaTest` → MASK at
+/// `_AlphaClipThreshold`; `_SurfaceType` 1 with SrcAlpha blending (`_SrcBlend` 5) → BLEND;
+/// anything else (including premultiplied One/OneMinusSrcAlpha, which the client blends
+/// itself) → OPAQUE. Render queue and `_AlphaClip` do not matter.
+#[must_use]
+pub fn npr_alpha_mode(floats: &Value) -> (&'static str, Option<f32>) {
+    let f = |k: &str| floats.get(k).and_then(Value::as_f64);
+    if f("_EnableAlphaTest") == Some(1.0) {
+        let cutoff = f("_AlphaClipThreshold").unwrap_or(0.5).clamp(0.0, 1.0) as f32;
+        return ("MASK", Some(cutoff));
+    }
+    if f("_SurfaceType") == Some(1.0) && f("_SrcBlend") == Some(5.0) {
+        return ("BLEND", None);
+    }
+    ("OPAQUE", None)
+}
+
+/// `{name: {r,g,b,a}}` → `{name: [r,g,b,a]}`.
+#[must_use]
+pub fn color_arrays(colors: Option<&Value>) -> Value {
+    let Some(map) = colors.and_then(Value::as_object) else {
+        return colors.cloned().unwrap_or(Value::Null);
+    };
+    let out: Map<String, Value> = map
+        .iter()
+        .map(|(k, v)| {
+            let arr = color(Some(v)).map_or_else(|| v.clone(), |c| json!(c));
+            (k.clone(), arr)
+        })
+        .collect();
+    Value::Object(out)
+}
 
 /// Role of a texture env name, if it maps to a glTF slot.
 #[must_use]
@@ -249,11 +330,17 @@ fn build_material(exp: &mut Exporter, mref: ObjRef) -> Option<Value> {
     let tags = mat.get("stringTagMap").cloned().unwrap_or(json!({}));
     let keywords = mat.get("m_ValidKeywords").cloned().unwrap_or(json!([]));
 
+    let npr = shader.as_deref().is_some_and(is_npr_shader);
+    let all_textures = exp_all_textures(exp);
     let emission_color = color(props.pointer("/m_Colors/_EmissionColor")).unwrap_or([0.0; 4]);
+    // NPR characters: warfarin embeds no emission map for any of their 47 `_UseEmission`
+    // materials, so the Studio would glow where theirs does not. Mirror that unless every
+    // texture is asked for.
     let emission_on = keywords
         .as_array()
         .is_some_and(|k| k.iter().any(|k| k.as_str() == Some("_EMISSION")))
-        && emission_color[..3].iter().any(|c| *c > 0.0);
+        && emission_color[..3].iter().any(|c| *c > 0.0)
+        && (!npr || all_textures);
     let mut tex_extras = Map::new();
     let mut bound: HashMap<TextureRole, (usize, u64)> = HashMap::new();
     let envs: Vec<(String, Value)> = props
@@ -268,13 +355,18 @@ fn build_material(exp: &mut Exporter, mref: ObjRef) -> Option<Value> {
         let tex_name = exp.peek_name(tref);
         let role = role_for(env_name);
         let uv = env.get("m_UVSetIndex").and_then(Value::as_u64).unwrap_or(0);
+        let data_role = if RAMP_SLOTS.contains(&env_name.as_str()) {
+            TextureRole::Ramp
+        } else {
+            TextureRole::Data
+        };
         let embed = match role {
-            Some(TextureRole::Emission) => emission_on || exp_all_textures(exp),
+            Some(TextureRole::Emission) => emission_on || all_textures,
             Some(_) => true,
-            None => exp_all_textures(exp),
+            None => all_textures || NPR_DATA_SLOTS.contains(&env_name.as_str()),
         };
         let index = if embed {
-            texture_index(exp, tref, role.unwrap_or(TextureRole::Data))
+            texture_index(exp, tref, role.unwrap_or(data_role))
         } else {
             None
         };
@@ -366,16 +458,38 @@ fn build_material(exp: &mut Exporter, mref: ObjRef) -> Option<Value> {
     let cutout = (2450..2900).contains(&render_queue)
         || float(&props, "_AlphaClip") == Some(1.0)
         || render_type.eq_ignore_ascii_case("TransparentCutout");
-    if transparent || faint_effect {
-        out["alphaMode"] = json!("BLEND");
-    } else if cutout && bound.contains_key(&TextureRole::BaseColor) {
-        out["alphaMode"] = json!("MASK");
-        out["alphaCutoff"] = json!(float(&props, "_Cutoff").unwrap_or(0.5).clamp(0.0, 1.0));
-    }
     let cull = float(&props, "_Cull").or_else(|| float(&props, "_CullMode"));
-    if cull == Some(0.0) {
-        out["doubleSided"] = json!(true);
+    if npr {
+        let floats = props.get("m_Floats").cloned().unwrap_or(Value::Null);
+        match npr_alpha_mode(&floats) {
+            ("OPAQUE", _) => {}
+            (mode, cutoff) => {
+                out["alphaMode"] = json!(mode);
+                if let Some(c) = cutoff {
+                    out["alphaCutoff"] = json!(c);
+                }
+            }
+        }
+        // Shaders without `_Cull` (overlay shadows, VFX) draw both faces.
+        if cull.is_none_or(|c| c == 0.0) {
+            out["doubleSided"] = json!(true);
+        }
+    } else {
+        if transparent || faint_effect {
+            out["alphaMode"] = json!("BLEND");
+        } else if cutout && bound.contains_key(&TextureRole::BaseColor) {
+            out["alphaMode"] = json!("MASK");
+            out["alphaCutoff"] = json!(float(&props, "_Cutoff").unwrap_or(0.5).clamp(0.0, 1.0));
+        }
+        if cull == Some(0.0) {
+            out["doubleSided"] = json!(true);
+        }
     }
+    let srgb: Vec<&String> = tex_extras
+        .iter()
+        .filter(|(slot, t)| is_srgb_slot(slot) && t.get("texture").is_some_and(|i| !i.is_null()))
+        .map(|(slot, _)| slot)
+        .collect();
     out["extras"] = json!({
         "shader": shader,
         "effect": effect,
@@ -384,8 +498,9 @@ fn build_material(exp: &mut Exporter, mref: ObjRef) -> Option<Value> {
         "tags": tags,
         "textures": tex_extras,
         "floats": props.get("m_Floats"),
-        "colors": props.get("m_Colors"),
+        "colors": color_arrays(props.get("m_Colors")),
         "ints": props.get("m_Ints"),
+        "srgb": srgb,
     });
     Some(out)
 }
@@ -550,7 +665,7 @@ fn embed(
             }
         }
     }
-    if let Some(max) = opts.max_texture_size
+    if let Some(max) = opts.max_texture_size.filter(|_| !role.is_data())
         && (rgba.width() > max || rgba.height() > max)
     {
         let scale = f64::from(max) / f64::from(rgba.width().max(rgba.height()));
@@ -566,7 +681,13 @@ fn embed(
         DynamicImage::ImageRgba8(rgba)
     };
     let mut bytes = Vec::new();
-    let encoded = match (opts.encoding, opaque) {
+    let encoding = if role.is_data() && opts.encoding == ImageEncoding::Auto {
+        // Data is never JPEG: ramps and LUTs are sampled at exact texels.
+        ImageEncoding::Png
+    } else {
+        opts.encoding
+    };
+    let encoded = match (encoding, opaque) {
         (ImageEncoding::Auto, true) => {
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90);
             dynamic.write_with_encoder(encoder).map(|()| "image/jpeg")
@@ -585,5 +706,9 @@ fn embed(
             return None;
         }
     };
-    Some(exp.builder.texture(&bytes, mime, name))
+    Some(if role == TextureRole::Ramp {
+        exp.builder.clamped_texture(&bytes, mime, name)
+    } else {
+        exp.builder.texture(&bytes, mime, name)
+    })
 }

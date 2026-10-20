@@ -926,6 +926,23 @@ async fn cmd_export(
             source.clear();
         }
     }
+    // Per-character menu lights of exported operators: <output>/lights/<id>.json.
+    let stored = |cab: &str| {
+        stored_root
+            .as_ref()
+            .is_none_or(|r| r.join("sf").join(cab).is_file())
+    };
+    let lights_dir = args.output.join("lights");
+    for e in index
+        .iter()
+        .filter(|e| e.glb.is_some() && e.kind == "operator")
+    {
+        if let Some(lights) = rig::lights::character_lights(&mut source, &records, &e.id, &stored) {
+            std::fs::create_dir_all(&lights_dir)?;
+            let path = lights_dir.join(format!("{}.json", e.id));
+            rig::store::write_atomic(&path, &serde_json::to_vec_pretty(&lights)?)?;
+        }
+    }
     let exported = index.iter().filter(|e| e.glb.is_some()).count();
     // Keep entries of earlier runs (other filters) that this run did not touch, under a lock
     // so concurrent exports into one directory don't lose each other's entries.

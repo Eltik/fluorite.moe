@@ -137,6 +137,12 @@ fn quat(value: Option<&Value>) -> [f32; 4] {
     [get("x", 0.0), get("y", 0.0), get("z", 0.0), get("w", 1.0)]
 }
 
+/// Whether a renderer's GameObject is a shadow-casting proxy (`S_x_shadowProxyDesktop`).
+#[must_use]
+pub fn is_shadow_proxy(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("shadowproxy")
+}
+
 /// Parse a trailing `_lodN` of a name: `(base, Some(N))`.
 #[must_use]
 pub fn split_lod(name: &str) -> (String, Option<usize>) {
@@ -490,7 +496,9 @@ impl<'a> Exporter<'a> {
             .collect()
     }
 
-    /// Keep the best LOD of each part: LODGroup level, else a `_lodN` name suffix.
+    /// Keep the best LOD of each part: LODGroup level, else a `_lodN` name suffix. Shadow
+    /// proxies (`*_shadowProxy*`, low-LOD casters the game never draws) are dropped too, as
+    /// are renderers drawing a `_lod1+` mesh whose `_lod0` another renderer draws.
     fn select_lods(&mut self) {
         for r in &mut self.renderers {
             let (_, from_name) = split_lod(&r.name);
@@ -499,6 +507,35 @@ impl<'a> Exporter<'a> {
         if self.opts.all_lods {
             return;
         }
+        let before = self.renderers.len();
+        let renderers = std::mem::take(&mut self.renderers);
+        let mesh_names: Vec<Option<String>> = renderers
+            .iter()
+            .map(|r| r.mesh.and_then(|m| self.peek_name(m)))
+            .collect();
+        let drawn_lod0: BTreeSet<String> = mesh_names
+            .iter()
+            .flatten()
+            .filter_map(|n| match split_lod(n) {
+                (base, Some(0)) => Some(base),
+                _ => None,
+            })
+            .collect();
+        self.renderers = renderers
+            .into_iter()
+            .zip(mesh_names)
+            .filter(|(r, mesh_name)| {
+                if is_shadow_proxy(&r.name) {
+                    return false;
+                }
+                !mesh_name.as_deref().is_some_and(|n| match split_lod(n) {
+                    (base, Some(level)) => level > 0 && drawn_lod0.contains(&base),
+                    _ => false,
+                })
+            })
+            .map(|(r, _)| r)
+            .collect();
+        let dropped = before - self.renderers.len();
         let mut best: HashMap<String, usize> = HashMap::new();
         for r in &self.renderers {
             let (base, _) = split_lod(&r.name);
@@ -518,7 +555,7 @@ impl<'a> Exporter<'a> {
             // A LODGroup-only level (no name suffix) is dropped when the group has a LOD0.
             !(level > 0 && split_lod(&r.name).1.is_none() && group_has_lod0)
         });
-        self.stats.skipped_lod_renderers = before - self.renderers.len();
+        self.stats.skipped_lod_renderers = before - self.renderers.len() + dropped;
     }
 
     fn decode(&mut self, mesh_ref: ObjRef) -> Option<(Value, DecodedMesh)> {
@@ -691,6 +728,7 @@ impl<'a> Exporter<'a> {
         }
         let attributes = Value::Object(attributes);
         let mut primitives = Vec::new();
+        let last_sub = decoded.submeshes.len().checked_sub(1);
         for (i, sub) in decoded.submeshes.iter().enumerate() {
             if sub.is_empty() {
                 continue;
@@ -710,6 +748,30 @@ impl<'a> Exporter<'a> {
             let material = material::material_index(self, mat_ref, &decoded.name);
             let material = self.material_for_uvs(material, decoded.uvs.len());
             primitives.push(json!({"attributes": attributes, "indices": indices, "material": material, "mode": 4}));
+            // Unity draws the last submesh once more with each material beyond the submesh
+            // count (transparent hair passes, layered eye shadows): extra primitives sharing
+            // the same accessors.
+            if Some(i) == last_sub {
+                let extra: Vec<ObjRef> = r
+                    .materials
+                    .iter()
+                    .skip(decoded.submeshes.len())
+                    .copied()
+                    .flatten()
+                    .collect();
+                for (pass, mref) in extra.into_iter().enumerate() {
+                    let material = material::material_index(self, Some(mref), &decoded.name);
+                    let material = self.material_for_uvs(material, decoded.uvs.len());
+                    self.stats.triangles += flipped.len() / 3;
+                    primitives.push(json!({
+                        "attributes": attributes,
+                        "indices": indices,
+                        "material": material,
+                        "mode": 4,
+                        "extras": {"extraMaterialPass": pass + 1},
+                    }));
+                }
+            }
         }
         if primitives.is_empty() {
             self.mesh_cache.insert(key, None);
@@ -1005,7 +1067,11 @@ impl<'a> Exporter<'a> {
             let Some((mesh, weights, mesh_value)) = self.mesh_for(r, r.bones.len()) else {
                 continue;
             };
-            let extras = json!({"active": r.active, "lod": r.lod, "renderer": if r.skinned {"SkinnedMeshRenderer"} else {"MeshRenderer"}});
+            let mut extras = json!({"active": r.active, "lod": r.lod, "renderer": if r.skinned {"SkinnedMeshRenderer"} else {"MeshRenderer"}});
+            // Only kept with `all_lods`: the client hides them.
+            if is_shadow_proxy(&r.name) {
+                extras["role"] = json!("shadowProxy");
+            }
             if r.skinned && weights.is_some() && !r.bones.is_empty() {
                 let skin = self.skin_for(r, &mesh_value, root_node);
                 // Skinned meshes sit at the scene root: glTF ignores their node transform.
@@ -1034,6 +1100,9 @@ impl<'a> Exporter<'a> {
                         .unwrap_or(json!({}));
                     node_extras["renderer"] = extras["renderer"].clone();
                     node_extras["lod"] = extras["lod"].clone();
+                    if let Some(role) = extras.get("role") {
+                        node_extras["role"] = role.clone();
+                    }
                     self.builder.nodes[r.node]["extras"] = node_extras;
                 }
                 self.stats.static_renderers += 1;
