@@ -1,5 +1,6 @@
 //! Prefab → glTF: Transform hierarchy, skinned/static meshes, skins and materials.
 use super::anim;
+use super::avatar;
 use super::convert;
 use super::gltf::{self, ARRAY_BUFFER, Builder};
 use super::material::{self, MaterialOptions};
@@ -865,6 +866,13 @@ impl<'a> Exporter<'a> {
                 continue;
             }
             match anim::decode_clip(&clip) {
+                // A clip binding mostly unknown paths belongs to another skeleton.
+                Ok(decoded) if anim::matched_fraction(&decoded, &hashes) < 0.5 => {
+                    self.warn(format!(
+                        "clip {}: skipped, most tracks match no node (other skeleton)",
+                        decoded.name
+                    ));
+                }
                 Ok(decoded) => {
                     let mut animations = std::mem::take(&mut self.builder.animations);
                     let stats =
@@ -903,6 +911,89 @@ impl<'a> Exporter<'a> {
                 obj.remove(key);
             }
         }
+        self.finish(root_node, asset_extras)
+    }
+
+    /// Build a model shipped without GameObjects (named NPC `sk_*.fbx` imports): the node
+    /// hierarchy comes from the Avatar's skeleton (TOS paths, parents, skeleton pose) and every
+    /// mesh is skinned through its `m_BoneNameHashes` (path hashes, resolved via the TOS).
+    /// Materials are not shipped either, so each part gets the name-matched fallback.
+    pub fn export_avatar(
+        mut self,
+        avatar: ObjRef,
+        meshes: &[ObjRef],
+        name: &str,
+        asset_extras: Value,
+    ) -> Result<EntityExport, String> {
+        let (_, value) = self.read(avatar).ok_or("avatar could not be read")?;
+        let skeleton = avatar::Skeleton::from_avatar(&value)?;
+        let root_node = self.builder.node(json!({"name": name}));
+        // Skeleton node 0 is the model root itself (empty path).
+        let mut nodes = vec![root_node];
+        for i in 1..skeleton.len() {
+            let (t, r, s) = skeleton.local[i];
+            let mut node = Map::new();
+            node.insert("name".into(), json!(skeleton.name(i)));
+            let tt = convert::position(t);
+            if tt != [0.0; 3] {
+                node.insert("translation".into(), json!(tt));
+            }
+            let rr = convert::rotation(r);
+            if rr != [0.0, 0.0, 0.0, 1.0] {
+                node.insert("rotation".into(), json!(rr));
+            }
+            if s != [1.0; 3] {
+                node.insert("scale".into(), json!(s));
+            }
+            nodes.push(self.builder.node(Value::Object(node)));
+        }
+        for i in 1..skeleton.len() {
+            let parent = nodes[skeleton.parent(i).unwrap_or(0)];
+            let mut children = self.builder.nodes[parent]["children"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            children.push(json!(nodes[i]));
+            self.builder.nodes[parent]["children"] = json!(children);
+        }
+        // Bones resolve by path hash: register each skeleton node under a synthetic ref.
+        for (i, &hash) in skeleton.ids.iter().enumerate() {
+            self.transform_nodes
+                .insert(avatar::bone_ref(hash), nodes[i]);
+        }
+        for &mesh in meshes {
+            let Some(fields) = self.read_prefix(mesh, &["m_BoneNameHashes"]) else {
+                continue;
+            };
+            let mesh_name = fields
+                .get("m_Name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let bones: Vec<Option<ObjRef>> = fields
+                .get("m_BoneNameHashes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|h| h.as_u64().map(|h| avatar::bone_ref(h as u32)))
+                .collect();
+            self.renderers.push(Renderer {
+                skinned: !bones.is_empty(),
+                renderer: mesh,
+                node: root_node,
+                name: mesh_name,
+                active: true,
+                mesh: Some(mesh),
+                materials: vec![None],
+                bones,
+                lod: None,
+            });
+        }
+        self.finish(root_node, asset_extras)
+    }
+
+    /// Shared tail of both exports: LOD choice, meshes, skins, clips, document.
+    fn finish(mut self, root_node: usize, asset_extras: Value) -> Result<EntityExport, String> {
         self.select_lods();
         let renderers = std::mem::take(&mut self.renderers);
         let mut scene = vec![root_node];

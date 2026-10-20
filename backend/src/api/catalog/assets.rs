@@ -338,7 +338,7 @@ impl RigIndex {
 
     /// Rigged GLB for an NPC: by catalog id, else through its `dataKey`. `npc_chr_<chrId>`
     /// is an operator's NPC-mode prefab (`npc/<chrId>.glb`, else the operator's own GLB),
-    /// `npc_eny_<enemyId>` an enemy.
+    /// `npc_eny_<enemyId>` an enemy, `npc_spl_<code>_NN` a named NPC (`npc/spl_<code>.glb`).
     pub fn find_npc(&self, output: &Path, id: &str, data_key: &str) -> Option<String> {
         self.find(output, "npcs", id).or_else(|| {
             if let Some(chr) = data_key.strip_prefix("npc_chr_") {
@@ -347,6 +347,11 @@ impl RigIndex {
                     .or_else(|| self.find(output, "operators", &chr))
             } else if let Some(eny) = data_key.strip_prefix("npc_eny_") {
                 self.find(output, "enemies", &format!("eny_{eny}"))
+            } else if let Some(spl) = data_key.strip_prefix("npc_spl_") {
+                // Named NPCs: `npc_spl_qinjc_01` -> the Avatar-built `npc/spl_qinjc.glb`.
+                let code = spl.trim_end_matches(|c: char| c.is_ascii_digit());
+                let code = code.strip_suffix('_').unwrap_or(code);
+                self.find(output, "npcs", &format!("spl_{code}"))
             } else {
                 None
             }

@@ -12,6 +12,9 @@ pub struct Candidate {
     /// `(cab, path_id)` of every bundle listing this container with a local asset.
     pub sources: Vec<(String, i64)>,
     pub chunks: Vec<String>,
+    /// A model import without GameObjects: `sources` are its objects (Avatar and Meshes),
+    /// exported with `Exporter::export_avatar`.
+    pub avatar: bool,
 }
 
 /// Entity kind from a container path.
@@ -133,6 +136,7 @@ pub fn candidates(records: &[CabRecord], filter: &str) -> Vec<Candidate> {
                 id: id_of(&lower),
                 sources: Vec::new(),
                 chunks: Vec::new(),
+                avatar: false,
             });
             if !entry
                 .sources
@@ -161,4 +165,65 @@ pub fn file_stem(id: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Id of an Avatar-only model import: `sk_npc_major_qinjc_01.fbx` -> `spl_qinjc`, matching
+/// the `npc_spl_qinjc_01` data key of named NPCs; other `sk_<name>.fbx` -> `<name>`.
+#[must_use]
+pub fn avatar_model_id(container: &str) -> String {
+    let file = container
+        .rsplit('/')
+        .next()
+        .unwrap_or(container)
+        .to_ascii_lowercase();
+    let stem = file.strip_suffix(".fbx").unwrap_or(&file);
+    let stem = stem.strip_prefix("sk_").unwrap_or(stem);
+    match stem.strip_prefix("npc_major_") {
+        Some(rest) => {
+            let code = rest.trim_end_matches(|c: char| c.is_ascii_digit());
+            format!("spl_{}", code.strip_suffix('_').unwrap_or(code))
+        }
+        None => stem.to_string(),
+    }
+}
+
+/// Skeletal model imports (`.../models/sk_*.fbx`) whose bundle holds an Avatar and Meshes but
+/// no GameObjects, so they have no prefab hierarchy to walk.
+#[must_use]
+pub fn avatar_candidates(records: &[CabRecord], filter: &str) -> Vec<Candidate> {
+    let filter = filter.to_ascii_lowercase();
+    let mut by_path: BTreeMap<String, Candidate> = BTreeMap::new();
+    for rec in records {
+        let avatar_only = rec.classes.contains_key(&90)
+            && rec.classes.contains_key(&43)
+            && !rec.classes.contains_key(&1);
+        if !avatar_only {
+            continue;
+        }
+        for (path, file_id, path_id) in &rec.containers {
+            let lower = path.to_ascii_lowercase();
+            let file = lower.rsplit('/').next().unwrap_or(&lower);
+            if *file_id != 0
+                || !file.starts_with("sk_")
+                || !file.ends_with(".fbx")
+                || !lower.contains("/models/")
+                || !lower.contains(&filter)
+            {
+                continue;
+            }
+            let entry = by_path.entry(lower.clone()).or_insert_with(|| Candidate {
+                container: path.clone(),
+                kind: kind_of(path),
+                id: avatar_model_id(path),
+                sources: Vec::new(),
+                chunks: vec![rec.chunk.clone()],
+                avatar: true,
+            });
+            // Objects of one import must come from one bundle.
+            if entry.sources.first().is_none_or(|(cab, _)| cab == &rec.cab) {
+                entry.sources.push((rec.cab.clone(), *path_id));
+            }
+        }
+    }
+    by_path.into_values().collect()
 }

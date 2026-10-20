@@ -134,6 +134,20 @@ pub fn validate_timing(num_samples: u32, sample_rate: f32) -> Result<(), String>
     Ok(())
 }
 
+/// Share of a clip's tracks whose path hash names a node (1.0 for a clip with no tracks).
+#[must_use]
+pub fn matched_fraction(clip: &DecodedClip, nodes: &HashMap<u32, usize>) -> f32 {
+    if clip.tracks.is_empty() {
+        return 1.0;
+    }
+    let matched = clip
+        .tracks
+        .iter()
+        .filter(|t| nodes.contains_key(&t.path_hash))
+        .count();
+    matched as f32 / clip.tracks.len() as f32
+}
+
 /// Flip quaternions so consecutive keys stay in the same hemisphere (glTF slerps the short
 /// way only if neighbours agree in sign).
 pub fn make_continuous(keys: &mut [[f32; 4]]) {

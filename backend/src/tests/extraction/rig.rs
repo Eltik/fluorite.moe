@@ -790,3 +790,97 @@ mod review_fixes {
         );
     }
 }
+
+mod avatar_models {
+    use crate::extraction::rig::avatar::Skeleton;
+    use crate::extraction::rig::entity::{avatar_candidates, avatar_model_id};
+    use crate::extraction::rig::store::CabRecord;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn avatar_model_ids_follow_npc_data_keys() {
+        let path =
+            "assets/beyond/arts/entity/npc/major/girl/qinjc/models/sk_npc_major_qinjc_01.fbx";
+        assert_eq!(avatar_model_id(path), "spl_qinjc");
+        assert_eq!(
+            avatar_model_id("a/models/sk_npc_major_andrewhq_01.fbx"),
+            "spl_andrewhq"
+        );
+        assert_eq!(avatar_model_id("a/models/sk_thing.fbx"), "thing");
+    }
+
+    #[test]
+    fn avatar_candidates_need_avatar_meshes_and_no_game_objects() {
+        let path =
+            "assets/beyond/arts/entity/npc/major/girl/qinjc/models/sk_npc_major_qinjc_01.fbx";
+        let rec = |cab: &str, classes: &[i32]| CabRecord {
+            cab: cab.into(),
+            chunk: "C".into(),
+            sf_size: 0,
+            resources: vec![],
+            resource_sizes: BTreeMap::new(),
+            classes: classes.iter().map(|c| (*c, 1)).collect(),
+            containers: vec![(path.into(), 0, 1), (path.into(), 0, 2)],
+            externals: vec![],
+        };
+        let found = avatar_candidates(
+            &[rec("CAB-a", &[43, 90, 142]), rec("CAB-b", &[1, 4, 43, 90])],
+            "npc/major",
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found[0].avatar);
+        assert_eq!(found[0].kind, "npc");
+        assert_eq!(found[0].id, "spl_qinjc");
+        assert_eq!(
+            found[0].sources,
+            vec![("CAB-a".to_string(), 1), ("CAB-a".to_string(), 2)]
+        );
+    }
+
+    fn pose(t: f64) -> serde_json::Value {
+        json!({"t": {"x": 0.0, "y": t, "z": 0.0}, "q": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}, "s": {"x": 1.0, "y": 1.0, "z": 1.0}})
+    }
+
+    #[test]
+    fn skeleton_reads_ids_parents_poses_and_tos_names() {
+        let avatar = json!({
+            "m_Avatar": {
+                "m_AvatarSkeleton": {"data": {"m_ID": [0, 11, 22], "m_Node": [
+                    {"m_ParentId": -1}, {"m_ParentId": 0}, {"m_ParentId": 1}
+                ]}},
+                "m_AvatarSkeletonPose": {"data": {"m_X": [pose(0.0), pose(1.0), pose(0.5)]}}
+            },
+            "m_TOS": {"0": "", "11": "Root", "22": "Root/Bip001"}
+        });
+        let s = Skeleton::from_avatar(&avatar).unwrap();
+        assert_eq!(s.len(), 3);
+        assert_eq!((s.parent(0), s.parent(2)), (None, Some(1)));
+        assert_eq!(s.name(2), "Bip001");
+        assert_eq!(s.local[1].0, [0.0, 1.0, 0.0]);
+        // Children listed before their parents are rejected.
+        let mut bad = avatar.clone();
+        bad["m_Avatar"]["m_AvatarSkeleton"]["data"]["m_Node"][1]["m_ParentId"] = json!(2);
+        assert!(Skeleton::from_avatar(&bad).is_err());
+    }
+}
+
+#[test]
+fn clips_for_other_skeletons_are_detected() {
+    use crate::extraction::rig::anim::{self, DecodedClip, TrackBinding};
+    let track = |h| TrackBinding {
+        path_hash: h,
+        position: false,
+        rotation: true,
+        scale: false,
+    };
+    let clip = DecodedClip {
+        name: "x".into(),
+        sample_rate: 30.0,
+        num_samples: 1,
+        tracks: vec![track(1), track(2), track(3), track(4)],
+        samples: vec![],
+    };
+    let nodes: std::collections::HashMap<u32, usize> = [(1, 0)].into_iter().collect();
+    assert!((anim::matched_fraction(&clip, &nodes) - 0.25).abs() < 1e-6);
+}

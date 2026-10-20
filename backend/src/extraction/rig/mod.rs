@@ -11,6 +11,7 @@
 //! - [`gltf`]: document builder, GLB container and structural checks
 pub mod acl;
 pub mod anim;
+pub mod avatar;
 pub mod chunk;
 pub mod convert;
 pub mod entity;

@@ -722,6 +722,7 @@ async fn cmd_export(
         records.len()
     );
     let mut candidates = rig::entity::candidates(&records, &args.filter);
+    candidates.extend(rig::entity::avatar_candidates(&records, &args.filter));
     // Pruned bundles (effects, cutscenes…) are indexed but not stored: not exportable.
     let stored_root = match source_dir {
         Some(dir) if dir.join("sf").is_dir() => Some(dir.to_path_buf()),
@@ -756,7 +757,14 @@ async fn cmd_export(
         let t0 = Instant::now();
         let mut last_error = None;
         let mut result = None;
-        for (cab, path_id) in &cand.sources {
+        if cand.avatar {
+            let clips = select_clips(&clip_index, &cand.id, &args.anims, args.max_anims);
+            match export_avatar_candidate(&mut source, cand, &args, clips) {
+                Ok(r) => result = Some(r),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        for (cab, path_id) in cand.sources.iter().filter(|_| !cand.avatar) {
             let Some(file) = source.get(cab) else {
                 last_error = Some(format!("{cab} not loadable"));
                 continue;
@@ -925,8 +933,8 @@ fn animation_containers(
 /// `…/<code>/animations/**`, monsters in `…/monster/animations/<code>/**`, where `<code>` is
 /// the id's third `_` segment (`chr_0005_chen` -> `chen`, `eny_0054_hsmino_chrdg` -> `hsmino`).
 /// Keywords are tried in order and the first one with any match wins, so `uiteam_idle,idle`
-/// prefers the UI idles and only falls back to every `idle` clip. At most `max` container
-/// paths are taken.
+/// prefers the UI idles and only falls back to every `idle` clip. Additive clips are skipped:
+/// they only make sense layered over a base pose. At most `max` container paths are taken.
 fn select_clips(
     index: &[(String, String, i64)],
     id: &str,
@@ -975,7 +983,8 @@ fn select_clips(
         let mut out = Vec::new();
         for (path, cab, path_id) in owned.iter().copied() {
             let file = path.rsplit('/').next().unwrap_or(path);
-            if !file.contains(&keyword) {
+            // Additive clips only make sense layered over a base pose.
+            if !file.contains(&keyword) || file.contains("additive") {
                 continue;
             }
             if !paths.contains(&path.as_str()) {
@@ -1009,6 +1018,51 @@ fn clip_code(id: &str) -> String {
 fn clip_folder_matches(folder: &str, code: &str, prefix: bool) -> bool {
     let base = code.trim_end_matches(|c: char| c.is_ascii_digit());
     !folder.is_empty() && (folder == code || folder == base || (prefix && folder.starts_with(code)))
+}
+
+/// Export an Avatar-only model import: its bundle's Avatar plus every Mesh of the container.
+fn export_avatar_candidate(
+    source: &mut rig::store::CabSource,
+    cand: &rig::entity::Candidate,
+    args: &ExportArgs,
+    clips: Vec<(String, i64)>,
+) -> Result<(String, rig::EntityExport), String> {
+    let cab = cand
+        .sources
+        .first()
+        .map(|(c, _)| c.clone())
+        .ok_or("no objects")?;
+    let file = source
+        .get(&cab)
+        .ok_or_else(|| format!("{cab} not loadable"))?;
+    let class_of = |path_id: i64| {
+        source.files.files[file]
+            .sf
+            .objects
+            .iter()
+            .find(|o| o.path_id == path_id)
+            .map(|o| o.class_id)
+    };
+    let refs = |class: i32| -> Vec<rig::ObjRef> {
+        cand.sources
+            .iter()
+            .filter(|(_, p)| class_of(*p) == Some(class))
+            .map(|(_, p)| rig::ObjRef { file, path_id: *p })
+            .collect()
+    };
+    let avatar = *refs(90).first().ok_or("import has no Avatar")?;
+    let meshes = refs(43);
+    let extras = serde_json::json!({
+        "source": {"container": cand.container, "cab": cab, "chunks": cand.chunks, "avatarOnly": true},
+        "entity": {"id": cand.id, "kind": cand.kind},
+    });
+    let mut exporter = rig::Exporter::new(source, args.opts.clone());
+    exporter.clip_sources = clips;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exporter.export_avatar(avatar, &meshes, &cand.id, extras)
+    }))
+    .unwrap_or_else(|_| Err("exporter panicked".into()))
+    .map(|r| (cab, r))
 }
 
 /// Run one entity export, turning a panic into an error so one bad entity can't end the run.
