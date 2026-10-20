@@ -139,6 +139,20 @@ export function SettingsPanel({
 					onChange={(lightFollow) => setPrefs({ lightFollow })}
 				/>
 				<Row
+					checked={prefs.extraLights}
+					disabled={prefs.shading !== "toon"}
+					hint="The character's own fill and rim lights"
+					label="Extra lights"
+					onChange={(extraLights) => setPrefs({ extraLights })}
+				/>
+				<Row
+					checked={prefs.selfShadow}
+					disabled={prefs.shading !== "toon"}
+					hint="Cast onto the character itself and the floor"
+					label="Shadows"
+					onChange={(selfShadow) => setPrefs({ selfShadow })}
+				/>
+				<Row
 					checked={prefs.bloom}
 					disabled={prefs.shading !== "toon"}
 					hint="Soft glow on highlights"

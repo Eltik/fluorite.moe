@@ -37,7 +37,13 @@ import {
 	NPR_TEXTURES_KEY,
 	textureIndexOf,
 } from "@/components/studio/npr/extras";
-import { type CharacterVolume, volumeFor } from "@/components/studio/npr/rig";
+import {
+	type CharacterLight,
+	type CharacterLighting,
+	type CharacterVolume,
+	DEFAULT_VOLUME,
+	volumeFor,
+} from "@/components/studio/npr/rig";
 import { disposeShading } from "@/components/studio/shading";
 import { api, fileUrl, modelFileUrl, type TreeEntry } from "@/lib/api";
 import { basename, dirname } from "@/lib/format";
@@ -77,6 +83,8 @@ export interface LoadedModel {
 	detectedZUp: boolean;
 	/** Menu lighting for the NPR rig. */
 	volume: CharacterVolume;
+	/** Additional menu lights (empty until exported). */
+	lights: CharacterLight[];
 	stats: ModelStats;
 	/** Non-fatal problems (missing parts, textures that failed to decode). */
 	warnings: string[];
@@ -392,6 +400,51 @@ async function resolveDataTextures(gltf: GLTF): Promise<void> {
 	await Promise.all(jobs);
 }
 
+/**
+ * The character's menu lighting: the catalog's `lights/<id>.json` (volume
+ * plus additional lights), a dev override URL, or the kind's defaults.
+ */
+async function loadLightingFor(
+	source: StudioModelSource,
+	signal: AbortSignal,
+): Promise<CharacterLighting> {
+	const url =
+		source.volumeUrl ?? (source.lights ? modelFileUrl(source.lights) : null);
+	if (!url) return { volume: volumeFor(source.entry.kind), lights: [] };
+	try {
+		return await loadLighting(url, signal);
+	} catch (error) {
+		if (signal.aborted) throw error;
+		return { volume: volumeFor(source.entry.kind), lights: [] };
+	}
+}
+
+/** A lighting JSON (a bare volume, or `{ volume, lights }`) from a URL. */
+async function loadLighting(
+	url: string,
+	signal: AbortSignal,
+): Promise<CharacterLighting> {
+	const res = await fetch(url, { signal });
+	if (!res.ok) throw new Error(`Lighting JSON failed: ${res.status}`);
+	const json = (await res.json()) as
+		| CharacterVolume
+		| Partial<CharacterLighting>;
+	const volume = "volume" in json ? json.volume : (json as CharacterVolume);
+	const lights = "lights" in json ? (json.lights ?? []) : [];
+	return { volume: { ...DEFAULT_VOLUME, ...volume }, lights };
+}
+
+/** Dev-only: animation clips from another GLB with the same bone names. */
+async function loadClips(
+	url: string,
+	signal: AbortSignal,
+): Promise<AnimationClip[]> {
+	const buf = await fetchBytes(url, { signal, onProgress: () => {} });
+	const gltf = await makeLoader().parseAsync(buf, "");
+	disposeObject(gltf.scene);
+	return gltf.animations;
+}
+
 const LOD_NAME = /_lod([1-9]\d*)(?:$|[^0-9])/i;
 const SHADOW_PROXY = /shadowproxy/i;
 
@@ -429,10 +482,14 @@ async function loadRigged(
 	const path = source.rigged as string;
 	const tracker = new ProgressTracker(onProgress);
 	try {
-		const buf = await fetchBytes(modelFileUrl(path), {
-			signal,
-			onProgress: tracker.reporter(path),
-		});
+		const [buf, lighting, extraClips] = await Promise.all([
+			fetchBytes(source.riggedUrl ?? modelFileUrl(path), {
+				signal,
+				onProgress: tracker.reporter(path),
+			}),
+			loadLightingFor(source, signal),
+			source.clipsUrl ? loadClips(source.clipsUrl, signal) : [],
+		]);
 		throwIfAborted(signal);
 		const gltf = await makeLoader().parseAsync(buf, "");
 		await resolveDataTextures(gltf);
@@ -468,9 +525,10 @@ async function loadRigged(
 			rigged: true,
 			content,
 			parts,
-			animations: gltf.animations,
+			animations: [...gltf.animations, ...extraClips],
 			detectedZUp: detectZUp(content),
-			volume: volumeFor(source.entry.kind),
+			volume: lighting.volume,
+			lights: lighting.lights,
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),
@@ -644,6 +702,7 @@ async function loadParts(
 			animations: [],
 			detectedZUp: detectZUp(content),
 			volume: volumeFor(source.entry.kind),
+			lights: [],
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),

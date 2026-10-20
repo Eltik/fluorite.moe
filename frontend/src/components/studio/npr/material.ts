@@ -32,13 +32,18 @@ import {
 	type FaceFrame,
 	type FaceUniforms,
 } from "@/components/studio/npr/face-frame";
-import { rigUniforms } from "@/components/studio/npr/rig";
+import {
+	addLightUniforms,
+	rigUniforms,
+	shadowUniforms,
+} from "@/components/studio/npr/rig";
 import {
 	NPR_FRAGMENT,
 	NPR_VERTEX,
 	TONE_CURVE_GLSL,
 } from "@/components/studio/npr/shaders";
 import {
+	fallbackHairSpecRamp,
 	fallbackRamp,
 	placeholderTexture,
 } from "@/components/studio/npr/textures";
@@ -91,15 +96,27 @@ export function createNprMaterial(
 
 	const diffRamp = on("_UseDiffRampMap")
 		? (tex("_DiffRampMap") ??
-			(hasSlot(extras, "_DiffRampMap") ? fallbackRamp() : null))
+			(hasSlot(extras, "_DiffRampMap") ? fallbackRamp(kind) : null))
 		: null;
-	const specRamp = on("_UseSpecRampMap") ? tex("_SpecRampMap") : null;
+	const specRamp = on("_UseSpecRampMap")
+		? (tex("_SpecRampMap") ??
+			(kind === "hair" && hasSlot(extras, "_SpecRampMap")
+				? fallbackHairSpecRamp()
+				: null))
+		: null;
 	const pMap = kind !== "skin" ? tex("_MetallicGlossMap") : null;
-	const useMetalGloss = on("_UseMetallicGlossMap") && pMap !== null;
+	// A declared but missing P map falls back to the material constants.
+	const pConst =
+		kind !== "skin" &&
+		!pMap &&
+		on("_UseMetallicGlossMap") &&
+		hasSlot(extras, "_MetallicGlossMap");
+	const useMetalGloss = on("_UseMetallicGlossMap") && (pMap !== null || pConst);
 	const sdf =
 		kind === "skin" && face && on("_UseSDFLightmap")
 			? tex("_SDFLightmap")
 			: null;
+	const faceFlat = kind === "skin" && face && on("_UseSDFLightmap") && !sdf;
 	const sdfMask = sdf ? tex("_SDFMask") : null;
 	const highlight = sdf ? tex("_HighlightMap") : null;
 	const lut = on("_UseShadowLutTex") ? tex("_ShadowLutTex") : null;
@@ -134,8 +151,10 @@ export function createNprMaterial(
 	if (diffRamp) defines.USE_DIFF_RAMP = "";
 	if (specRamp) defines.USE_SPEC_RAMP = "";
 	if (pMap) defines.HAS_P_MAP = "";
+	if (pConst) defines.P_CONST = "";
 	if (useMetalGloss) defines.USE_METAL_GLOSS = "";
 	if (sdf) defines.FACE_SDF = "";
+	if (faceFlat) defines.FACE_FLAT = "";
 	if (sdfMask) defines.SDF_MASK = "";
 	if (highlight) defines.HIGHLIGHT = "";
 	if (lut && lutN) defines.SHADOW_LUT = "";
@@ -165,14 +184,15 @@ export function createNprMaterial(
 			uSpecRamp: { value: specRamp ?? fill },
 			uMetalGloss: { value: pMap ?? fill },
 			uPbrConst: {
-				value: on("_UseMetallicGlossMap")
-					? new Vector4(1, 1, 1, 1)
-					: new Vector4(
-							f("_Metallic", 0),
-							f("_Specular", 1),
-							1,
-							f("_Smoothness", 0.5),
-						),
+				value:
+					on("_UseMetallicGlossMap") && pMap
+						? new Vector4(1, 1, 1, 1)
+						: new Vector4(
+								f("_Metallic", 0),
+								f("_Specular", 1),
+								1,
+								f("_Smoothness", 0.5),
+							),
 			},
 			uSdf: { value: sdf ?? fill },
 			uSdfMask: { value: sdfMask ?? fill },
@@ -212,6 +232,8 @@ export function createNprMaterial(
 			uRimColor: rigUniforms.uRimColor,
 			uRimWidth: rigUniforms.uRimWidth,
 			uSpecStrength: rigUniforms.uSpecStrength,
+			...addLightUniforms,
+			...shadowUniforms,
 		},
 		side: s.side,
 		transparent,

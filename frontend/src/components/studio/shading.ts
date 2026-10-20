@@ -271,6 +271,10 @@ export function applyShading(
 	outlines: boolean,
 	wireframe: boolean,
 ): void {
+	if (import.meta.env.DEV) {
+		// Dev-only: lets the console inspect the shaded model.
+		(window as unknown as { __studioModel?: Object3D }).__studioModel = root;
+	}
 	for (const mesh of meshesOf(root)) {
 		let data = mesh.userData.studioShading;
 		if (!data) {

@@ -12,6 +12,10 @@ const StudioApp = React.lazy(loadStudio);
 const parseSearch = searchParams({
 	bg: str(32),
 	clip: str(200),
+	// Dev-only shader testing against arbitrary GLBs; ignored in production.
+	glb: str(2000),
+	volume: str(2000),
+	clips: str(2000),
 });
 
 export const Route = createFileRoute("/studio")({

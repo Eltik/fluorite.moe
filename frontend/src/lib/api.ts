@@ -214,6 +214,8 @@ export interface CatalogModel {
 	parts: CatalogModelPart[];
 	/** Skinned, textured GLB under the `models` root, when one was exported. */
 	rigged?: string;
+	/** Menu lighting JSON (volume + lights) under the `models` root. */
+	lights?: string;
 }
 
 export interface CatalogList {

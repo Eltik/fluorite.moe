@@ -33,11 +33,18 @@ import { StageBackdrop } from "@/components/studio/npr/backdrop";
 import { Bloom } from "@/components/studio/npr/bloom";
 import { ContactBlobs } from "@/components/studio/npr/contact-blobs";
 import {
+	AdditionalLights,
+	clearAdditionalLights,
+} from "@/components/studio/npr/lights";
+import {
 	applyVolume,
 	FRONT_VIEW_FORWARD,
 	keyLightDirection,
 	rigUniforms,
+	shadowUniforms,
 } from "@/components/studio/npr/rig";
+import { SelfShadow } from "@/components/studio/npr/self-shadow";
+import { useSceneObjects } from "@/components/studio/npr/use-scene-objects";
 import type {
 	ShadingId,
 	StudioPrefs,
@@ -259,22 +266,54 @@ function StudioEnvironment({ preset }: { preset: LightingPreset }) {
 function NprSync({
 	model,
 	follow,
+	extraLights,
+	selfShadow,
+	groundShadow,
+	stageFactor,
 }: {
 	model: LoadedModel | null;
 	follow: boolean;
+	extraLights: boolean;
+	selfShadow: boolean;
+	groundShadow: boolean;
+	/** Dims the additional lights (0.5 on the dark stage). */
+	stageFactor: number;
 }) {
+	const gl = useThree((s) => s.gl);
+	const scene = useThree((s) => s.scene);
 	const camera = useThree((s) => s.camera);
 	const invalidate = useThree((s) => s.invalidate);
 	const forward = React.useMemo(() => new Vector3(), []);
+	const lights = React.useMemo(
+		() =>
+			model && extraLights && model.lights.length
+				? new AdditionalLights(model.content, model.lights)
+				: null,
+		[model, extraLights],
+	);
+	const shadow = React.useMemo(
+		() => (model?.rigged && selfShadow ? new SelfShadow(model.content) : null),
+		[model, selfShadow],
+	);
+	React.useEffect(() => () => shadow?.dispose(), [shadow]);
 	React.useEffect(() => {
 		if (model) applyVolume(model.volume);
+		if (!lights) clearAdditionalLights();
+		if (!shadow) shadowUniforms.uShadowOn.value = 0;
 		invalidate();
-	}, [model, invalidate]);
+	}, [model, lights, shadow, invalidate]);
+	const ground = React.useMemo(
+		() => (shadow && groundShadow ? [shadow.ground] : []),
+		[shadow, groundShadow],
+	);
+	useSceneObjects(ground);
 	useFrame(() => {
 		if (!model) return;
 		const dir = follow ? camera.getWorldDirection(forward) : FRONT_VIEW_FORWARD;
 		keyLightDirection(dir, model.volume, rigUniforms.uLightDir.value);
 		updateFaceFrames(model.content);
+		lights?.update(stageFactor);
+		shadow?.render(gl, scene, 0);
 	});
 	return null;
 }
@@ -386,17 +425,17 @@ function frameCamera(
 	let target: Vector3;
 	let offset: Vector3;
 	if (character) {
-		// The menu framing: from the front, aimed at 72 % of the height, close
-		// enough that the bounding sphere overflows the view. The sphere is
-		// taken from the height and half the span so a T-pose bind pose does
-		// not push the camera back.
-		const span = Math.max(size.x, size.z) * 0.5;
-		const sphere = Math.hypot(size.y, span) / 2;
+		// The menu framing: from the front, aimed at 78 % of the height, at
+		// 0.6× the distance that fits the bounding sphere. The game measures
+		// the posed (arms-down) character, whose sphere is ~0.56× the height;
+		// using the height keeps T-pose bind poses from pushing the camera
+		// back, with a floor for wide, squat models.
+		const sphere = Math.max(size.y, Math.hypot(size.x, size.z) * 0.6) * 0.56;
 		const fit = (sphere / Math.sin(Math.min(vFov, hFov) / 2)) * 1.05;
 		distance = fit * 0.6;
 		target = new Vector3(
 			center.x,
-			MathUtils.lerp(center.y - size.y / 2, center.y + size.y / 2, 0.72),
+			MathUtils.lerp(center.y - size.y / 2, center.y + size.y / 2, 0.78),
 			center.z,
 		);
 		offset = new Vector3(0, 0, distance);
@@ -759,7 +798,14 @@ export function Stage({
 			<LightRig preset={preset} radius={radius} toon={toon} />
 			<StudioEnvironment key={prefs.lighting} preset={preset} />
 			<ShadingSync preset={preset} />
-			<NprSync follow={prefs.lightFollow} model={shown} />
+			<NprSync
+				extraLights={prefs.extraLights}
+				follow={prefs.lightFollow}
+				groundShadow={prefs.groundShadow}
+				model={shown}
+				selfShadow={toon && prefs.selfShadow}
+				stageFactor={background.stage && background.dark ? 0.5 : 1}
+			/>
 			{background.stage && (
 				<StageBackdrop dark={background.dark} floor={prefs.floor} />
 			)}

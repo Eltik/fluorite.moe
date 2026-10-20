@@ -38,6 +38,12 @@ export interface StudioSearch {
 	bg?: string;
 	/** Animation clip name to select once the model is loaded. */
 	clip?: string;
+	/** Dev builds only: load this rigged GLB URL instead of the catalog model. */
+	glb?: string;
+	/** Dev builds only: JSON with a `CharacterVolume` (or `{ volume }`). */
+	volume?: string;
+	/** Dev builds only: a second GLB whose animation clips are added. */
+	clips?: string;
 }
 
 /** Link options for opening an entity in the Studio: `<Link {...studioLink(k, id)} />`. */

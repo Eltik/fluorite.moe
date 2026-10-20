@@ -38,6 +38,14 @@ export interface StudioModelSource {
 	description?: string;
 	/** Rigged GLB under the `models` root. */
 	rigged?: string;
+	/** Menu lighting JSON (volume + lights) under the `models` root. */
+	lights?: string;
+	/** Dev builds only: absolute URL that replaces `rigged`. */
+	riggedUrl?: string;
+	/** Dev builds only: URL of a JSON `CharacterVolume` (or `{ volume }`). */
+	volumeUrl?: string;
+	/** Dev builds only: URL of a GLB whose animation clips are added. */
+	clipsUrl?: string;
 	/** Static part GLBs under the `meshes` root. */
 	parts: string[];
 	source: "api" | "meshes";
@@ -214,12 +222,14 @@ function strings(value: unknown): string[] {
 export function modelFromDetail(detail: CatalogDetail): {
 	parts: string[];
 	rigged?: string;
+	lights?: string;
 } {
 	const record = detail as Record<string, unknown>;
 	const model = (record.model ?? {}) as Record<string, unknown>;
 	const models = record.models;
 	let parts = strings(model.parts);
 	let rigged = str(model.rigged) ?? str(record.rigged);
+	let lights = str(model.lights);
 	if (models && typeof models === "object") {
 		if (Array.isArray(models)) {
 			for (const m of models) {
@@ -227,14 +237,16 @@ export function modelFromDetail(detail: CatalogDetail): {
 				const mm = m as Record<string, unknown>;
 				if (!parts.length) parts = strings(mm.parts);
 				rigged ??= str(mm.rigged);
+				lights ??= str(mm.lights);
 			}
 		} else {
 			const mm = models as Record<string, unknown>;
 			if (!parts.length) parts = strings(mm.parts);
 			rigged ??= str(mm.rigged);
+			lights ??= str(mm.lights);
 		}
 	}
-	return { parts: bestLodParts(parts), rigged };
+	return { parts: bestLodParts(parts), rigged, lights };
 }
 
 // ------------------------------------------------------------- queries
@@ -284,12 +296,13 @@ export const studioDetailQuery = (
 		queryFn: async ({ signal }): Promise<StudioModelSource> => {
 			try {
 				const detail = await api.catalogDetail(kind, id, lang, signal);
-				const { parts, rigged } = modelFromDetail(detail);
+				const { parts, rigged, lights } = modelFromDetail(detail);
 				return {
 					entry: toEntry(kind, detail),
 					description: str(detail.description),
 					parts,
 					rigged,
+					lights,
 					source: "api",
 				};
 			} catch (error) {

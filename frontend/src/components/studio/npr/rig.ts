@@ -4,10 +4,82 @@
  * and outline shares these uniform objects, so updating them once per frame
  * drives the whole model.
  */
-import { Color, type IUniform, MathUtils, Vector3 } from "three";
+import {
+	Color,
+	DepthTexture,
+	type IUniform,
+	MathUtils,
+	Matrix4,
+	NearestFilter,
+	UnsignedShortType,
+	Vector2,
+	Vector3,
+	Vector4,
+	WebGLRenderTarget,
+} from "three";
 import type { StudioKind } from "@/lib/studio";
 
 export type Rgb = [number, number, number];
+export type Vec3 = [number, number, number];
+export type Vec4 = [number, number, number, number];
+
+/** A light from the character's menu light group (positions in three.js handedness). */
+export interface CharacterLight {
+	name?: string;
+	active: boolean;
+	type: "point" | "spot" | "directional" | "area";
+	/** Linear colour. */
+	colorLinear: Rgb;
+	intensity: number;
+	/** < 0 selects the inverse-square falloff. */
+	falloffExponent?: number;
+	range: number;
+	/** Spot angles in degrees (full): outer, inner. */
+	spot?: [number, number];
+	/** Model-space position and forward, used when there is no follower. */
+	position: Vec3;
+	forward: Vec3;
+	npr: "wrap" | "rim" | "ramped" | "specular" | "fog" | "unknown";
+	/** wrap: amount, auto-limit; rim: width, albedo mix. */
+	nprData: Vec4;
+	follower?: {
+		type: "parent" | "fixedOffset";
+		/** Bone name (`Bip001`, `Head_Local`). */
+		node: string;
+		positionOffset?: Vec3;
+		localPosition?: Vec3;
+		localRotation?: Vec4;
+	} | null;
+}
+
+/** The whole menu lighting entry for a character. */
+export interface CharacterLighting {
+	volume: CharacterVolume;
+	lights: CharacterLight[];
+}
+
+export const MAX_ADD_LIGHTS = 16;
+
+export interface AddLightUniforms {
+	uAddLightCount: IUniform<number>;
+	uAddLightPos: IUniform<Vector4[]>;
+	uAddLightColor: IUniform<Vector4[]>;
+	uAddLightDir: IUniform<Vector4[]>;
+	uAddLightCone: IUniform<Vector4[]>;
+	uAddLightData: IUniform<Vector4[]>;
+}
+
+const vec4s = () => Array.from({ length: MAX_ADD_LIGHTS }, () => new Vector4());
+
+/** Packed additional lights, shared by every NPR material. */
+export const addLightUniforms: AddLightUniforms = {
+	uAddLightCount: { value: 0 },
+	uAddLightPos: { value: vec4s() },
+	uAddLightColor: { value: vec4s() },
+	uAddLightDir: { value: vec4s() },
+	uAddLightCone: { value: vec4s() },
+	uAddLightData: { value: vec4s() },
+};
 
 /**
  * Per-character menu lighting (the game's `HGCharacterVolume`). Colours are
@@ -105,6 +177,46 @@ export const rigUniforms: RigUniforms = {
 	uRimWidth: { value: RIG.rimWidth },
 	uSpecStrength: { value: RIG.specStrength },
 	uOutlineScale: { value: RIG.outlineScale },
+};
+
+export const SHADOW_MAP_SIZE = 1024;
+
+export interface ShadowUniforms {
+	uShadowMap: IUniform<DepthTexture>;
+	uShadowMatrix: IUniform<Matrix4>;
+	/** World-space offsets along the light and the normal (1 and 4 texels). */
+	uShadowBias: IUniform<Vector2>;
+	uShadowTexel: IUniform<number>;
+	uShadowOn: IUniform<number>;
+}
+
+let shadowTarget: WebGLRenderTarget | null = null;
+
+/** The self-shadow depth map (compared manually in the shader). */
+export function getShadowTarget(): WebGLRenderTarget {
+	if (shadowTarget) return shadowTarget;
+	const depth = new DepthTexture(
+		SHADOW_MAP_SIZE,
+		SHADOW_MAP_SIZE,
+		UnsignedShortType,
+	);
+	depth.minFilter = NearestFilter;
+	depth.magFilter = NearestFilter;
+	shadowTarget = new WebGLRenderTarget(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, {
+		depthTexture: depth,
+		depthBuffer: true,
+		stencilBuffer: false,
+	});
+	return shadowTarget;
+}
+
+/** Shared by every NPR material; filled by `SelfShadow` each frame. */
+export const shadowUniforms: ShadowUniforms = {
+	uShadowMap: { value: getShadowTarget().depthTexture as DepthTexture },
+	uShadowMatrix: { value: new Matrix4() },
+	uShadowBias: { value: new Vector2(0, 0) },
+	uShadowTexel: { value: 1 / SHADOW_MAP_SIZE },
+	uShadowOn: { value: 0 },
 };
 
 export function applyVolume(volume: CharacterVolume): void {

@@ -227,8 +227,30 @@ function Studio(): React.ReactElement {
 		),
 		enabled: Boolean(kind && id),
 	});
-	const source: StudioModelSource | undefined =
+	const catalogSource: StudioModelSource | undefined =
 		kind && id ? detail.data : undefined;
+	// Dev builds can point the Studio at any rigged GLB (plus a volume JSON)
+	// to test the shaders against other exporters' files.
+	const devGlb = import.meta.env.DEV ? search.glb : undefined;
+	const devVolume = import.meta.env.DEV ? search.volume : undefined;
+	const devClips = import.meta.env.DEV ? search.clips : undefined;
+	const source = React.useMemo<StudioModelSource | undefined>(() => {
+		if (!devGlb) return catalogSource;
+		return {
+			entry: catalogSource?.entry ?? {
+				kind: kind ?? "operators",
+				id: id ?? "dev",
+				name: id ?? "Dev GLB",
+				tags: [],
+			},
+			rigged: devGlb,
+			riggedUrl: devGlb,
+			volumeUrl: devVolume,
+			clipsUrl: devClips,
+			parts: [],
+			source: "api",
+		};
+	}, [catalogSource, devGlb, devVolume, devClips, kind, id]);
 
 	React.useEffect(() => {
 		if (!detail.error || !kind || !id) return;

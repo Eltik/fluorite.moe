@@ -52,6 +52,10 @@ export interface StudioPrefs {
 	lightFollow: boolean;
 	/** Toon mode: soft bloom post pass. */
 	bloom: boolean;
+	/** Toon mode: the character's additional wrap / rim lights. */
+	extraLights: boolean;
+	/** Toon mode: the character shadows itself (and the floor). */
+	selfShadow: boolean;
 	dprCap: number;
 	zUp: ZUpMode;
 	welcomeDismissed: boolean;
@@ -75,6 +79,8 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	stats: false,
 	lightFollow: true,
 	bloom: false,
+	extraLights: true,
+	selfShadow: true,
 	dprCap: 2,
 	zUp: "auto",
 	welcomeDismissed: false,
@@ -129,6 +135,8 @@ function read(): StudioPrefs {
 			stats: bool(p.stats, d.stats),
 			lightFollow: bool(p.lightFollow, d.lightFollow),
 			bloom: bool(p.bloom, d.bloom),
+			extraLights: bool(p.extraLights, d.extraLights),
+			selfShadow: bool(p.selfShadow, d.selfShadow),
 			dprCap:
 				typeof p.dprCap === "number" &&
 				(DPR_CAPS as readonly number[]).includes(p.dprCap)

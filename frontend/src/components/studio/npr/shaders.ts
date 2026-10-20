@@ -63,7 +63,7 @@ void main() {
 }
 `;
 
-export const NPR_FRAGMENT = /* glsl */ `
+const NPR_FRAGMENT_HEAD = /* glsl */ `
 #include <common>
 uniform sampler2D uMap;
 uniform vec3 uBaseColor;
@@ -104,9 +104,80 @@ uniform vec3 uRimColor;
 uniform float uRimWidth;
 uniform float uSpecStrength;
 
+// Additional (per-character) wrap and rim lights, packed per frame.
+#define NPR_MAX_LIGHTS 16
+uniform int uAddLightCount;
+uniform vec4 uAddLightPos[NPR_MAX_LIGHTS];   // xyz, 1 / range
+uniform vec4 uAddLightColor[NPR_MAX_LIGHTS]; // rgb, w ≥ 3 = rim light
+uniform vec4 uAddLightDir[NPR_MAX_LIGHTS];   // forward xyz, falloff exponent (< 0 = inverse-square)
+uniform vec4 uAddLightCone[NPR_MAX_LIGHTS];  // cos outer, 1 / (cos inner − cos outer), is spot
+uniform vec4 uAddLightData[NPR_MAX_LIGHTS];  // wrap: amount, auto-limit; rim: width, albedo mix
+
 varying vec2 vUv;
 varying vec3 vNormalW;
 varying vec3 vPosW;
+
+#if defined(NPR_SKIN) && defined(USE_DIFF_RAMP)
+#define SKIN_RAMP
+#endif
+
+${""}`;
+
+/** Depth-map lookup shared by the surface shader and the ground receiver. */
+const SELF_SHADOW_GLSL = /* glsl */ `
+uniform highp sampler2D uShadowMap;
+uniform mat4 uShadowMatrix;
+uniform vec2 uShadowBias;
+uniform float uShadowTexel;
+uniform float uShadowOn;
+
+/** 1 lit, 0 shadowed; outside the map everything is lit. */
+float selfShadow(vec3 P, vec3 N, vec3 L) {
+	if (uShadowOn < 0.5) return 1.0;
+	float k = 1.0 - clamp(dot(N, L), 0.0, 0.9);
+	vec3 p = P + L * (uShadowBias.x * k) + N * (uShadowBias.y * k);
+	vec4 sc = uShadowMatrix * vec4(p, 1.0);
+	vec3 c = sc.xyz / sc.w;
+	if (c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0 || c.z > 1.0) return 1.0;
+	float sum = 0.0;
+	for (int x = -1; x <= 1; x++) {
+		for (int y = -1; y <= 1; y++) {
+			float d = texture2D(uShadowMap, c.xy + vec2(float(x), float(y)) * uShadowTexel).r;
+			sum += step(c.z, d);
+		}
+	}
+	return sum / 9.0;
+}
+`;
+
+export const GROUND_SHADOW_VERTEX = /* glsl */ `
+varying vec3 vPosW;
+void main() {
+	vec4 world = modelMatrix * vec4(position, 1.0);
+	vPosW = world.xyz;
+	gl_Position = projectionMatrix * viewMatrix * world;
+}
+`;
+
+/** Multiply-blended receiver: darkens the floor where the character shadows it. */
+export const GROUND_SHADOW_FRAGMENT = /* glsl */ `
+uniform vec3 uLightDir;
+uniform vec3 uCentre;
+uniform float uInner;
+uniform float uFade;
+varying vec3 vPosW;
+${SELF_SHADOW_GLSL}
+void main() {
+	float t = clamp((uInner + uFade - distance(vPosW, uCentre)) / uFade, 0.0, 1.0);
+	float f = t * t * (3.0 - 2.0 * t);
+	if (f <= 0.0) discard;
+	float v = clamp(0.95 - selfShadow(vPosW, vec3(0.0, 1.0, 0.0), normalize(uLightDir)), 0.0, 1.0) * f;
+	gl_FragColor = vec4(mix(vec3(1.0), vec3(0.4452), v), 1.0);
+}
+`;
+
+const NPR_FRAGMENT_TAIL = /* glsl */ `
+${SELF_SHADOW_GLSL}
 
 const float AMBIENT = 0.2877;
 const float SKIN_AMBIENT = 0.725;
@@ -214,6 +285,73 @@ float sdfRampInput(vec3 L) {
 }
 #endif
 
+/**
+ * Wrap lights add tinted fill (albedo × wrapped N·L); rim lights add a band
+ * on the silhouette facing the light, gated to the lit hemisphere.
+ */
+vec3 additionalLights(vec3 N, vec3 wrapN, vec3 sideN, vec3 V, vec3 wrapAlbedo,
+		vec3 rimAlbedo, float faceFront, float faceRim) {
+	vec3 sum = vec3(0.0);
+	vec3 Z = cameraAxis();
+	float edge = 1.0 - abs(dot(N, V));
+	#ifdef SKIN_RAMP
+	const float wrapBase = 0.5;
+	#else
+	const float wrapBase = 0.25;
+	#endif
+	for (int i = 0; i < NPR_MAX_LIGHTS; i++) {
+		if (i >= uAddLightCount) break;
+		vec4 P = uAddLightPos[i];
+		vec4 D = uAddLightDir[i];
+		vec4 cone = uAddLightCone[i];
+		vec4 data = uAddLightData[i];
+		vec3 C = uAddLightColor[i].rgb;
+		vec3 toLight = P.xyz - vPosW;
+		float d2 = max(dot(toLight, toLight), 1e-8);
+		vec3 L = toLight * inversesqrt(d2);
+		float t = d2 * P.w * P.w;
+		float A;
+		if (D.w < 0.0) {
+			float w = max(1.0 - t * t, 0.0);
+			A = w * w / (d2 + 1.0);
+		} else {
+			A = pow(max(1.0 - min(t, 1.0), 0.0), D.w);
+		}
+		if (cone.z > 0.5) {
+			float c = clamp((dot(L, -D.xyz) - cone.x) * cone.y, 0.0, 1.0);
+			A *= c * c;
+		}
+		if (A <= 0.0001) continue;
+		if (uAddLightColor[i].w < 0.5) {
+			vec3 AC = A * C;
+			float limit = (1.0 - data.y) + data.y / max(max(AC.r, max(AC.g, AC.b)) * 0.75, 1.0);
+			float wrap = wrapBase * data.x + (1.0 - wrapBase * data.x) * clamp(dot(wrapN, L) + 0.5, 0.0, 1.0);
+			sum += AC * limit * wrap * wrapAlbedo;
+		} else {
+			vec3 side = cross(Z, cross(Z, L));
+			float sideLen = length(side);
+			float facing = sideLen > 1e-5 ? clamp(dot(N, -side / sideLen), 0.0, 1.0) : 0.0;
+			float hemi = clamp(dot(sideN, L) + 1.0, 0.0, 1.0);
+			float band = smooth01((edge - (0.8 - 0.6 * data.x)) / (0.1 + 0.2 * data.x));
+			#ifdef SKIN_RAMP
+			float k = mix(band * faceFront, faceFront * faceRim, clamp(10.0 * data.x - 3.0, 0.0, 1.0)) * hemi;
+			#else
+			float k = band * hemi;
+			#endif
+			sum += A * k * C * facing * (0.5 + data.y * (rimAlbedo - 0.5));
+		}
+	}
+	return sum;
+}
+
+/** How frontal the head is to the camera (0 off-axis, 1 within ~25°). */
+float headFrontality() {
+	vec3 Z = cameraAxis();
+	vec2 zf = vec2(dot(Z, uHeadRight), dot(Z, uHeadForward));
+	float zy = zf.y / max(length(zf), 1e-4);
+	return smooth01((abs(zy) - 0.9) * 10.0);
+}
+
 #ifdef PBR_CLOTH
 /** Softbox environment: brighter towards the ceiling plus a key-side panel. */
 vec3 fakeEnvironment(vec3 R, float rough, vec3 L) {
@@ -261,19 +399,40 @@ void main() {
 	float NdotL = dot(N, L);
 	float NdotV = clamp(dot(N, V), 0.0, 1.0);
 	float NdotH = clamp(dot(N, H), 0.0, 1.0);
-	#ifdef HAS_P_MAP
+	#if defined(HAS_P_MAP)
 	// r = metallic, g = specular, b = shadow/AO mask, a = smoothness.
 	vec4 P = texture2D(uMetalGloss, vUv);
+	#elif defined(P_CONST)
+	// No P map embedded: the material constants stand in for it.
+	vec4 P = uPbrConst;
 	#endif
+	// 1 lit, 0 in the character's own shadow.
+	float sh = selfShadow(vPosW, N, L);
 
 	vec3 color;
 	vec3 light;
 	float litK;
+	// Inputs for the additional lights (set per branch).
+	vec3 wrapN = N;
+	vec3 sideN = N;
+	vec3 wrapAlbedo;
+	vec3 rimAlbedo = base.rgb * ALBEDO_SCALE;
+	float faceFront = 0.0;
+	float faceRim = 0.0;
 
-#if defined(NPR_SKIN) && defined(USE_DIFF_RAMP)
+#ifdef SKIN_RAMP
 	// ---- skin with a ramp (faces, bodies)
 	float x = clamp(NdotL + uRangeBias, -1.0, 1.0);
 	float rimOff = uSkinRimOffScale;
+	#ifdef FACE_FLAT
+	// No SDF embedded: shade the face around a cylinder through the head,
+	// which is what the SDF stylises, instead of the geometric normal.
+	{
+		vec3 headOffset = vPosW - uHeadPos;
+		vec3 flatN = normalize(vec3(headOffset.x, 0.0, headOffset.z));
+		x = clamp(dot(flatN, L) + uRangeBias, -1.0, 1.0);
+	}
+	#endif
 	#ifdef FACE_SDF
 	vec4 mask = vec4(1.0);
 	#ifdef SDF_MASK
@@ -285,9 +444,27 @@ void main() {
 	#endif
 	float rimT = clamp(0.85 * (1.0 - NdotV) * rimOff, 0.0, 1.0);
 	vec4 ramp = texture2D(uDiffRamp, vec2(clamp(x * 0.5 + 0.5, 0.002, 0.998), 0.5));
-	// The albedo alpha doubles as a baked shadow mask on skin.
-	litK = min(base.a, ramp.a);
-	float fillK = base.a;
+	// Self-shadow fades out on the face as the view turns frontal; the
+	// albedo alpha doubles as a baked shadow mask on skin.
+	float shadowLit = 1.0;
+	float shadowFill = 1.0;
+	#ifdef FACE_FLAT
+	// Without the SDF mask the whole face counts as SDF-shaded: no self-shadow.
+	shadowLit = 0.0;
+	shadowFill = 0.0;
+	#endif
+	#ifdef FACE_SDF
+	{
+		vec3 Zc = cameraAxis();
+		vec2 zf = vec2(dot(Zc, uHeadRight), dot(Zc, uHeadForward));
+		float frontal = smooth01(1.5 - 2.0 * zf.y / max(length(zf), 1e-4));
+		shadowLit = max(mask.b * frontal, mask.g);
+		shadowFill = mask.g;
+	}
+	#endif
+	float s = mix(1.0, sh, shadowLit);
+	litK = min(base.a, min(s, ramp.a));
+	float fillK = base.a * mix(1.0, s, shadowFill);
 	vec3 shadowCol = shadowColor(base.rgb) * ALBEDO_SCALE * uEnvMul;
 	vec3 litCol = base.rgb * mix(vec3(1.0), uSdfRimColor, rimT) * ALBEDO_SCALE;
 	vec3 c = mix(deepShadow(shadowCol), shadowCol, clamp(fillK + ramp.a, 0.0, 1.0));
@@ -295,11 +472,22 @@ void main() {
 	color = rampTint(c, ramp.rgb);
 	light = mix(uShadowTint, vec3(1.0), litK) * SKIN_AMBIENT * AMBIENT * uSkinLightColor
 		+ mix(vec3(lum(uSkinLightColor)), uSkinLightColor, litK);
+	wrapAlbedo = color;
 	color *= light;
 	#ifdef HIGHLIGHT
 	vec2 huv = vUv + vec2(-dot(V, uHeadRight), 0.0) * uHighlightVec.x;
 	color += texture2D(uHighlightMap, huv).rgb * light * mix(uEnvMul, 1.0, litK) * (0.5 + 0.5 * litK);
 	#endif
+	// Faces take extra light around a cylinder through the head.
+	vec4 addMask = vec4(1.0, 1.0, 1.0, 0.0);
+	#ifdef FACE_SDF
+	addMask = mask;
+	vec3 headOffset = vPosW - uHeadPos;
+	sideN = normalize(vec3(headOffset.x, 0.000061, headOffset.z));
+	#endif
+	faceFront = headFrontality();
+	faceRim = addMask.a;
+	wrapN = normalize(mix(sideN, N, addMask.g));
 #else
 	// ---- hair, cloth and skin without a ramp
 	float x01 = clamp(NdotL + uRangeBias, -1.0, 1.0) * 0.5 + 0.5;
@@ -315,46 +503,48 @@ void main() {
 
 	#ifdef USE_DIFF_RAMP
 	float pMask = 1.0;
-	#ifdef HAS_P_MAP
+	#if defined(HAS_P_MAP) || defined(P_CONST)
 	pMask = P.b;
 	#endif
 	vec4 ramp = texture2D(uDiffRamp, vec2(clamp(x01, 0.002, 0.998), 0.5));
 	// Front fill: the ramp read with N·V instead of N·L.
 	float frontA = texture2D(uDiffRamp, vec2(clamp(dot(N, V) * 0.5 + 0.5, 0.002, 0.998), 0.5)).a;
-	litK = min(ramp.a, pMask);
-	float fill = frontA * pMask;
+	litK = min(ramp.a, min(pMask, sh));
+	float fill = frontA * pMask * sh;
 	vec3 litCol = base.rgb * ALBEDO_SCALE;
 	vec3 c = mix(deepShadow(shadowCol), shadowCol, clamp(ramp.a + fill, 0.0, 1.0));
 	c = mix(c, litCol, litK);
 	color = rampTint(c, ramp.rgb);
 	#elif defined(PBR_CLOTH)
 	vec4 g = uPbrConst;
-	#ifdef HAS_P_MAP
+	#if defined(HAS_P_MAP) || defined(P_CONST)
 	g = P;
 	#endif
 	float k = ALBEDO_SCALE * (1.0 - g.r);
 	float s = smooth01((clamp(NdotL + uRangeBias, -1.0, 1.0) - 0.25) * 1.333333);
 	vec3 Z = cameraAxis();
 	float vf = smooth01((dot(N, Z) - 0.25) * 1.333333);
-	litK = min(s, g.b);
-	float fill = vf * g.b;
+	litK = min(s, min(g.b, sh));
+	float fill = vf * g.b * sh;
 	vec3 shadowC = shadowCol * (1.0 - g.r);
 	vec3 litCol = base.rgb * k;
 	vec3 c = mix(deepShadow(shadowC), shadowC, clamp(s + fill, 0.0, 1.0));
 	color = mix(c, litCol, litK);
 	#else
-	litK = smoothstep(0.48, 0.52, x01);
+	litK = min(smoothstep(0.48, 0.52, x01), sh);
 	color = mix(shadowCol, base.rgb, litK);
 	#endif
 
 	light = mix(uShadowTint, vec3(1.0), litK) * hemi * AMBIENT * uLightColor
 		+ mix(vec3(lum(uLightColor)), uLightColor, litK);
+	wrapAlbedo = color;
 	color *= light;
 	#if defined(PREMUL) && !defined(PBR_CLOTH)
 	color *= base.a;
 	#endif
 
 	#ifdef PBR_CLOTH
+	rimAlbedo = litCol;
 	float aK = mix(1.0, base.a, uAlphaPremul);
 	color *= aK;
 	float rough = 1.0 - g.a;
@@ -383,6 +573,8 @@ void main() {
 	#endif
 #endif
 
+	color += additionalLights(N, wrapN, sideN, V, wrapAlbedo, rimAlbedo, faceFront, faceRim);
+
 	#if defined(NPR_CLOTH) && defined(USE_METAL_GLOSS) && !defined(PBR_CLOTH)
 	// Toon specular: a binarised Blinn lobe tinted by the spec ramp.
 	float sm = P.a;
@@ -401,7 +593,9 @@ void main() {
 	color += band * base.rgb * uSpecStrength * smoothstep(0.0, 0.2, NdotL) * uLightColor;
 	#endif
 
-	float rim = smoothstep(1.0 - uRimWidth, 1.0, 1.0 - NdotV) * uRimEnable;
+	// The built-in rim only stands in while no additional lights are active.
+	float rim = smoothstep(1.0 - uRimWidth, 1.0, 1.0 - NdotV) * uRimEnable
+		* (uAddLightCount > 0 ? 0.0 : 1.0);
 	color += rim * uRimColor * mix(vec3(1.0), base.rgb, 0.5);
 	#if defined(NPR_CLOTH) && !defined(PBR_CLOTH) && defined(EMISSION)
 	color += texture2D(uEmissionMap, vUv).rgb * uEmissionColor * mix(1.0, base.a, uAlphaPremul);
@@ -416,6 +610,8 @@ void main() {
 	#include <colorspace_fragment>
 }
 `;
+
+export const NPR_FRAGMENT = NPR_FRAGMENT_HEAD + NPR_FRAGMENT_TAIL;
 
 export const OUTLINE_VERTEX = /* glsl */ `
 #include <common>
