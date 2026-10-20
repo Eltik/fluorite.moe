@@ -17,6 +17,7 @@ use backend::extraction::pipeline::{self, VFS_DIRS};
 use backend::extraction::texture;
 use backend::extraction::texture_layout;
 use backend::extraction::texture_sort;
+use backend::extraction::unity::SerializedFile;
 use backend::extraction::unity_extract::{ChkContents, class_name, extract_chk_contents};
 use backend::extraction::update;
 use backend::extraction::utils::{format_bytes, hex_dump, remove_dir_all_retry, sanitize_filename};
@@ -32,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use unity_asset_binary::asset::SerializedFileParser;
 
 #[derive(Parser)]
 #[command(name = "endfield", about = "Arknights Endfield asset extraction CLI")]
@@ -445,7 +445,7 @@ fn process_chk_contents(
     let mut write_errors = 0u64;
     let mut parsed = 0usize;
     for sf_bytes in &chk.sf_data {
-        let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
+        let sf = match SerializedFile::parse(sf_bytes.clone()) {
             Ok(sf) => sf,
             Err(_) => continue,
         };
@@ -1667,13 +1667,13 @@ async fn cmd_survey(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::
 
     for chk in &all_chks {
         for sf_bytes in &chk.sf_data {
-            let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
+            let sf = match SerializedFile::parse(sf_bytes.clone()) {
                 Ok(sf) => sf,
                 Err(_) => continue,
             };
             for obj in &sf.objects {
-                *class_counts.entry(obj.type_id).or_insert(0) += 1;
-                *class_total_bytes.entry(obj.type_id).or_insert(0) += obj.byte_size as u64;
+                *class_counts.entry(obj.class_id).or_insert(0) += 1;
+                *class_total_bytes.entry(obj.class_id).or_insert(0) += obj.byte_size as u64;
                 total_objects += 1;
             }
         }

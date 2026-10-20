@@ -1,4 +1,5 @@
 /// Texture output layout derived from Unity AssetBundle container metadata.
+use crate::extraction::unity::SerializedFile;
 use crate::extraction::utils::{fit_filename, sanitize_filename};
 use serde::Serialize;
 use serde_json::Value;
@@ -6,8 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::object::ObjectHandle;
 
 /// Bump when existing PNGs on disk become stale. 2: rows flipped to top-down orientation.
 pub const LAYOUT_VERSION: u32 = 2;
@@ -36,7 +35,7 @@ pub fn plan_textures(sf: &SerializedFile) -> Vec<PlannedTexture> {
     let mut paths = HashSet::new();
 
     for obj in sf.objects_of_type(28) {
-        let Some(name) = ObjectHandle::new(sf, obj).peek_name().ok().flatten() else {
+        let Some(name) = sf.peek_name(obj).ok().flatten() else {
             continue;
         };
         if name.is_empty() {
@@ -68,10 +67,8 @@ pub fn container_map(sf: &SerializedFile) -> HashMap<i64, Placement> {
     let mut bundles = Vec::new();
 
     for obj in sf.objects_of_type(142) {
-        let Ok(unity_obj) = ObjectHandle::new(sf, obj).read() else {
-            continue;
-        };
-        let Ok(value) = serde_json::to_value(unity_obj.class.properties()) else {
+        // Pairs stay `[path, info]` arrays: `m_Container` repeats paths across assets.
+        let Ok(value) = sf.read_object_keep_pairs(obj) else {
             continue;
         };
         bundles.push(value);

@@ -54,7 +54,7 @@ fn half_and_normalized_vertex_formats_decode() {
 
 #[test]
 fn malformed_mesh_does_not_panic() {
-    let object = unity_asset_binary::object::UnityObject::from_raw(43, 1, vec![0]);
+    let object = serde_json::json!({});
     assert!(decode_mesh(&object, &HashMap::new()).is_err());
     assert!(decode_scalar(0, &[0, 0, 0]).is_err());
 }
@@ -62,10 +62,9 @@ fn malformed_mesh_does_not_panic() {
 #[test]
 #[ignore]
 fn fixtures_decode_and_write_glb() {
+    use crate::extraction::unity::SerializedFile;
     use std::fs;
     use std::path::Path;
-    use unity_asset_binary::asset::SerializedFileParser;
-    use unity_asset_binary::object::ObjectHandle;
     let root = std::env::var("MESH_FIXTURES").expect("set MESH_FIXTURES");
     let root = Path::new(&root);
     let resources = fs::read_dir(root)
@@ -84,15 +83,15 @@ fn fixtures_decode_and_write_glb() {
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().starts_with("sf_"))
     {
-        let sf = SerializedFileParser::from_bytes(fs::read(file.path()).unwrap()).unwrap();
+        let sf = SerializedFile::parse(fs::read(file.path()).unwrap()).unwrap();
         for info in sf.objects_of_type(43) {
-            let object = ObjectHandle::new(&sf, info).read().unwrap();
+            let object = sf.read_object(info).unwrap();
             let mesh = match decode_mesh(&object, &resources) {
                 Err(error) if error == "mesh has no vertices" => continue,
                 result => result.unwrap(),
             };
             // Decoded positions must reproduce Unity's own bounding box.
-            let aabb = serde_json::to_value(object.get("m_LocalAABB").unwrap()).unwrap();
+            let aabb = &object["m_LocalAABB"];
             for (axis, key) in ["x", "y", "z"].iter().enumerate() {
                 let center = aabb["m_Center"][key].as_f64().unwrap() as f32;
                 let extent = aabb["m_Extent"][key].as_f64().unwrap() as f32;

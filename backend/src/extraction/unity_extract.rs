@@ -1,7 +1,7 @@
+use crate::extraction::unity::{ObjectInfo, SerializedFile};
 /// Unity asset extraction helpers: ChkContents, TextAsset parsing, class names.
 use crate::extraction::{unityfs_header, vfs_decrypt};
 use std::collections::HashMap;
-use unity_asset_binary::asset::{ObjectInfo, SerializedFile};
 
 /// All extracted contents from a .chk file: SerializedFile data + shared resource streams.
 pub struct ChkContents {
@@ -95,11 +95,9 @@ pub fn class_name(id: i32) -> String {
 
 /// Get the script type name for a MonoBehaviour object from TypeTree metadata.
 pub fn get_script_type_name(sf: &SerializedFile, info: &ObjectInfo) -> String {
-    if info.type_index >= 0
-        && let Some(st) = sf.types.get(info.type_index as usize)
-    {
-        if !st.type_tree.nodes.is_empty() {
-            let root_type = &st.type_tree.nodes[0].type_name;
+    if let Some(st) = sf.types.get(info.type_index) {
+        if let Some(root) = &st.type_tree {
+            let root_type = &root.type_name;
             if !root_type.is_empty() && root_type != "MonoBehaviour" {
                 return root_type.clone();
             }
@@ -117,5 +115,5 @@ pub fn get_script_type_name(sf: &SerializedFile, info: &ObjectInfo) -> String {
             );
         }
     }
-    format!("class_{}", info.type_id)
+    format!("class_{}", info.class_id)
 }

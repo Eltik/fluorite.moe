@@ -1,12 +1,11 @@
 /// TextAsset and MonoBehaviour export, laid out by AssetBundle container path.
 use crate::extraction::texture_layout::{self, Placement};
+use crate::extraction::unity::SerializedFile;
 use crate::extraction::unity_extract::{get_script_type_name, parse_text_asset};
 use crate::extraction::utils::{fit_filename, remove_dir_all_retry, sanitize_filename};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::object::ObjectHandle;
 
 /// How a TextAsset's bytes were classified when saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,10 +247,9 @@ pub fn extract_monobehaviours(
     }
     for obj in sf.objects_of_type(114) {
         let type_name = sanitize_filename(&get_script_type_name(sf, obj));
-        let handle = ObjectHandle::new(sf, obj);
         let placement = containers.get(&obj.path_id);
-        let name = handle
-            .peek_name()
+        let name = sf
+            .peek_name(obj)
             .ok()
             .flatten()
             .map(|n| sanitize_filename(&n).replace(['/', '\\'], "_"))
@@ -274,10 +272,10 @@ pub fn extract_monobehaviours(
         let Some(path) = claim_path(out_dir.join(dir), &file_name, obj.path_id, seen) else {
             continue;
         };
-        let Ok(unity_obj) = handle.read() else {
+        let Ok(value) = sf.read_object(obj) else {
             continue;
         };
-        let Ok(json) = serde_json::to_vec_pretty(unity_obj.class.properties()) else {
+        let Ok(json) = serde_json::to_vec_pretty(&value) else {
             continue;
         };
         if write_file(&path, &json) {

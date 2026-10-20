@@ -1,14 +1,13 @@
 //! Migration of legacy flat texture output into the container-based layout.
 use crate::extraction::texture;
 use crate::extraction::texture_layout::{self, IndexEntry, Placement};
+use crate::extraction::unity::SerializedFile;
 use crate::extraction::unity_extract::ChkContents;
 use crate::extraction::utils::sanitize_filename;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use unity_asset_binary::asset::SerializedFileParser;
-use unity_asset_binary::object::ObjectHandle;
 
 pub struct SortCandidate {
     pub chk_name: String,
@@ -23,19 +22,18 @@ pub struct SortCandidate {
 pub fn collect_candidates(chk_name: &str, chk: &ChkContents) -> Vec<SortCandidate> {
     let mut candidates = Vec::new();
     for bytes in &chk.sf_data {
-        let Ok(sf) = SerializedFileParser::from_bytes(bytes.clone()) else {
+        let Ok(sf) = SerializedFile::parse(bytes.clone()) else {
             continue;
         };
         let objects: HashMap<_, _> = sf
             .objects_of_type(28)
-            .into_iter()
             .map(|obj| (obj.path_id, obj))
             .collect();
         for planned in texture_layout::plan_textures(&sf) {
             let Some(&obj) = objects.get(&planned.path_id) else {
                 continue;
             };
-            let Ok(value) = ObjectHandle::new(&sf, obj).read() else {
+            let Ok(value) = sf.read_object(obj) else {
                 continue;
             };
             let width = value.get("m_Width").and_then(|v| v.as_i64()).unwrap_or(0) as u32;

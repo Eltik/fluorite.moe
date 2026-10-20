@@ -1,10 +1,9 @@
 /// Texture2D extraction: decode compressed textures and export as PNG.
 use crate::extraction::texture_layout::{self, IndexEntry, Placement, PlannedTexture};
+use crate::extraction::unity::{SerializedFile, value_bytes};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::object::ObjectHandle;
-use unity_asset_core::UnityValue;
 
 /// Unity TextureFormat enum names (subset of common values).
 pub fn texture_format_name(id: i64) -> &'static str {
@@ -152,27 +151,12 @@ pub fn decode_texture(
 
 /// Resolve streamed texture data from .resS resources.
 /// m_StreamData.path can be "archive:/CAB-<hash>/CAB-<hash>.resS" or just "CAB-<hash>.resS".
-pub fn resolve_stream_data(
-    obj: &unity_asset_binary::object::UnityObject,
-    resources: &HashMap<String, Vec<u8>>,
-) -> Option<Vec<u8>> {
-    let sd = match obj.get("m_StreamData") {
-        Some(UnityValue::Object(o)) => o,
-        _ => return None,
-    };
+pub fn resolve_stream_data(obj: &Value, resources: &HashMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+    let sd = obj.get("m_StreamData")?.as_object()?;
 
-    let path = match sd.get("path") {
-        Some(UnityValue::String(s)) if !s.is_empty() => s.as_str(),
-        _ => return None,
-    };
-    let offset = match sd.get("offset") {
-        Some(UnityValue::Integer(i)) => *i as usize,
-        _ => 0,
-    };
-    let size = match sd.get("size") {
-        Some(UnityValue::Integer(i)) => *i as usize,
-        _ => return None,
-    };
+    let path = sd.get("path")?.as_str().filter(|s| !s.is_empty())?;
+    let offset = sd.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let size = sd.get("size")?.as_u64()? as usize;
     if size == 0 {
         return None;
     }
@@ -197,8 +181,8 @@ pub fn resolve_stream_data(
     Some(res_data[offset..end].to_vec())
 }
 
-/// Get an integer field from a UnityObject.
-fn get_int(obj: &unity_asset_binary::object::UnityObject, key: &str) -> i64 {
+/// Get an integer field from a deserialized object.
+fn get_int(obj: &Value, key: &str) -> i64 {
     obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
@@ -270,8 +254,7 @@ pub fn extract_textures(
         let Some(plan) = planned_by_id.get(&obj.path_id) else {
             continue;
         };
-        let handle = ObjectHandle::new(sf, obj);
-        let unity_obj = match handle.read() {
+        let unity_obj = match sf.read_object(obj) {
             Ok(o) => o,
             Err(_) => continue,
         };
@@ -297,11 +280,11 @@ pub fn extract_textures(
         let pixel_data: Option<Vec<u8>> = {
             let inline = unity_obj
                 .get("image data")
-                .and_then(|v| v.as_bytes())
+                .and_then(value_bytes)
                 .filter(|b| !b.is_empty());
 
-            if let Some(data) = inline {
-                Some(data.to_vec())
+            if inline.is_some() {
+                inline
             } else {
                 resolve_stream_data(&unity_obj, resources)
             }

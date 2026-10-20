@@ -2,13 +2,11 @@
 use crate::extraction::gamedata::{claim_path, write_file};
 use crate::extraction::texture::resolve_stream_data;
 use crate::extraction::texture_layout::{self, Placement};
+use crate::extraction::unity::{SerializedFile, value_bytes};
 use crate::extraction::utils::sanitize_filename;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::object::{ObjectHandle, UnityObject};
-use unity_asset_core::UnityValue;
 
 /// Mesh data decoded from Unity's vertex and index buffers.
 pub struct DecodedMesh {
@@ -30,33 +28,25 @@ struct Channel {
     packed: bool,
 }
 
-fn object<'a>(
-    value: Option<&'a UnityValue>,
-    name: &str,
-) -> Result<&'a indexmap::IndexMap<String, UnityValue>, String> {
+fn object<'a>(value: Option<&'a Value>, name: &str) -> Result<&'a Map<String, Value>, String> {
     value
-        .and_then(UnityValue::as_object)
+        .and_then(Value::as_object)
         .ok_or_else(|| format!("missing or invalid {name}"))
 }
-fn integer(map: &indexmap::IndexMap<String, UnityValue>, name: &str) -> Result<i64, String> {
+fn integer(map: &Map<String, Value>, name: &str) -> Result<i64, String> {
     map.get(name)
-        .and_then(UnityValue::as_i64)
+        .and_then(Value::as_i64)
         .ok_or_else(|| format!("missing or invalid {name}"))
 }
-fn bytes(value: Option<&UnityValue>) -> Result<Vec<u8>, String> {
-    match value {
-        Some(UnityValue::Bytes(b)) => Ok(b.clone()),
-        Some(UnityValue::Array(a)) => a
-            .iter()
-            .map(|v| {
-                v.as_i64()
-                    .filter(|n| (0..=255).contains(n))
-                    .map(|n| n as u8)
-                    .ok_or_else(|| "invalid byte array".to_string())
-            })
-            .collect(),
-        _ => Err("missing or invalid byte data".into()),
-    }
+fn bytes(value: Option<&Value>) -> Result<Vec<u8>, String> {
+    let value = value.ok_or("missing or invalid byte data")?;
+    value_bytes(value).ok_or_else(|| {
+        if value.is_array() {
+            "invalid byte array".into()
+        } else {
+            "missing or invalid byte data".into()
+        }
+    })
 }
 fn format_size(format: usize) -> Option<usize> {
     match format {
@@ -191,7 +181,7 @@ fn channel_values(
 
 /// Decode a Unity Mesh object, including streamed vertex data.
 pub fn decode_mesh(
-    mesh: &UnityObject,
+    mesh: &Value,
     resources: &HashMap<String, Vec<u8>>,
 ) -> Result<DecodedMesh, String> {
     // Endfield sets m_MeshCompression to values stock Unity never writes (4, 5) on meshes whose
@@ -199,11 +189,11 @@ pub fn decode_mesh(
     // payload rather than the flag.
     let compressed_vertices = mesh
         .get("m_CompressedMesh")
-        .and_then(UnityValue::as_object)
+        .and_then(Value::as_object)
         .and_then(|c| c.get("m_Vertices"))
-        .and_then(UnityValue::as_object)
+        .and_then(Value::as_object)
         .and_then(|v| v.get("m_NumItems"))
-        .and_then(UnityValue::as_i64)
+        .and_then(Value::as_i64)
         .unwrap_or(0);
     if compressed_vertices > 0 {
         return Err("compressed mesh unsupported".into());
@@ -221,7 +211,7 @@ pub fn decode_mesh(
     }
     let channels = vertex
         .get("m_Channels")
-        .and_then(UnityValue::as_array)
+        .and_then(Value::as_array)
         .ok_or_else(|| "missing m_Channels".to_string())?
         .iter()
         .map(|v| {
@@ -312,7 +302,7 @@ pub fn decode_mesh(
     let index_data = bytes(mesh.get("m_IndexBuffer"))?;
     let index_size = match mesh
         .get("m_IndexFormat")
-        .and_then(UnityValue::as_i64)
+        .and_then(Value::as_i64)
         .unwrap_or(0)
     {
         0 => 2,
@@ -321,7 +311,7 @@ pub fn decode_mesh(
     };
     let submeshes = mesh
         .get("m_SubMeshes")
-        .and_then(UnityValue::as_array)
+        .and_then(Value::as_array)
         .ok_or_else(|| "missing m_SubMeshes".to_string())?
         .iter()
         .filter_map(|v| v.as_object())
@@ -368,7 +358,7 @@ pub fn decode_mesh(
     Ok(DecodedMesh {
         name: mesh
             .get("m_Name")
-            .and_then(UnityValue::as_str)
+            .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
         positions,
@@ -520,10 +510,7 @@ pub fn write_glb(mesh: &DecodedMesh) -> Vec<u8> {
 }
 
 /// Decode a Unity Mesh and write it as glTF binary.
-pub fn mesh_to_glb(
-    mesh: &UnityObject,
-    resources: &HashMap<String, Vec<u8>>,
-) -> Result<Vec<u8>, String> {
+pub fn mesh_to_glb(mesh: &Value, resources: &HashMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
     Ok(write_glb(&decode_mesh(mesh, resources)?))
 }
 
@@ -549,19 +536,25 @@ pub fn extract_meshes(
         write_errors: 0,
     };
     for obj in sf.objects_of_type(43) {
-        let Ok(mesh) = ObjectHandle::new(sf, obj).read() else {
-            result.failed += 1;
-            continue;
+        let mesh = match sf.read_object(obj) {
+            Ok(mesh) => mesh,
+            // Endfield writes some meshes (seen on collision-only ones) without the
+            // m_CompressedMesh bytes their type tree declares, so the full read fails. Every
+            // field decode_mesh needs, short of streamed vertex data, precedes it.
+            Err(_) => match sf.read_prefix(obj, &["m_VertexData"]) {
+                Ok(Some(fields)) => Value::Object(fields),
+                _ => {
+                    result.failed += 1;
+                    continue;
+                }
+            },
         };
         let glb = match mesh_to_glb(&mesh, resources) {
             Ok(glb) => glb,
             // Empty placeholder meshes are common and not worth reporting.
             Err(error) if error == "mesh has no vertices" => continue,
             Err(error) => {
-                let name = mesh
-                    .get("m_Name")
-                    .and_then(UnityValue::as_str)
-                    .unwrap_or("");
+                let name = mesh.get("m_Name").and_then(Value::as_str).unwrap_or("");
                 eprintln!("  FAIL mesh {name} ({}): {error}", obj.path_id);
                 result.failed += 1;
                 continue;
@@ -569,7 +562,7 @@ pub fn extract_meshes(
         };
         let mut name = mesh
             .get("m_Name")
-            .and_then(UnityValue::as_str)
+            .and_then(Value::as_str)
             .map(|n| sanitize_filename(n).replace(['/', '\\'], "_"))
             .unwrap_or_default();
         if name.is_empty() {

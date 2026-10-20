@@ -30,12 +30,8 @@ semver = "1.0.27"
 futures = "0.3.32"
 flate2 = "1.1.9"
 lz4_flex = "0.12.0"
-unity-asset-binary = "0.2.0"
 unity-asset-core = "0.2.0"
 aes = "0.8"
 texture2ddecoder = "0.1"
 image = "0.25"
-
-# Vendored with a relaxed array-size cap; see vendor/unity-asset-binary/VENDORED.md.
-[patch.crates-io]
-unity-asset-binary = { path = "vendor/unity-asset-binary" }
+base64 = "0.22"
