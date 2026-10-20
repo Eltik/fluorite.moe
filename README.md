@@ -435,6 +435,7 @@ answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy)
 
 ### Operations
 
+- [ ] **Smoke test**: after an update or deploy, `scripts/smoke.sh` checks the running API and web routes end to end (`--api-only`, `--web-only`; override targets with `API=` and `WEB=`); it exits 1 on any failure.
 - [ ] **Updates**: schedule `backend/scripts/auto-update.sh` every 15 minutes (cron or
   `fluorite-update.timer`). The servers keep running; the API re-indexes on its own.
 - [ ] **Health**: schedule `backend/scripts/health-check.sh` daily with
