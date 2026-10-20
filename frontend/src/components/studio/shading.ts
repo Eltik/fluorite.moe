@@ -2,9 +2,11 @@
  * Studio shading modes for loaded models.
  *
  * - Standard: the loader's PBR-ish MeshStandardMaterial (or the GLB's own).
- * - Toon: a MeshToonMaterial built from the same diffuse map with a stepped
- *   light ramp and a soft fresnel rim, plus an optional inverted-hull outline
- *   whose width is constant in screen pixels.
+ * - Toon: materials that carry `HGRP/CharacterNPR*` extras get the in-game
+ *   NPR material (see `npr/`), eyes go unlit, and skinned meshes get an
+ *   inverted-hull outline on averaged normals. Anything else (static parts,
+ *   GLBs without extras) falls back to a MeshToonMaterial with a stepped ramp,
+ *   a fresnel rim and a pixel-constant hull.
  *
  * Variants are created lazily, cached on each mesh's userData and disposed by
  * `disposeShading` (called from the model's dispose).
@@ -26,9 +28,22 @@ import {
 	Vector2,
 	type WebGLProgramParametersWithUniforms,
 } from "three";
+import { extrasOf, isEyeShader, nprKind } from "@/components/studio/npr/extras";
+import {
+	computeFaceFrame,
+	type FaceFrame,
+	updateFaceUniforms,
+} from "@/components/studio/npr/face-frame";
+import {
+	createEyeMaterial,
+	createNprMaterial,
+	type NprUserData,
+	wantsFaceFrame,
+} from "@/components/studio/npr/material";
+import { createNprOutline } from "@/components/studio/npr/outline";
 import type { ShadingId } from "@/components/studio/prefs";
 
-/** Uniforms shared by every toon / outline material of the page. */
+/** Uniforms shared by the fallback toon / outline materials of the page. */
 export const shadingUniforms = {
 	rimColor: { value: new Color("#ffffff") },
 	rimStrength: { value: 0.3 },
@@ -61,7 +76,7 @@ function getRamp(): DataTexture {
 	return ramp;
 }
 
-/** Meshes that never get an outline (eyes, brows, mouth interior…). */
+/** Fallback-path meshes that never get an outline (eyes, brows, mouth…). */
 const NO_OUTLINE =
 	/(^|[_\s.-])(eye|eyes|eyeball|iris|pupil|brow|brows|eyebrow|lash|lashes|eyelash|mouth|teeth|tooth|tongue|hl|highlight|hs|shadow|eyeshadow|blush|cheek|fx|effect)([_\s.\d-]|$)/i;
 
@@ -69,9 +84,16 @@ interface ShadingData {
 	standard: Material | Material[];
 	toon?: Material | Material[];
 	outline?: ThreeMesh | null;
+	/** Head axes for SDF-lit skin; `null` once tried and not applicable. */
+	face?: FaceFrame | null;
+	/** True when the toon variant uses the NPR materials. */
+	npr?: boolean;
+	renderOrder: number;
 }
 
 type ShadedMesh = Mesh & { userData: { studioShading?: ShadingData } };
+
+// ------------------------------------------------------------- fallback toon
 
 const toonCache = new WeakMap<Material, Material>();
 
@@ -163,7 +185,7 @@ function meshNames(mesh: Object3D): string {
 	return names.join(" ");
 }
 
-function makeOutline(mesh: Mesh): ThreeMesh | null {
+function makeFallbackOutline(mesh: Mesh): ThreeMesh | null {
 	if (!mesh.geometry.attributes.normal) return null;
 	if (NO_OUTLINE.test(meshNames(mesh))) return null;
 	const sources = Array.isArray(mesh.material)
@@ -191,6 +213,48 @@ function makeOutline(mesh: Mesh): ThreeMesh | null {
 	return outline;
 }
 
+// ------------------------------------------------------------- NPR
+
+/** Whether any of a mesh's materials carries character shader extras. */
+function hasNprExtras(materials: Material[]): boolean {
+	return materials.some((m) => {
+		const shader = extrasOf(m)?.shader;
+		return nprKind(shader) !== null || isEyeShader(shader);
+	});
+}
+
+function buildToonVariant(
+	mesh: ShadedMesh,
+	data: ShadingData,
+): Material | Material[] {
+	const build = (source: Material): Material => {
+		const extras = extrasOf(source);
+		const kind = nprKind(extras?.shader);
+		if (extras && kind) {
+			if (kind === "skin" && data.face === undefined) {
+				data.face =
+					wantsFaceFrame(extras) && (mesh as SkinnedMesh).isSkinnedMesh
+						? computeFaceFrame(mesh as SkinnedMesh)
+						: null;
+			}
+			return createNprMaterial(source, kind, extras, data.face ?? null);
+		}
+		if (extras && isEyeShader(extras.shader)) return createEyeMaterial(source);
+		return toonOf(source);
+	};
+	const standard = data.standard;
+	return Array.isArray(standard) ? standard.map(build) : build(standard);
+}
+
+/** Render queue from the extras of the mesh's (first) material, or -1. */
+function renderQueueOf(materials: Material[]): number {
+	for (const m of materials) {
+		const q = extrasOf(m)?.renderQueue;
+		if (typeof q === "number" && q >= 0) return q;
+	}
+	return -1;
+}
+
 function meshesOf(root: Object3D): ShadedMesh[] {
 	const meshes: ShadedMesh[] = [];
 	root.traverse((node) => {
@@ -210,26 +274,53 @@ export function applyShading(
 	for (const mesh of meshesOf(root)) {
 		let data = mesh.userData.studioShading;
 		if (!data) {
-			data = { standard: mesh.material };
+			data = { standard: mesh.material, renderOrder: mesh.renderOrder };
 			mesh.userData.studioShading = data;
 		}
+		const sources = Array.isArray(data.standard)
+			? data.standard
+			: [data.standard];
 		if (mode === "toon") {
-			data.toon ??= Array.isArray(data.standard)
-				? data.standard.map(toonOf)
-				: toonOf(data.standard);
+			if (!data.toon) {
+				data.npr = hasNprExtras(sources);
+				data.toon = buildToonVariant(mesh, data);
+			}
 			mesh.material = data.toon;
+			const queue = renderQueueOf(sources);
+			mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
 		} else {
 			mesh.material = data.standard;
+			mesh.renderOrder = data.renderOrder;
 		}
 		const wantOutline = mode === "toon" && outlines && !wireframe;
 		if (wantOutline && data.outline === undefined) {
-			data.outline = makeOutline(mesh);
+			data.outline = data.npr
+				? (mesh as SkinnedMesh).isSkinnedMesh
+					? createNprOutline(mesh as SkinnedMesh)
+					: null
+				: makeFallbackOutline(mesh);
 			if (data.outline) mesh.add(data.outline);
 		}
-		if (data.outline) data.outline.visible = wantOutline;
+		if (data.outline) {
+			data.outline.visible = wantOutline;
+			data.outline.renderOrder = mesh.renderOrder;
+		}
 		const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
 		for (const m of mats) {
 			if ("wireframe" in m) (m as { wireframe: boolean }).wireframe = wireframe;
+		}
+	}
+}
+
+/** Pushes the current head axes into every SDF-lit skin material. */
+export function updateFaceFrames(root: Object3D): void {
+	for (const mesh of meshesOf(root)) {
+		const data = mesh.userData.studioShading;
+		if (!data?.face || !data.toon) continue;
+		const mats = Array.isArray(data.toon) ? data.toon : [data.toon];
+		for (const m of mats) {
+			const face = (m.userData as Partial<NprUserData>).face;
+			if (face) updateFaceUniforms(data.face, face);
 		}
 	}
 }
@@ -258,6 +349,7 @@ export function disposeShading(root: Object3D): void {
 		}
 		// Restore the original so the caller disposes what it created.
 		mesh.material = data.standard;
+		mesh.renderOrder = data.renderOrder;
 		delete mesh.userData.studioShading;
 	}
 }

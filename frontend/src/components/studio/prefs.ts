@@ -48,6 +48,10 @@ export interface StudioPrefs {
 	skeleton: boolean;
 	autoRotate: boolean;
 	stats: boolean;
+	/** Toon mode: the key light follows the camera (else the front view). */
+	lightFollow: boolean;
+	/** Toon mode: soft bloom post pass. */
+	bloom: boolean;
 	dprCap: number;
 	zUp: ZUpMode;
 	welcomeDismissed: boolean;
@@ -69,6 +73,8 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	skeleton: false,
 	autoRotate: false,
 	stats: false,
+	lightFollow: true,
+	bloom: false,
 	dprCap: 2,
 	zUp: "auto",
 	welcomeDismissed: false,
@@ -121,6 +127,8 @@ function read(): StudioPrefs {
 			skeleton: bool(p.skeleton, d.skeleton),
 			autoRotate: bool(p.autoRotate, d.autoRotate),
 			stats: bool(p.stats, d.stats),
+			lightFollow: bool(p.lightFollow, d.lightFollow),
+			bloom: bool(p.bloom, d.bloom),
 			dprCap:
 				typeof p.dprCap === "number" &&
 				(DPR_CAPS as readonly number[]).includes(p.dprCap)

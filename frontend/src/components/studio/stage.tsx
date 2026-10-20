@@ -18,6 +18,7 @@ import {
 	type Group,
 	MathUtils,
 	NeutralToneMapping,
+	NoToneMapping,
 	type PerspectiveCamera,
 	SkeletonHelper,
 	setConsoleFunction,
@@ -28,6 +29,15 @@ import {
 import type { AnimationController } from "@/components/studio/animation";
 import { ContactShadows } from "@/components/studio/contact-shadows";
 import type { LoadedModel } from "@/components/studio/load-model";
+import { StageBackdrop } from "@/components/studio/npr/backdrop";
+import { Bloom } from "@/components/studio/npr/bloom";
+import { ContactBlobs } from "@/components/studio/npr/contact-blobs";
+import {
+	applyVolume,
+	FRONT_VIEW_FORWARD,
+	keyLightDirection,
+	rigUniforms,
+} from "@/components/studio/npr/rig";
 import type {
 	ShadingId,
 	StudioPrefs,
@@ -39,7 +49,11 @@ import {
 	type LightingPreset,
 	type ResolvedBackground,
 } from "@/components/studio/presets";
-import { applyShading, shadingUniforms } from "@/components/studio/shading";
+import {
+	applyShading,
+	shadingUniforms,
+	updateFaceFrames,
+} from "@/components/studio/shading";
 import { publishStats } from "@/components/studio/stats-store";
 
 // r3f still constructs THREE.Clock, whose deprecation warning fires on every
@@ -85,17 +99,29 @@ interface Framing {
 
 const DEFAULT_AZIMUTH = MathUtils.degToRad(28);
 const DEFAULT_POLAR = MathUtils.degToRad(80);
+/** The game's character menu camera. */
+const CAMERA_FOV = 20;
 
 // ------------------------------------------------------------- renderer
 
-function RendererSettings({ exposure }: { exposure: number }) {
+/**
+ * Toon mode tone maps inside the character materials and leaves the renderer
+ * at NoToneMapping; the standard look uses Neutral with the exposure slider.
+ */
+function RendererSettings({
+	exposure,
+	toon,
+}: {
+	exposure: number;
+	toon: boolean;
+}) {
 	const gl = useThree((s) => s.gl);
 	const invalidate = useThree((s) => s.invalidate);
 	React.useEffect(() => {
-		gl.toneMapping = NeutralToneMapping;
+		gl.toneMapping = toon ? NoToneMapping : NeutralToneMapping;
 		gl.toneMappingExposure = exposure;
 		invalidate();
-	}, [gl, exposure, invalidate]);
+	}, [gl, exposure, toon, invalidate]);
 	return null;
 }
 
@@ -225,7 +251,35 @@ function StudioEnvironment({ preset }: { preset: LightingPreset }) {
 	);
 }
 
-/** Keeps the toon rim and outline uniforms in sync with the view. */
+/**
+ * Drives the NPR rig every frame: the key light follows the camera (yaw plus
+ * bias, pitch clamped) using the shown model's volume, and SDF-lit faces get
+ * their current head axes.
+ */
+function NprSync({
+	model,
+	follow,
+}: {
+	model: LoadedModel | null;
+	follow: boolean;
+}) {
+	const camera = useThree((s) => s.camera);
+	const invalidate = useThree((s) => s.invalidate);
+	const forward = React.useMemo(() => new Vector3(), []);
+	React.useEffect(() => {
+		if (model) applyVolume(model.volume);
+		invalidate();
+	}, [model, invalidate]);
+	useFrame(() => {
+		if (!model) return;
+		const dir = follow ? camera.getWorldDirection(forward) : FRONT_VIEW_FORWARD;
+		keyLightDirection(dir, model.volume, rigUniforms.uLightDir.value);
+		updateFaceFrames(model.content);
+	});
+	return null;
+}
+
+/** Keeps the fallback toon rim and outline uniforms in sync with the view. */
 function ShadingSync({ preset }: { preset: LightingPreset }) {
 	const gl = useThree((s) => s.gl);
 	const invalidate = useThree((s) => s.invalidate);
@@ -322,29 +376,51 @@ function frameCamera(
 	controls: CameraControls,
 	camera: PerspectiveCamera,
 	framing: Framing,
+	character: boolean,
 	transition: boolean,
 ): void {
 	const { center, size, radius } = framing;
 	const vFov = MathUtils.degToRad(camera.fov);
 	const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
-	const depth = Math.max(size.x, size.z);
-	const fitH = size.y / 2 / Math.tan(vFov / 2);
-	const fitW = Math.max(size.x, size.z) / 2 / Math.tan(hFov / 2);
-	const distance = Math.max(fitH, fitW) * 1.15 + depth / 2;
-	// Depth range sized to the model: close-ups stay crisp, no z-fighting.
+	let distance: number;
+	let target: Vector3;
+	let offset: Vector3;
+	if (character) {
+		// The menu framing: from the front, aimed at 72 % of the height, close
+		// enough that the bounding sphere overflows the view. The sphere is
+		// taken from the height and half the span so a T-pose bind pose does
+		// not push the camera back.
+		const span = Math.max(size.x, size.z) * 0.5;
+		const sphere = Math.hypot(size.y, span) / 2;
+		const fit = (sphere / Math.sin(Math.min(vFov, hFov) / 2)) * 1.05;
+		distance = fit * 0.6;
+		target = new Vector3(
+			center.x,
+			MathUtils.lerp(center.y - size.y / 2, center.y + size.y / 2, 0.72),
+			center.z,
+		);
+		offset = new Vector3(0, 0, distance);
+	} else {
+		const depth = Math.max(size.x, size.z);
+		const fitH = size.y / 2 / Math.tan(vFov / 2);
+		const fitW = Math.max(size.x, size.z) / 2 / Math.tan(hFov / 2);
+		distance = Math.max(fitH, fitW) * 1.15 + depth / 2;
+		offset = new Vector3().setFromSphericalCoords(
+			distance,
+			DEFAULT_POLAR,
+			DEFAULT_AZIMUTH,
+		);
+		// Aim slightly below centre so the model clears the bottom toolbar.
+		target = center.clone().setY(center.y - size.y * 0.07);
+	}
+	// Depth range sized to the model (and the stage dome): close-ups stay
+	// crisp, no z-fighting.
 	camera.near = Math.max(radius * 0.01, 0.001);
-	camera.far = radius * 40;
+	camera.far = Math.max(radius * 40, 60);
 	camera.updateProjectionMatrix();
 	controls.minDistance = radius * 0.08;
 	controls.maxDistance = radius * 14;
 	shadingUniforms.outlineRef.value = distance;
-	const offset = new Vector3().setFromSphericalCoords(
-		distance,
-		DEFAULT_POLAR,
-		DEFAULT_AZIMUTH,
-	);
-	// Aim slightly below centre so the model clears the bottom toolbar.
-	const target = center.clone().setY(center.y - size.y * 0.07);
 	const position = target.clone().add(offset);
 	void controls.setLookAt(
 		position.x,
@@ -466,7 +542,7 @@ function ModelMount({
 		const swapped = framed.current !== current;
 		// A new model snaps into place behind a fade; re-orienting the same
 		// model glides.
-		if (c) frameCamera(c, camera, framing, !swapped);
+		if (c) frameCamera(c, camera, framing, current.rigged, !swapped);
 		if (swapped) fadeIn(gl.domElement);
 		framed.current = current;
 		invalidate();
@@ -626,6 +702,7 @@ export function Stage({
 	const [framing, setFraming] = React.useState<Framing | null>(null);
 	const [shown, setShown] = React.useState<LoadedModel | null>(null);
 	const preset = LIGHTING[prefs.lighting];
+	const toon = prefs.shading === "toon";
 	const radius = framing?.radius ?? 1;
 	const height = framing?.size.y ?? 1;
 	const footprint = framing
@@ -649,13 +726,23 @@ export function Stage({
 	return (
 		<Canvas
 			aria-label={label}
-			camera={{ fov: 32, near: 0.01, far: 500, position: [1.6, 1.3, 4.2] }}
+			camera={{
+				fov: CAMERA_FOV,
+				near: 0.01,
+				far: 500,
+				position: [0, 1.2, 4.2],
+			}}
 			className="touch-none"
 			dpr={[1, prefs.dprCap]}
 			frameloop="demand"
-			gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
+			gl={{
+				antialias: true,
+				alpha: true,
+				stencil: true,
+				powerPreference: "high-performance",
+			}}
 			onCreated={({ gl }) => {
-				gl.toneMapping = NeutralToneMapping;
+				gl.toneMapping = NoToneMapping;
 				gl.setClearColor(0x000000, 0);
 				const canvas = gl.domElement;
 				canvas.addEventListener("webglcontextlost", () => onContextLost(true));
@@ -666,16 +753,16 @@ export function Stage({
 			performance={{ min: 0.75, debounce: 250 }}
 			role="img"
 		>
-			<RendererSettings exposure={prefs.exposure} />
+			<RendererSettings exposure={prefs.exposure} toon={toon} />
 			<AdaptivePixelRatio cap={prefs.dprCap} />
 			{prefs.stats && <StatsProbe />}
-			<LightRig
-				preset={preset}
-				radius={radius}
-				toon={prefs.shading === "toon"}
-			/>
+			<LightRig preset={preset} radius={radius} toon={toon} />
 			<StudioEnvironment key={prefs.lighting} preset={preset} />
 			<ShadingSync preset={preset} />
+			<NprSync follow={prefs.lightFollow} model={shown} />
+			{background.stage && (
+				<StageBackdrop dark={background.dark} floor={prefs.floor} />
+			)}
 			<ModelMount
 				controls={controls}
 				hiddenParts={hiddenParts}
@@ -687,7 +774,7 @@ export function Stage({
 				wireframe={prefs.wireframe}
 				zUpMode={zUpMode}
 			/>
-			{prefs.floor && shown && framing && (
+			{prefs.floor && !background.stage && shown && framing && (
 				<FloorDisc
 					color={background.floor.color}
 					opacity={background.floor.opacity}
@@ -695,7 +782,10 @@ export function Stage({
 				/>
 			)}
 			{shown?.rigged && prefs.skeleton && <Skeleton model={shown} />}
-			{prefs.groundShadow && shown && framing && (
+			{prefs.groundShadow && shown?.rigged && framing && (
+				<ContactBlobs placementKey={framing.version} root={shown.content} />
+			)}
+			{prefs.groundShadow && shown && !shown.rigged && framing && (
 				<ContactShadows
 					bakeKey={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}`}
 					blur={2.2}
@@ -732,6 +822,7 @@ export function Stage({
 			<ControlsLock controls={controls} locked={locked} />
 			<AutoRotate controls={controls} enabled={prefs.autoRotate && !locked} />
 			<MixerDriver controller={animation} />
+			<Bloom enabled={toon && prefs.bloom} />
 			<HandleBridge
 				background={background}
 				controls={controls}

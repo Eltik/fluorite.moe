@@ -11,6 +11,10 @@ export interface ResolvedBackground {
 	css: string;
 	/** Whether the backdrop is dark (drives grid / shadow contrast). */
 	dark: boolean;
+	/** The in-game menu stage (dome and floor) is drawn in the canvas. */
+	stage: boolean;
+	/** CSS `background` of a vignette layer over the canvas, if any. */
+	vignette?: string;
 	/** Ground disc tint and centre opacity. */
 	floor: { color: string; opacity: number };
 	/** Paints the same backdrop into a 2D canvas (screenshots). */
@@ -31,11 +35,11 @@ export const BACKGROUNDS: Record<BackgroundId, BackgroundDef> = {
 	},
 	"stage-light": {
 		label: "Light stage",
-		swatch: "radial-gradient(circle at 50% 35%, #ffffff, #dcdbe6 70%, #c3c1d1)",
+		swatch: "linear-gradient(to bottom, #bbbbbb, #d4d4d4 45%, #e6e6e6)",
 	},
 	"stage-dark": {
 		label: "Dark stage",
-		swatch: "radial-gradient(circle at 50% 35%, #3b3650, #1b1925 70%, #0d0c12)",
+		swatch: "linear-gradient(to bottom, #303030, #3d3d3d 45%, #4a4a4a)",
 	},
 	black: { label: "Black", swatch: "#000000" },
 	white: { label: "White", swatch: "#ffffff" },
@@ -52,23 +56,17 @@ interface Stop {
 	color: string;
 }
 
-function radial(stops: Stop[]): Pick<ResolvedBackground, "css" | "paint"> {
+/** The menu stage's vertical gradient, drawn behind the transparent canvas. */
+function vertical(stops: Stop[]): Pick<ResolvedBackground, "css" | "paint"> {
 	return {
-		css: `radial-gradient(120% 90% at 50% 38%, ${stops
+		css: `linear-gradient(to bottom, ${stops
 			.map((s) => `${s.color} ${Math.round(s.at * 100)}%`)
 			.join(", ")})`,
 		paint: (ctx, w, h) => {
-			// Approximate the elliptical CSS gradient by scaling a circular one.
-			const rx = w * 1.2;
-			const ry = h * 0.9;
-			ctx.save();
-			ctx.translate(w / 2, h * 0.38);
-			ctx.scale(1, ry / rx);
-			const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx);
+			const g = ctx.createLinearGradient(0, 0, 0, h);
 			for (const s of stops) g.addColorStop(s.at, s.color);
 			ctx.fillStyle = g;
-			ctx.fillRect(-w, -h * (rx / ry), w * 2, h * 2 * (rx / ry));
-			ctx.restore();
+			ctx.fillRect(0, 0, w, h);
 		},
 	};
 }
@@ -92,15 +90,20 @@ function luminance(hex: string): number {
 }
 
 const STAGE_LIGHT: Stop[] = [
-	{ at: 0, color: "#ffffff" },
-	{ at: 0.45, color: "#ebeaf2" },
-	{ at: 1, color: "#c4c2d3" },
+	{ at: 0, color: "#bbbbbb" },
+	{ at: 0.45, color: "#d4d4d4" },
+	{ at: 1, color: "#e6e6e6" },
 ];
 const STAGE_DARK: Stop[] = [
-	{ at: 0, color: "#353048" },
-	{ at: 0.5, color: "#1a1824" },
-	{ at: 1, color: "#09080d" },
+	{ at: 0, color: "#303030" },
+	{ at: 0.45, color: "#3d3d3d" },
+	{ at: 1, color: "#4a4a4a" },
 ];
+
+const vignette = (color: string) =>
+	`radial-gradient(ellipse 140% 120% at 50% 45%, transparent 55%, ${color} 100%)`;
+const LIGHT_VIGNETTE = vignette("rgb(17 17 19 / 0.3)");
+const DARK_VIGNETTE = vignette("rgb(0 0 0 / 0.35)");
 
 const LIGHT_FLOOR = { color: "#cfccdc", opacity: 0.7 };
 const DARK_FLOOR = { color: "#3a3550", opacity: 0.55 };
@@ -126,13 +129,28 @@ export function resolveBackground(
 	if (id === "auto") id = themeDark ? "stage-dark" : "stage-light";
 	switch (id) {
 		case "stage-light":
-			return { id, dark: false, floor: LIGHT_FLOOR, ...radial(STAGE_LIGHT) };
+			return {
+				id,
+				dark: false,
+				stage: true,
+				vignette: LIGHT_VIGNETTE,
+				floor: LIGHT_FLOOR,
+				...vertical(STAGE_LIGHT),
+			};
 		case "stage-dark":
-			return { id, dark: true, floor: DARK_FLOOR, ...radial(STAGE_DARK) };
+			return {
+				id,
+				dark: true,
+				stage: true,
+				vignette: DARK_VIGNETTE,
+				floor: DARK_FLOOR,
+				...vertical(STAGE_DARK),
+			};
 		case "black":
 			return {
 				id,
 				dark: true,
+				stage: false,
 				floor: { color: "#2a2733", opacity: 0.55 },
 				...solid("#000000"),
 			};
@@ -140,6 +158,7 @@ export function resolveBackground(
 			return {
 				id,
 				dark: false,
+				stage: false,
 				floor: { color: "#d9d7e3", opacity: 0.6 },
 				...solid("#ffffff"),
 			};
@@ -147,6 +166,7 @@ export function resolveBackground(
 			return {
 				id,
 				dark: true,
+				stage: false,
 				floor: { color: "#a4a3ad", opacity: 0.45 },
 				...solid("#7f7f86"),
 			};
@@ -155,6 +175,7 @@ export function resolveBackground(
 			return {
 				id,
 				dark,
+				stage: false,
 				floor: dark
 					? { color: "#ffffff", opacity: 0.08 }
 					: { color: "#000000", opacity: 0.07 },

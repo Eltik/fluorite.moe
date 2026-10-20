@@ -16,6 +16,7 @@ import {
 	type Material,
 	type Mesh,
 	MeshStandardMaterial,
+	NoColorSpace,
 	type Object3D,
 	type SkinnedMesh,
 	SRGBColorSpace,
@@ -23,9 +24,20 @@ import {
 	Vector3,
 } from "three";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import {
+	type GLTF,
+	GLTFLoader,
+} from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchBytes, ProgressTracker } from "@/components/studio/bytes";
 import type { StudioModelSource } from "@/components/studio/catalog-source";
+import {
+	extrasOf,
+	isOverlayShadowShader,
+	isVfxShader,
+	NPR_TEXTURES_KEY,
+	textureIndexOf,
+} from "@/components/studio/npr/extras";
+import { type CharacterVolume, volumeFor } from "@/components/studio/npr/rig";
 import { disposeShading } from "@/components/studio/shading";
 import { api, fileUrl, modelFileUrl, type TreeEntry } from "@/lib/api";
 import { basename, dirname } from "@/lib/format";
@@ -63,6 +75,8 @@ export interface LoadedModel {
 	animations: AnimationClip[];
 	/** True when the bounds suggest the file is Z-up. */
 	detectedZUp: boolean;
+	/** Menu lighting for the NPR rig. */
+	volume: CharacterVolume;
 	stats: ModelStats;
 	/** Non-fatal problems (missing parts, textures that failed to decode). */
 	warnings: string[];
@@ -103,6 +117,10 @@ function collectTextures(material: Material, into: Set<Texture>): void {
 	for (const value of Object.values(material)) {
 		if (value instanceof Texture) into.add(value);
 	}
+	const data = material.userData[NPR_TEXTURES_KEY] as
+		| Record<string, Texture>
+		| undefined;
+	if (data) for (const t of Object.values(data)) into.add(t);
 }
 
 /** Frees GPU resources (geometries, materials, textures, bitmaps). */
@@ -293,11 +311,20 @@ async function findTextureCandidates(
 	return [...found.values()];
 }
 
-async function loadTexture(
+/** Loads a PNG from the `textures` root as a glTF-oriented (flipY false) texture. */
+export async function loadTexture(
 	path: string,
-	options: { signal: AbortSignal; onProgress: (l: number, t: number) => void },
+	options: {
+		signal: AbortSignal;
+		onProgress?: (l: number, t: number) => void;
+		/** Colour data (default) or raw values for masks and fields. */
+		srgb?: boolean;
+	},
 ): Promise<Texture> {
-	const buf = await fetchBytes(fileUrl("textures", path), options);
+	const buf = await fetchBytes(fileUrl("textures", path), {
+		signal: options.signal,
+		onProgress: options.onProgress ?? (() => {}),
+	});
 	throwIfAborted(options.signal);
 	const bitmap = await createImageBitmap(
 		new Blob([buf], { type: "image/png" }),
@@ -308,11 +335,81 @@ async function loadTexture(
 	);
 	const texture = new Texture(bitmap);
 	texture.flipY = false;
-	texture.colorSpace = SRGBColorSpace;
+	texture.colorSpace = options.srgb === false ? NoColorSpace : SRGBColorSpace;
 	texture.anisotropy = 8;
 	texture.name = basename(path);
 	texture.needsUpdate = true;
 	return texture;
+}
+
+// ------------------------------------------------------------- character extras
+
+/** Slots GLTFLoader already binds through the standard PBR channels. */
+const STANDARD_SLOTS = new Set(["_BaseMap", "_BumpMap", "_EmissionMap"]);
+
+/**
+ * Resolves the data textures (ramps, LUTs, SDFs, masks) referenced by the
+ * material extras and stores them under `userData.nprTextures`. Slots the
+ * exporter left as `null` are skipped; the shaders fall back without them.
+ */
+async function resolveDataTextures(gltf: GLTF): Promise<void> {
+	const jobs: Promise<void>[] = [];
+	const seen = new Set<Material>();
+	gltf.scene.traverse((node) => {
+		const mesh = node as Mesh;
+		if (!mesh.isMesh) return;
+		const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+		for (const material of mats) {
+			if (!material || seen.has(material)) continue;
+			seen.add(material);
+			const extras = extrasOf(material);
+			if (!extras?.textures) continue;
+			const resolved: Record<string, Texture> = {};
+			material.userData[NPR_TEXTURES_KEY] = resolved;
+			const standard = material as MeshStandardMaterial;
+			for (const slot of Object.keys(extras.textures)) {
+				if (STANDARD_SLOTS.has(slot)) continue;
+				const index = textureIndexOf(extras, slot);
+				if (index === null) continue;
+				jobs.push(
+					gltf.parser
+						.getDependency("texture", index)
+						.then((texture: Texture) => {
+							// A slot that shares an image with a colour map keeps that
+							// map's colour space; everything else is raw data.
+							const colour =
+								texture === standard.map ||
+								texture === standard.emissiveMap ||
+								extras.srgb?.includes(slot);
+							if (!colour) texture.colorSpace = NoColorSpace;
+							resolved[slot] = texture;
+						})
+						.catch(() => {}),
+				);
+			}
+		}
+	});
+	await Promise.all(jobs);
+}
+
+const LOD_NAME = /_lod([1-9]\d*)(?:$|[^0-9])/i;
+const SHADOW_PROXY = /shadowproxy/i;
+
+function lodOfNode(mesh: Mesh): number | undefined {
+	const tagged = mesh.userData.lod;
+	if (typeof tagged === "number") return tagged;
+	const m = LOD_NAME.exec(mesh.name);
+	return m ? Number(m[1]) : undefined;
+}
+
+/** Game-side helpers that never draw in the menu: LODs, shadow proxies, overlays, VFX. */
+function isHiddenCharacterMesh(mesh: Mesh, lod: number | undefined): boolean {
+	if ((lod ?? 0) > 0 || SHADOW_PROXY.test(mesh.name)) return true;
+	const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+	return mats.some((m) => {
+		const shader = extrasOf(m)?.shader;
+		return isOverlayShadowShader(shader) || isVfxShader(shader);
+	});
 }
 
 // ------------------------------------------------------------- loaders
@@ -338,6 +435,7 @@ async function loadRigged(
 		});
 		throwIfAborted(signal);
 		const gltf = await makeLoader().parseAsync(buf, "");
+		await resolveDataTextures(gltf);
 		if (signal.aborted) {
 			disposeObject(gltf.scene);
 			throwIfAborted(signal);
@@ -353,13 +451,15 @@ async function loadRigged(
 				? mesh.material
 				: [mesh.material];
 			for (const m of mats) if (m) collectTextures(m, textures);
+			const lod = lodOfNode(mesh);
 			parts.push({
 				id: mesh.uuid,
 				label: mesh.name || `Mesh ${parts.length + 1}`,
+				lod,
 				object: mesh,
 				status: "embedded",
 				triangles: triangleCount(mesh),
-				hiddenByDefault: false,
+				hiddenByDefault: isHiddenCharacterMesh(mesh, lod),
 			});
 		});
 		return {
@@ -370,6 +470,7 @@ async function loadRigged(
 			parts,
 			animations: gltf.animations,
 			detectedZUp: detectZUp(content),
+			volume: volumeFor(source.entry.kind),
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),
@@ -542,6 +643,7 @@ async function loadParts(
 			parts,
 			animations: [],
 			detectedZUp: detectZUp(content),
+			volume: volumeFor(source.entry.kind),
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),

@@ -498,6 +498,13 @@ function Studio(): React.ReactElement {
 					zUpMode={prefs.zUp}
 				/>
 			</div>
+			{background.vignette && (
+				<div
+					aria-hidden="true"
+					className="pointer-events-none absolute inset-0 z-10"
+					style={{ background: background.vignette }}
+				/>
+			)}
 
 			{loading && (
 				<LoadingCard

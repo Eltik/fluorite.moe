@@ -336,6 +336,25 @@ export function LightingPanel({
 				/>
 			</label>
 			<PanelHeading>Lighting</PanelHeading>
+			{prefs.shading === "toon" && (
+				<p className="text-muted-foreground text-xs">
+					Toon shading uses the game's own menu light. Presets and exposure
+					apply to the standard look.
+				</p>
+			)}
+			<label
+				className={cn(
+					"flex items-center justify-between gap-2 text-sm",
+					prefs.shading !== "toon" && "text-muted-foreground",
+				)}
+			>
+				<span>Light follows camera</span>
+				<Switch
+					checked={prefs.lightFollow}
+					disabled={prefs.shading !== "toon"}
+					onCheckedChange={(lightFollow) => setPrefs({ lightFollow })}
+				/>
+			</label>
 			<div
 				aria-label="Lighting preset"
 				className="flex flex-col gap-1"

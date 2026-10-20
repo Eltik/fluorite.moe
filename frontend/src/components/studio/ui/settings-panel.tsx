@@ -130,6 +130,23 @@ export function SettingsPanel({
 				/>
 			</section>
 			<section className="flex flex-col">
+				<PanelHeading>Toon look</PanelHeading>
+				<Row
+					checked={prefs.lightFollow}
+					disabled={prefs.shading !== "toon"}
+					hint="Key light orbits with the view, as in the game menu"
+					label="Light follows camera"
+					onChange={(lightFollow) => setPrefs({ lightFollow })}
+				/>
+				<Row
+					checked={prefs.bloom}
+					disabled={prefs.shading !== "toon"}
+					hint="Soft glow on highlights"
+					label="Bloom"
+					onChange={(bloom) => setPrefs({ bloom })}
+				/>
+			</section>
+			<section className="flex flex-col">
 				<PanelHeading>Debug</PanelHeading>
 				<Row
 					checked={prefs.wireframe}
