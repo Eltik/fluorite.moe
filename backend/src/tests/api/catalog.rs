@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::{Fixture, body_json, get};
-use crate::api::catalog::assets::{MeshIndex, model_parts, split_lod};
+use crate::api::catalog::assets::{MeshIndex, RigIndex, model_parts, split_lod};
 use crate::api::story::{natural_cmp, replace_non_finite};
 
 const UI: &str = "textures/beyond/dynamicassets/gameplay/ui/sprites";
@@ -764,4 +764,33 @@ async fn models_root_is_browsable() {
         .map(|e| e["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["operators", "index.json"]);
+}
+
+/// Catalog ids resolve to rigged variant prefabs when no exact GLB exists.
+#[test]
+fn rig_index_falls_back_to_variant_prefabs() {
+    let rig = RigIndex {
+        by_stem: [
+            ("eny_0054_hsmino_chrdg", "enemy/eny_0054_hsmino_chrdg.glb"),
+            ("eny_0054_hsmino1", "enemy/eny_0054_hsmino1.glb"),
+            ("eny_0113_jzogre", "enemy/eny_0113_jzogre.glb"),
+            ("wpn_pistol_0009_refined", "weapon/wpn_pistol_0009_refined.glb"),
+            ("wpn_sword_00091", "weapon/wpn_sword_00091.glb"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect(),
+        stamp: Some(std::time::SystemTime::UNIX_EPOCH),
+    };
+    let out = std::env::temp_dir().join("fluorite-rig-variant-test");
+    let find = |kind: &str, id: &str| rig.find(&out, kind, id);
+    assert_eq!(find("enemies", "eny_0113_jzogre").as_deref(), Some("enemy/eny_0113_jzogre.glb"));
+    // Digit variants win over `_` variants.
+    assert_eq!(find("enemies", "eny_0054_hsmino").as_deref(), Some("enemy/eny_0054_hsmino1.glb"));
+    assert_eq!(find("weapons", "wpn_pistol_0009").as_deref(), Some("weapon/wpn_pistol_0009_refined.glb"));
+    // A numeric id never claims a longer number.
+    assert_eq!(find("weapons", "wpn_sword_0009"), None);
+    assert_eq!(find("enemies", "eny_0055_hscrane"), None);
+    // No index, no rigged model.
+    assert_eq!(RigIndex::default().find(&out, "enemies", "eny_0113_jzogre"), None);
 }

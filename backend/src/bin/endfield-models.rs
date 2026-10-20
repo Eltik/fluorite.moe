@@ -895,24 +895,32 @@ fn animation_containers(records: &[rig::store::CabRecord], stored_root: Option<&
     out
 }
 
-/// Clips for an entity: containers under `<code>…/animations/` whose file name contains a
-/// keyword, where `<code>` is the id's last `_` segment. Keywords are tried in order and the
-/// first one with any match wins, so `uiteam_idle,idle` prefers the UI idles and only falls
-/// back to every `idle` clip. At most `max` container paths are taken.
+/// Clips for an entity, found by container path. Operators keep clips in
+/// `…/<code>/animations/**`, monsters in `…/monster/animations/<code>/**`, where `<code>` is
+/// the id's third `_` segment (`chr_0005_chen` -> `chen`, `eny_0054_hsmino_chrdg` -> `hsmino`).
+/// Keywords are tried in order and the first one with any match wins, so `uiteam_idle,idle`
+/// prefers the UI idles and only falls back to every `idle` clip. At most `max` container
+/// paths are taken.
 fn select_clips(index: &[(String, String, i64)], id: &str, keywords: &[String], max: usize) -> Vec<(String, i64)> {
-    let code = id.rsplit('_').next().unwrap_or(id).to_ascii_lowercase();
-    let folder = format!("/{code}");
-    let owned: Vec<&(String, String, i64)> = index
-        .iter()
-        .filter(|(path, _, _)| {
-            let Some(at) = path.find("/animations/") else {
-                return false;
-            };
-            let owner = &path[..at];
-            // `purrche` must find `purrchena/`, so the folder only has to start with the code.
-            owner.contains(&folder) && owner.rsplit('/').next().unwrap_or("").starts_with(&code)
-        })
-        .collect();
+    let code = clip_code(id);
+    let in_folder = |prefix: bool| -> Vec<&(String, String, i64)> {
+        index
+            .iter()
+            .filter(|(path, _, _)| {
+                let Some(at) = path.find("/animations/") else {
+                    return false;
+                };
+                let before = path[..at].rsplit('/').next().unwrap_or("");
+                let after = path[at + "/animations/".len()..].split('/').next().unwrap_or("");
+                clip_folder_matches(before, &code, prefix) || clip_folder_matches(after, &code, prefix)
+            })
+            .collect()
+    };
+    // Exact folders first, so `chen` never picks up `chenpast/`; prefixes only as a fallback.
+    let mut owned = in_folder(false);
+    if owned.is_empty() {
+        owned = in_folder(true);
+    }
     for keyword in keywords.iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_ascii_lowercase()) {
         if keyword.is_empty() {
             continue;
@@ -937,4 +945,47 @@ fn select_clips(index: &[(String, String, i64)], id: &str, keywords: &[String], 
         }
     }
     Vec::new()
+}
+
+/// The model code an entity's animation folders are named after: the id's third `_` segment
+/// (`chr_0005_chen` -> `chen`, `eny_0054_hsmino_chrdg` -> `hsmino`), else its last segment.
+fn clip_code(id: &str) -> String {
+    let parts: Vec<&str> = id.split('_').collect();
+    parts.get(2).or(parts.last()).unwrap_or(&id).to_ascii_lowercase()
+}
+
+/// Whether an animation folder belongs to `code`: an exact match, the code without its variant
+/// digits (`hsmino1` -> `hsmino`), or with `prefix` a longer name (`purrche` -> `purrchena`).
+fn clip_folder_matches(folder: &str, code: &str, prefix: bool) -> bool {
+    let base = code.trim_end_matches(|c: char| c.is_ascii_digit());
+    !folder.is_empty() && (folder == code || folder == base || (prefix && folder.starts_with(code)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clip_code, clip_folder_matches, select_clips};
+
+    #[test]
+    fn clip_codes_and_folders() {
+        assert_eq!(clip_code("chr_0005_chen"), "chen");
+        assert_eq!(clip_code("eny_0054_hsmino_chrdg"), "hsmino");
+        assert!(clip_folder_matches("hsmino", "hsmino1", false));
+        assert!(clip_folder_matches("purrchena", "purrche", true));
+        assert!(!clip_folder_matches("purrchena", "purrche", false));
+        assert!(!clip_folder_matches("hsminox", "hsmino1", true));
+    }
+
+    #[test]
+    fn keywords_are_tried_in_order() {
+        let index = vec![
+            ("assets/a/actor/girl/chen/animations/ui/a_actor_chen_idle_avoid.fbx".to_string(), "C1".to_string(), 1),
+            ("assets/a/actor/girl/chen/animations/ui/a_actor_chen_uiteam_idle_01.fbx".to_string(), "C2".to_string(), 2),
+            ("assets/a/monster/animations/hsmino/a_monster_hsmino_idle.fbx".to_string(), "C3".to_string(), 3),
+            ("assets/a/npc/girl/chenpast/animations/a_chenpast_uiteam_idle_01.fbx".to_string(), "C4".to_string(), 4),
+        ];
+        let kw = vec!["uiteam_idle,idle".to_string()];
+        assert_eq!(select_clips(&index, "chr_0005_chen", &kw, 3), vec![("C2".to_string(), 2)]);
+        assert_eq!(select_clips(&index, "eny_0054_hsmino1", &kw, 3), vec![("C3".to_string(), 3)]);
+        assert!(select_clips(&index, "eny_0001_other", &kw, 3).is_empty());
+    }
 }

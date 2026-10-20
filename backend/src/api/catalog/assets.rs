@@ -333,6 +333,28 @@ impl RigIndex {
             .iter()
             .map(|k| format!("{k}/{id}.glb"))
             .find(|rel| root.join(rel).is_file())
+            .or_else(|| self.find_variant(id))
+    }
+
+    /// A variant prefab of a catalog id: templates such as `eny_0054_hsmino` only have
+    /// `eny_0054_hsmino1` / `eny_0054_hsmino_chrdg`, and some weapons only `<id>_refined`.
+    /// Digit suffixes count only after a letter (so `wpn_x_0009` never matches `wpn_x_00091`);
+    /// digit variants win over `_` variants, then the shortest, then the first by name.
+    fn find_variant(&self, id: &str) -> Option<String> {
+        let digit_ok = id.ends_with(|c: char| c.is_ascii_alphabetic());
+        self.by_stem
+            .iter()
+            .filter_map(|(stem, path)| {
+                let rest = stem.strip_prefix(id)?;
+                let rank = match rest.chars().next()? {
+                    c if c.is_ascii_digit() && digit_ok => 0,
+                    '_' => 1,
+                    _ => return None,
+                };
+                Some(((rank, stem.len(), stem.clone()), path))
+            })
+            .min_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, path)| path.clone())
     }
 }
 
