@@ -271,37 +271,66 @@ pub fn uses_cdn_catalog(resolved: &ResolvedPipeline, dir_hash: &str) -> bool {
             .is_some_and(|patch| pipeline::patch_files(patch, dir_hash).next().is_some())
 }
 
-/// GET a whole (small) file.
-async fn get_bytes(client: &Client, url: &str) -> Result<Vec<u8>, String> {
+/// The raw `.blc` catalog of a directory from the patch CDN, or `None` when the CDN has none
+/// (HTTP 403/404): some hot-updated directories ship patch chunks without a CDN catalog.
+pub async fn fetch_cdn_catalog(
+    client: &Client,
+    resolved: &ResolvedPipeline,
+    dir_hash: &str,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let main =
+        pipeline::main_resource_path(&resolved.config).ok_or("launcher lists no main resource")?;
+    let url = pipeline::cdn_blc_url(main, dir_hash);
     let resp = client
-        .get(url)
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("{url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("{url}: HTTP {}", resp.status()));
+    let status = resp.status();
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
     }
-    Ok(resp
-        .bytes()
-        .await
-        .map_err(|e| format!("{url}: {e}"))?
-        .to_vec())
+    if !status.is_success() {
+        return Err(format!("{url}: HTTP {status}").into());
+    }
+    Ok(Some(
+        resp.bytes()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?
+            .to_vec(),
+    ))
 }
 
-/// The raw `.blc` catalog of a directory, from the CDN or the archive (see [`uses_cdn_catalog`]).
+/// The raw `.blc` catalog of a directory as the archive ships it, if it ships one.
+pub async fn fetch_archive_catalog(
+    client: &Client,
+    resolved: &ResolvedPipeline,
+    dir_hash: &str,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let path = pipeline::blc_path(dir_hash);
+    if resolved.cd.get(&path).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(
+        pipeline::download_chk(client, &resolved.cd, &path).await?,
+    ))
+}
+
+/// The raw `.blc` catalog of a directory: from the CDN when [`uses_cdn_catalog`], falling back
+/// to the archive copy only when the CDN has none.
 pub async fn fetch_catalog(
     client: &Client,
     resolved: &ResolvedPipeline,
     dir_hash: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if !uses_cdn_catalog(resolved, dir_hash) {
-        return pipeline::download_chk(client, &resolved.cd, &pipeline::blc_path(dir_hash)).await;
+    if uses_cdn_catalog(resolved, dir_hash)
+        && let Some(catalog) = fetch_cdn_catalog(client, resolved, dir_hash).await?
+    {
+        return Ok(catalog);
     }
-    let main =
-        pipeline::main_resource_path(&resolved.config).ok_or("launcher lists no main resource")?;
-    // No fallback to the archive copy: it misses the hot-update chunks, and the directory
-    // would be recorded as current.
-    Ok(get_bytes(client, &pipeline::cdn_blc_url(main, dir_hash)).await?)
+    fetch_archive_catalog(client, resolved, dir_hash)
+        .await?
+        .ok_or_else(|| format!("{dir_hash}: no catalog on the CDN or in the archive").into())
 }
 
 /// Attempts per download segment. Within one run a retry continues from the segment's last

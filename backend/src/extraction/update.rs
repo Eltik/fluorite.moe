@@ -122,6 +122,10 @@ pub fn mark_textures_flipped(digest: &str) -> Option<String> {
 /// Marks the part of a BLC digest that identifies a catalog read from the patch CDN.
 pub const CDN_CATALOG_TAG: &str = "cdn-blc";
 
+/// Stands in for [`catalog_digest`] when the CDN has no catalog for a hot-updated directory
+/// and the archive catalog was used instead.
+pub const CDN_CATALOG_MISSING: &str = "missing";
+
 /// Identity of a raw catalog read from the patch CDN: FNV-1a 64 of its bytes plus its length.
 pub fn catalog_digest(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

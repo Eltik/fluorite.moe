@@ -180,7 +180,7 @@ cargo run --release --bin endfield -- survey --scan-all
 
 #### `endfield update`
 
-Incrementally sync all assets (`extract --all --scan-all` + `decrypt`) to the latest game and hot-update version. Built to run from cron: when nothing changed upstream it exits in ~1s after two launcher API calls; otherwise it re-processes only the `.chk` files and encrypted directories whose CRC32/size or patch MD5s changed. A directory read through its CDN catalog (hot-updated, or only in the patch index like the voice languages) is tracked by that catalog's bytes plus its patch MD5s, since the catalog can name CDN chunks the patch index leaves out; such directories re-extract once after upgrading from a version that read the archive catalog.
+Incrementally sync all assets (`extract --all --scan-all` + `decrypt`) to the latest game and hot-update version. Built to run from cron: when nothing changed upstream it exits in ~1s after two launcher API calls; otherwise it re-processes only the `.chk` files and encrypted directories whose CRC32/size or patch MD5s changed. A directory read through its CDN catalog (hot-updated, or only in the patch index like the voice languages) is tracked by that catalog's bytes plus its patch MD5s, since the catalog can name CDN chunks the patch index leaves out; such directories re-extract once after upgrading from a version that read the archive catalog. When the CDN has no catalog for a hot-updated directory (HTTP 403/404), the archive catalog is used and the digest records `cdn-blc=missing`, so the directory re-extracts if a CDN catalog appears later.
 
 ```bash
 # Sync everything (first run is a full extraction)

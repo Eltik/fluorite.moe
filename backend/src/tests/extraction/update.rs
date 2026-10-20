@@ -189,6 +189,27 @@ fn blc_digest_of_patch_only_directory_changes_with_its_chunks_or_catalog() {
 }
 
 #[test]
+fn blc_digest_marks_a_missing_cdn_catalog_so_a_later_one_re_extracts() {
+    let index = patch_index(&[("3C9D9D2D/A.chk", "1")]);
+    let missing = update::blc_digest(
+        Some("abc-1".into()),
+        Some(update::CDN_CATALOG_MISSING.into()),
+        Some(&index),
+        "3C9D9D2D",
+    );
+    assert_eq!(missing, "abc-1;cdn-blc=missing;3C9D9D2D/A.chk:1");
+    assert_ne!(
+        missing,
+        update::blc_digest(
+            Some("abc-1".into()),
+            Some(update::catalog_digest(b"catalog")),
+            Some(&index),
+            "3C9D9D2D",
+        )
+    );
+}
+
+#[test]
 fn catalog_digest_depends_on_bytes_and_length() {
     assert_eq!(
         update::catalog_digest(b"abc"),

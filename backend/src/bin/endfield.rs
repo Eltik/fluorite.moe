@@ -1310,10 +1310,23 @@ async fn extract_blc_directories(
             .get(&pipeline::blc_path(dir))
             .map(|entry| update::zip_digest(entry.crc32, entry.uncompressed_size));
         // Hot-updated and patch-only directories are read through their CDN catalog, which
-        // is fetched up front: it names chunks the patch index does not list.
-        let cdn_catalog = if blc::uses_cdn_catalog(resolved, dir) {
-            match blc::fetch_catalog(ctx.client, resolved, dir).await {
-                Ok(bytes) => Some(bytes),
+        // is fetched up front: it names chunks the patch index does not list. When the CDN
+        // has none, the archive catalog is used and the digest says so, so a later run that
+        // finds a CDN catalog re-extracts.
+        let (catalog, cdn_digest) = if blc::uses_cdn_catalog(resolved, dir) {
+            let fetched = match blc::fetch_cdn_catalog(ctx.client, resolved, dir).await {
+                Ok(Some(bytes)) => Ok((Some(update::catalog_digest(&bytes)), bytes)),
+                Ok(None) => blc::fetch_archive_catalog(ctx.client, resolved, dir)
+                    .await
+                    .and_then(|archive| {
+                        let bytes = archive.ok_or("no catalog on the CDN or in the archive")?;
+                        println!("  {dir}: no CDN catalog; using the archive catalog");
+                        Ok((Some(update::CDN_CATALOG_MISSING.to_string()), bytes))
+                    }),
+                Err(error) => Err(error),
+            };
+            match fetched {
+                Ok((digest, bytes)) => (Some(bytes), digest),
                 Err(error) => {
                     println!("  {dir}: catalog: {error}");
                     counts.dirty += 1;
@@ -1322,11 +1335,11 @@ async fn extract_blc_directories(
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let digest = update::blc_digest(
             archive_catalog,
-            cdn_catalog.as_deref().map(update::catalog_digest),
+            cdn_digest,
             resolved.patch_index.as_ref(),
             dir,
         );
@@ -1339,7 +1352,7 @@ async fn extract_blc_directories(
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
-        let extracted = match &cdn_catalog {
+        let extracted = match &catalog {
             Some(catalog) => {
                 blc::extract_directory_from(
                     ctx.client,
