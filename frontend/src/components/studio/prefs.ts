@@ -61,7 +61,14 @@ export interface StudioPrefs {
 	welcomeDismissed: boolean;
 	/** Last tab opened in the model picker. */
 	pickerKind: PickerKind;
+	/** Let root-motion clips travel instead of playing in place. */
+	rootMotion: boolean;
+	/** Last tab opened in the animations panel. */
+	clipTab: ClipTab;
 }
+
+export const CLIP_TABS = ["featured", "all"] as const;
+export type ClipTab = (typeof CLIP_TABS)[number];
 
 export const DEFAULT_PREFS: StudioPrefs = {
 	background: "auto",
@@ -85,6 +92,8 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	zUp: "auto",
 	welcomeDismissed: false,
 	pickerKind: "operators",
+	rootMotion: false,
+	clipTab: "featured",
 };
 
 const KEY = "fluorite.studio";
@@ -145,6 +154,8 @@ function read(): StudioPrefs {
 			zUp: pick(p.zUp, ["auto", "on", "off"] as const, d.zUp),
 			welcomeDismissed: bool(p.welcomeDismissed, d.welcomeDismissed),
 			pickerKind: pick(p.pickerKind, PICKER_KINDS, d.pickerKind),
+			rootMotion: bool(p.rootMotion, d.rootMotion),
+			clipTab: pick(p.clipTab, CLIP_TABS, d.clipTab),
 		};
 	} catch {
 		return DEFAULT_PREFS;
@@ -173,10 +184,10 @@ export function setPrefs(patch: Partial<StudioPrefs>): void {
 	for (const listener of listeners) listener();
 }
 
-/** Restores every display preference except the welcome hint and picker tab. */
+/** Restores every display preference except the welcome hint and remembered tabs. */
 export function resetPrefs(): void {
-	const { welcomeDismissed, pickerKind } = snapshot();
-	setPrefs({ ...DEFAULT_PREFS, welcomeDismissed, pickerKind });
+	const { welcomeDismissed, pickerKind, clipTab } = snapshot();
+	setPrefs({ ...DEFAULT_PREFS, welcomeDismissed, pickerKind, clipTab });
 }
 
 function subscribe(listener: () => void): () => void {

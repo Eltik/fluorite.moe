@@ -1,11 +1,9 @@
-/** Animation transport bar and the searchable, virtualized clip list. */
-import { useVirtualizer } from "@tanstack/react-virtual";
+/** Animation transport bar: play/pause, frame step, speed, loop and seek. */
 import {
 	PauseIcon,
 	PlayIcon,
 	Repeat1Icon,
 	RepeatIcon,
-	SearchIcon,
 	StepBackIcon,
 	StepForwardIcon,
 } from "lucide-react";
@@ -17,17 +15,19 @@ import {
 } from "@/components/studio/animation";
 import { GlassCard, IconButton } from "@/components/studio/ui/chrome";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
 const IDLE: AnimationState = {
 	clip: null,
+	loading: null,
+	failed: null,
 	playing: false,
 	speed: 1,
 	loop: true,
 	duration: 0,
+	rootMotion: false,
 };
 
 export function useAnimationState(
@@ -54,7 +54,7 @@ function formatTime(t: number): string {
 }
 
 /** Polls the mixer time each frame while playing (no React state churn otherwise). */
-function useClipTime(
+export function useClipTime(
 	controller: AnimationController | null,
 	state: AnimationState,
 ): number {
@@ -90,8 +90,8 @@ export function TransportBar({
 }): React.ReactElement {
 	const state = useAnimationState(controller);
 	const time = useClipTime(controller, state);
-	const enabled = Boolean(controller?.clips.length);
-	const ready = enabled && state.clip !== null;
+	const enabled = Boolean(controller?.entries.length);
+	const ready = enabled && state.clip !== null && state.loading === null;
 
 	const bar = (
 		<GlassCard
@@ -179,104 +179,5 @@ export function TransportBar({
 			<TooltipTrigger render={bar} />
 			<TooltipPopup side="top">Animations aren't exported yet</TooltipPopup>
 		</Tooltip>
-	);
-}
-
-export function ClipList({
-	controller,
-	onSelect,
-}: {
-	controller: AnimationController;
-	onSelect: (name: string) => void;
-}): React.ReactElement {
-	const state = useAnimationState(controller);
-	const [search, setSearch] = React.useState("");
-	const deferred = React.useDeferredValue(search);
-	const scrollRef = React.useRef<HTMLDivElement>(null);
-	const clips = React.useMemo(() => {
-		const needle = deferred.trim().toLowerCase();
-		return needle
-			? controller.clips.filter((c) => c.name.toLowerCase().includes(needle))
-			: controller.clips;
-	}, [controller, deferred]);
-
-	const virtualizer = useVirtualizer({
-		count: clips.length,
-		getScrollElement: () => scrollRef.current,
-		estimateSize: () => 36,
-		overscan: 8,
-	});
-
-	React.useEffect(() => {
-		const i = clips.findIndex((c) => c.name === state.clip);
-		if (i >= 0) virtualizer.scrollToIndex(i, { align: "center" });
-	}, [clips, state.clip, virtualizer]);
-
-	return (
-		<div className="flex w-full flex-col gap-2 sm:w-80">
-			<div className="relative">
-				<SearchIcon
-					aria-hidden="true"
-					className="pointer-events-none absolute start-2.5 top-1/2 z-10 size-4 -translate-y-1/2 text-muted-foreground"
-				/>
-				<Input
-					aria-label="Search animations"
-					className="ps-8"
-					onChange={(e) => setSearch(e.target.value)}
-					placeholder={`Search ${controller.clips.length} animations…`}
-					size="sm"
-					type="search"
-					value={search}
-				/>
-			</div>
-			<div
-				className="relative h-[min(22rem,45dvh)] overflow-y-auto"
-				ref={scrollRef}
-			>
-				{clips.length === 0 ? (
-					<p className="py-6 text-center text-muted-foreground text-sm">
-						No match
-					</p>
-				) : (
-					<ul
-						aria-label="Animations"
-						className="relative w-full"
-						style={{ height: virtualizer.getTotalSize() }}
-					>
-						{virtualizer.getVirtualItems().map((row) => {
-							const clip = clips[row.index];
-							const active = clip.name === state.clip;
-							return (
-								<li
-									className="absolute inset-x-0"
-									key={clip.uuid}
-									style={{
-										height: row.size,
-										transform: `translateY(${row.start}px)`,
-									}}
-								>
-									<button
-										aria-current={active ? "true" : undefined}
-										className={cn(
-											"flex h-full w-full items-center gap-2 rounded-lg px-2.5 text-start text-sm outline-none hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring",
-											active && "bg-primary/10 font-medium",
-										)}
-										onClick={() => onSelect(clip.name)}
-										type="button"
-									>
-										<span className="min-w-0 flex-1 truncate" title={clip.name}>
-											{clip.name}
-										</span>
-										<span className="font-mono text-muted-foreground text-xs tabular-nums">
-											{clip.duration.toFixed(1)}s
-										</span>
-									</button>
-								</li>
-							);
-						})}
-					</ul>
-				)}
-			</div>
-		</div>
 	);
 }

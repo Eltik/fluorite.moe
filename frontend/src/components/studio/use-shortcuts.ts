@@ -10,6 +10,8 @@ export interface ShortcutHandlers {
 	onHelp: () => void;
 	onToggleUi: () => void;
 	onShowUi: () => void;
+	/** Escape with the interface visible: closes a non-modal panel, if any. */
+	onEscape: () => void;
 	onReset: () => void;
 	onLock: () => void;
 	onFlyout: (flyout: FlyoutId) => void;
@@ -71,8 +73,8 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 					h.onToggleUi();
 					break;
 				case "Escape":
-					if (!h.uiHidden) return;
-					h.onShowUi();
+					if (h.uiHidden) h.onShowUi();
+					else h.onEscape();
 					break;
 				case "f":
 					h.onReset();

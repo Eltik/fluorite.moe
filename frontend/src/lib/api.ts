@@ -216,6 +216,8 @@ export interface CatalogModel {
 	rigged?: string;
 	/** Menu lighting JSON (volume + lights) under the `models` root. */
 	lights?: string;
+	/** Per-clip animation index (`clips/<kind>/<id>/index.json`) under the `models` root. */
+	clips?: string;
 }
 
 export interface CatalogList {

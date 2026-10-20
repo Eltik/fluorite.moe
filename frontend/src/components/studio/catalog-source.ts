@@ -40,11 +40,13 @@ export interface StudioModelSource {
 	rigged?: string;
 	/** Menu lighting JSON (volume + lights) under the `models` root. */
 	lights?: string;
+	/** Per-clip animation index JSON under the `models` root. */
+	clips?: string;
 	/** Dev builds only: absolute URL that replaces `rigged`. */
 	riggedUrl?: string;
 	/** Dev builds only: URL of a JSON `CharacterVolume` (or `{ volume }`). */
 	volumeUrl?: string;
-	/** Dev builds only: URL of a GLB whose animation clips are added. */
+	/** Dev builds only: URL of a clip `index.json`, or of a GLB whose clips are used. */
 	clipsUrl?: string;
 	/** Static part GLBs under the `meshes` root. */
 	parts: string[];
@@ -223,6 +225,7 @@ export function modelFromDetail(detail: CatalogDetail): {
 	parts: string[];
 	rigged?: string;
 	lights?: string;
+	clips?: string;
 } {
 	const record = detail as Record<string, unknown>;
 	const model = (record.model ?? {}) as Record<string, unknown>;
@@ -230,6 +233,7 @@ export function modelFromDetail(detail: CatalogDetail): {
 	let parts = strings(model.parts);
 	let rigged = str(model.rigged) ?? str(record.rigged);
 	let lights = str(model.lights);
+	let clips = str(model.clips);
 	if (models && typeof models === "object") {
 		if (Array.isArray(models)) {
 			for (const m of models) {
@@ -238,15 +242,17 @@ export function modelFromDetail(detail: CatalogDetail): {
 				if (!parts.length) parts = strings(mm.parts);
 				rigged ??= str(mm.rigged);
 				lights ??= str(mm.lights);
+				clips ??= str(mm.clips);
 			}
 		} else {
 			const mm = models as Record<string, unknown>;
 			if (!parts.length) parts = strings(mm.parts);
 			rigged ??= str(mm.rigged);
 			lights ??= str(mm.lights);
+			clips ??= str(mm.clips);
 		}
 	}
-	return { parts: bestLodParts(parts), rigged, lights };
+	return { parts: bestLodParts(parts), rigged, lights, clips };
 }
 
 // ------------------------------------------------------------- queries
@@ -296,13 +302,14 @@ export const studioDetailQuery = (
 		queryFn: async ({ signal }): Promise<StudioModelSource> => {
 			try {
 				const detail = await api.catalogDetail(kind, id, lang, signal);
-				const { parts, rigged, lights } = modelFromDetail(detail);
+				const { parts, rigged, lights, clips } = modelFromDetail(detail);
 				return {
 					entry: toEntry(kind, detail),
 					description: str(detail.description),
 					parts,
 					rigged,
 					lights,
+					clips,
 					source: "api",
 				};
 			} catch (error) {

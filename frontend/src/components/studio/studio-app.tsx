@@ -46,6 +46,10 @@ import {
 } from "@/components/studio/prefs";
 import { BACKGROUNDS, resolveBackground } from "@/components/studio/presets";
 import { Stage, type StageHandle } from "@/components/studio/stage";
+import {
+	AnimationsBrowser,
+	AnimationsCard,
+} from "@/components/studio/ui/animations-panel";
 import { GlassCard, IconButton } from "@/components/studio/ui/chrome";
 import { Flyout } from "@/components/studio/ui/flyout";
 import { ModelPicker } from "@/components/studio/ui/model-picker";
@@ -65,13 +69,14 @@ import {
 } from "@/components/studio/ui/panels";
 import { SettingsPanel } from "@/components/studio/ui/settings-panel";
 import { ToolbarButton } from "@/components/studio/ui/toolbar-button";
-import { ClipList, TransportBar } from "@/components/studio/ui/transport";
+import { TransportBar } from "@/components/studio/ui/transport";
 import { useStudioShortcuts } from "@/components/studio/use-shortcuts";
 import { Badge } from "@/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTrigger } from "@/components/ui/popover";
 import { toastManager } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useMediaQuery } from "@/hooks/use-media-query";
+import { clipLabel, clipStem, defaultClip } from "@/lib/clips";
 import { pageTitle } from "@/lib/route-meta";
 import { updateSettings, useSettings } from "@/lib/settings";
 import {
@@ -197,6 +202,8 @@ function Studio(): React.ReactElement {
 	const stageRef = React.useRef<StageHandle | null>(null);
 	const toolbarRef = React.useRef<HTMLDivElement>(null);
 	const pickerSearchRef = React.useRef<HTMLInputElement>(null);
+	const clipSearchRef = React.useRef<HTMLInputElement>(null);
+	const animationsButtonRef = React.useRef<HTMLButtonElement>(null);
 	const models = React.useRef(new Set<LoadedModel>());
 	const modelRef = React.useRef<LoadedModel | null>(null);
 	modelRef.current = model;
@@ -356,36 +363,65 @@ function Studio(): React.ReactElement {
 
 	// ---------------------------------------------------------- animation
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: root motion is applied below, not rebuilt
 	const animation = React.useMemo(
 		() =>
-			shown?.animations.length
-				? new AnimationController(shown.content, shown.animations)
+			shown?.clips?.entries.length
+				? new AnimationController(shown.content, shown.clips, {
+						rootMotion: prefs.rootMotion,
+					})
 				: null,
 		[shown],
 	);
 	React.useEffect(() => () => animation?.dispose(), [animation]);
+	React.useEffect(() => {
+		animation?.setRootMotion(prefs.rootMotion);
+	}, [animation, prefs.rootMotion]);
 
-	// `?clip=` deep link once the clips are known. Only on a new controller:
-	// later URL changes come from selecting clips.
+	const reportClipFailure = React.useCallback(
+		(stem: string) => {
+			const entry = animation?.entry(stem);
+			toastManager.add({
+				type: "error",
+				title: "Couldn't load the animation",
+				description: entry ? clipLabel(entry) : stem,
+			});
+		},
+		[animation],
+	);
+
+	// `?clip=` deep link once the clips are known, else a sensible idle. Only
+	// on a new controller: later URL changes come from selecting clips.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: see above
 	React.useEffect(() => {
 		if (!animation) return;
 		const wanted = search.clip;
-		if (wanted && animation.select(wanted)) return;
-		const first = animation.clips[0];
-		if (first) animation.select(first.name, false);
+		const fallback = defaultClip(animation.entries);
+		const stem =
+			wanted && animation.entry(wanted)
+				? wanted
+				: fallback
+					? clipStem(fallback.file)
+					: null;
+		if (!stem) return;
+		void animation.select(stem).then((ok) => {
+			if (!ok && animation.state.failed === stem) reportClipFailure(stem);
+		});
 	}, [animation]);
 
 	const selectClip = React.useCallback(
-		(name: string) => {
-			animation?.select(name);
+		(stem: string) => {
+			if (!animation) return;
+			void animation.select(stem).then((ok) => {
+				if (!ok && animation.state.failed === stem) reportClipFailure(stem);
+			});
 			void navigate({
 				to: ".",
-				search: (prev: StudioSearch) => ({ ...prev, clip: name }),
+				search: (prev: StudioSearch) => ({ ...prev, clip: stem }),
 				replace: true,
 			} as never);
 		},
-		[animation, navigate],
+		[animation, navigate, reportClipFailure],
 	);
 
 	// ---------------------------------------------------------- view
@@ -427,6 +463,21 @@ function Studio(): React.ReactElement {
 	const toggleFlyout = React.useCallback((f: FlyoutId) => {
 		setFlyout((cur) => (cur === f ? null : f));
 	}, []);
+	// The desktop animations card is not a popover, so it manages its own
+	// open focus (search) and close focus (its toolbar button).
+	const animationsOpen = flyout === "animations" && !uiHidden;
+	const closeAnimations = React.useCallback(() => {
+		setFlyout((cur) => (cur === "animations" ? null : cur));
+		animationsButtonRef.current?.focus();
+	}, []);
+	React.useEffect(() => {
+		if (!animationsOpen || mobile) return;
+		const t = window.setTimeout(() => clipSearchRef.current?.focus(), 30);
+		return () => window.clearTimeout(t);
+	}, [animationsOpen, mobile]);
+	React.useEffect(() => {
+		if (!animation) setFlyout((cur) => (cur === "animations" ? null : cur));
+	}, [animation]);
 	const flyoutProps = (f: FlyoutId) => ({
 		open: flyout === f && !uiHidden,
 		onOpenChange: (open: boolean) =>
@@ -455,6 +506,9 @@ function Studio(): React.ReactElement {
 			setFlyout(null);
 		},
 		onShowUi: () => setUiHidden(false),
+		onEscape: () => {
+			if (flyout === "animations") closeAnimations();
+		},
 		uiHidden,
 		onReset: () => stageRef.current?.resetView(),
 		onLock: () => setLocked((l) => !l),
@@ -703,6 +757,19 @@ function Studio(): React.ReactElement {
 					</Popover>
 				</GlassCard>
 
+				{/* Left: the animations browser (desktop). Phones get a sheet. */}
+				{animation && animationsOpen && !mobile && (
+					<div className="pointer-events-none absolute inset-y-0 start-4 flex items-center pt-24 pb-28">
+						<AnimationsCard
+							className="pointer-events-auto"
+							controller={animation}
+							onClose={closeAnimations}
+							onSelect={selectClip}
+							searchRef={clipSearchRef}
+						/>
+					</div>
+				)}
+
 				{/* Welcome hint */}
 				{!prefs.welcomeDismissed && !flyout && (
 					<div className="absolute inset-x-0 bottom-36 flex justify-center px-4 sm:bottom-auto sm:start-4 sm:top-24 sm:justify-start sm:px-0">
@@ -771,7 +838,7 @@ function Studio(): React.ReactElement {
 								onHiddenChange={setHiddenParts}
 							/>
 						</Flyout>
-						{animation && (
+						{animation && mobile && (
 							<Flyout
 								{...flyoutProps("animations")}
 								title="Animations"
@@ -784,8 +851,23 @@ function Studio(): React.ReactElement {
 									/>
 								}
 							>
-								<ClipList controller={animation} onSelect={selectClip} />
+								<AnimationsBrowser
+									controller={animation}
+									mobile
+									onSelect={selectClip}
+								/>
 							</Flyout>
+						)}
+						{animation && !mobile && (
+							<ToolbarButton
+								active={animationsOpen}
+								aria-expanded={animationsOpen}
+								icon={<ClapperboardIcon />}
+								label="Animations"
+								onClick={() => toggleFlyout("animations")}
+								ref={animationsButtonRef}
+								shortcut="A"
+							/>
 						)}
 						<Flyout
 							{...flyoutProps("background")}

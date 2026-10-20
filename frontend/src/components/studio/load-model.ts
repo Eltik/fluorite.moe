@@ -9,7 +9,6 @@
  *   part, then to a neutral material.
  */
 import {
-	type AnimationClip,
 	Box3,
 	DoubleSide,
 	Group,
@@ -30,6 +29,11 @@ import {
 } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchBytes, ProgressTracker } from "@/components/studio/bytes";
 import type { StudioModelSource } from "@/components/studio/catalog-source";
+import {
+	type ClipLibrary,
+	embeddedClipLibrary,
+	loadClipIndex,
+} from "@/components/studio/clip-library";
 import {
 	extrasOf,
 	isOverlayShadowShader,
@@ -78,7 +82,8 @@ export interface LoadedModel {
 	/** The raw content, in file coordinates. */
 	content: Object3D;
 	parts: PartEntry[];
-	animations: AnimationClip[];
+	/** Animation clips (per-clip files or embedded), or null for static models. */
+	clips: ClipLibrary | null;
 	/** True when the bounds suggest the file is Z-up. */
 	detectedZUp: boolean;
 	/** Menu lighting for the NPR rig. */
@@ -435,14 +440,40 @@ async function loadLighting(
 }
 
 /** Dev-only: animation clips from another GLB with the same bone names. */
-async function loadClips(
+async function loadEmbeddedClips(
 	url: string,
 	signal: AbortSignal,
-): Promise<AnimationClip[]> {
+): Promise<ClipLibrary> {
 	const buf = await fetchBytes(url, { signal, onProgress: () => {} });
 	const gltf = await makeLoader().parseAsync(buf, "");
 	disposeObject(gltf.scene);
-	return gltf.animations;
+	return embeddedClipLibrary(gltf.animations);
+}
+
+/**
+ * The model's clip index: the catalog's `clips/<kind>/<id>/index.json`, or
+ * a dev override (an index URL, or a GLB whose embedded clips are used).
+ * Resolves null when there is none, and reports a failed index through
+ * `warn` so the Studio can fall back to whatever the model GLB embeds.
+ */
+async function loadClipSource(
+	source: StudioModelSource,
+	signal: AbortSignal,
+	warn: (message: string) => void,
+): Promise<ClipLibrary | null> {
+	const dev = source.clipsUrl;
+	if (dev && !/\.json(?:[?#]|$)/i.test(dev)) {
+		return loadEmbeddedClips(dev, signal);
+	}
+	const url = dev ?? (source.clips ? modelFileUrl(source.clips) : null);
+	if (!url) return null;
+	try {
+		return await loadClipIndex(url, signal);
+	} catch (error) {
+		if (signal.aborted) throw error;
+		warn("The animation list couldn't be loaded.");
+		return null;
+	}
 }
 
 const LOD_NAME = /_lod([1-9]\d*)(?:$|[^0-9])/i;
@@ -481,14 +512,15 @@ async function loadRigged(
 ): Promise<LoadedModel> {
 	const path = source.rigged as string;
 	const tracker = new ProgressTracker(onProgress);
+	const warnings: string[] = [];
 	try {
-		const [buf, lighting, extraClips] = await Promise.all([
+		const [buf, lighting, clipIndex] = await Promise.all([
 			fetchBytes(source.riggedUrl ?? modelFileUrl(path), {
 				signal,
 				onProgress: tracker.reporter(path),
 			}),
 			loadLightingFor(source, signal),
-			source.clipsUrl ? loadClips(source.clipsUrl, signal) : [],
+			loadClipSource(source, signal, (w) => warnings.push(w)),
 		]);
 		throwIfAborted(signal);
 		const gltf = await makeLoader().parseAsync(buf, "");
@@ -519,13 +551,18 @@ async function loadRigged(
 				hiddenByDefault: isHiddenCharacterMesh(mesh, lod),
 			});
 		});
+		// With a clip index the GLB's own clips (humanoid idles that don't
+		// move the body) are ignored; without one they are all there is.
+		const clips =
+			clipIndex ??
+			(gltf.animations.length ? embeddedClipLibrary(gltf.animations) : null);
 		return {
 			key,
 			name: source.entry.name,
 			rigged: true,
 			content,
 			parts,
-			animations: [...gltf.animations, ...extraClips],
+			clips,
 			detectedZUp: detectZUp(content),
 			volume: lighting.volume,
 			lights: lighting.lights,
@@ -535,7 +572,7 @@ async function loadRigged(
 				textures: textures.size,
 				bytes: buf.byteLength,
 			},
-			warnings: [],
+			warnings,
 			dispose: () => {
 				disposeShading(content);
 				disposeObject(content);
@@ -699,7 +736,7 @@ async function loadParts(
 			rigged: false,
 			content,
 			parts,
-			animations: [],
+			clips: null,
 			detectedZUp: detectZUp(content),
 			volume: volumeFor(source.entry.kind),
 			lights: [],
