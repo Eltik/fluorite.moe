@@ -9,7 +9,10 @@ import { cn } from "@/lib/utils";
 export interface FacetValue {
 	code: string;
 	name: string;
+	/** Matches with the other active filters applied. */
 	count: number;
+	/** Entries carrying this value overall. */
+	total?: number;
 }
 
 export interface Facet {
@@ -19,6 +22,8 @@ export interface Facet {
 
 /** Facets with more values than this collapse into a searchable popover. */
 const INLINE_LIMIT = 12;
+/** How many leading values of a large facet stay visible as chips. */
+const FEATURED = 8;
 
 export function FilterChip({
 	pressed,
@@ -43,6 +48,7 @@ export function FilterChip({
 				pressed
 					? "border-foreground/20 bg-foreground text-background hover:bg-foreground/90"
 					: "border-input bg-background text-foreground/80 hover:bg-accent hover:text-foreground dark:bg-input/32",
+				!pressed && count === 0 && "opacity-50",
 				className,
 			)}
 			onClick={() => onPressedChange(!pressed)}
@@ -68,10 +74,12 @@ function FacetPopover({
 	facet,
 	selected,
 	onToggle,
+	triggerLabel,
 }: {
 	facet: Facet;
 	selected: Set<string>;
 	onToggle: (key: string) => void;
+	triggerLabel?: string;
 }): React.ReactElement {
 	const [filter, setFilter] = React.useState("");
 	const label = TAG_KIND_LABELS[facet.kind] ?? facet.kind;
@@ -101,7 +109,7 @@ function FacetPopover({
 					/>
 				}
 			>
-				{label}
+				{triggerLabel ?? label}
 				{chosen.length > 0 ? (
 					<span className="max-w-40 truncate text-muted-foreground">
 						{chosen.length === 1
@@ -152,7 +160,12 @@ function FacetPopover({
 										<span className="min-w-0 flex-1 truncate">
 											{value.name}
 										</span>
-										<span className="text-muted-foreground text-xs tabular-nums">
+										<span
+											className={cn(
+												"text-muted-foreground text-xs tabular-nums",
+												value.count === 0 && "opacity-50",
+											)}
+										>
 											{value.count}
 										</span>
 									</button>
@@ -178,6 +191,7 @@ export function CatalogFilters({
 	rarities,
 	selectedRarities,
 	onToggleRarity,
+	rarityCounts,
 	onClear,
 }: {
 	facets: Facet[];
@@ -186,10 +200,14 @@ export function CatalogFilters({
 	rarities: number[];
 	selectedRarities: Set<number>;
 	onToggleRarity: (rarity: number) => void;
+	/** Matches per rarity with the other filters applied. */
+	rarityCounts?: Map<number, number>;
 	onClear?: () => void;
 }): React.ReactElement | null {
 	const inline = facets.filter((f) => f.values.length <= INLINE_LIMIT);
-	const popovers = facets.filter((f) => f.values.length > INLINE_LIMIT);
+	// Large facets keep their leading values as a visible row of chips, with
+	// the rest behind a searchable popover.
+	const large = facets.filter((f) => f.values.length > INLINE_LIMIT);
 	if (facets.length === 0 && rarities.length === 0) return null;
 
 	return (
@@ -214,11 +232,46 @@ export function CatalogFilters({
 					})}
 				</FilterRow>
 			))}
-			{(rarities.length > 1 || popovers.length > 0) && (
-				<FilterRow label={rarities.length > 1 ? "Rarity" : "More"}>
+			{large.map((facet) => {
+				const featured = facet.values.slice(0, FEATURED);
+				const featuredCodes = new Set(featured.map((v) => v.code));
+				const rest = {
+					...facet,
+					values: facet.values.filter((v) => !featuredCodes.has(v.code)),
+				};
+				return (
+					<FilterRow
+						key={facet.kind}
+						label={TAG_KIND_LABELS[facet.kind] ?? facet.kind}
+					>
+						{featured.map((value) => {
+							const key = `${facet.kind}:${value.code}`;
+							return (
+								<FilterChip
+									count={value.count}
+									key={key}
+									onPressedChange={() => onToggleTag(key)}
+									pressed={selected.has(key)}
+								>
+									{value.name}
+								</FilterChip>
+							);
+						})}
+						<FacetPopover
+							facet={rest}
+							onToggle={onToggleTag}
+							selected={selected}
+							triggerLabel="More"
+						/>
+					</FilterRow>
+				);
+			})}
+			{rarities.length > 1 && (
+				<FilterRow label="Rarity">
 					{rarities.length > 1 &&
 						rarities.map((rarity) => (
 							<FilterChip
+								count={rarityCounts?.get(rarity) ?? 0}
 								key={rarity}
 								onPressedChange={() => onToggleRarity(rarity)}
 								pressed={selectedRarities.has(rarity)}
@@ -233,17 +286,6 @@ export function CatalogFilters({
 								/>
 							</FilterChip>
 						))}
-					{rarities.length > 1 && popovers.length > 0 && (
-						<span aria-hidden className="mx-1 h-4 w-px bg-border" />
-					)}
-					{popovers.map((facet) => (
-						<FacetPopover
-							facet={facet}
-							key={facet.kind}
-							onToggle={onToggleTag}
-							selected={selected}
-						/>
-					))}
 				</FilterRow>
 			)}
 			{onClear && (

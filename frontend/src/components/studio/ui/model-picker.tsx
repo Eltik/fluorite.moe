@@ -1,6 +1,6 @@
 /**
- * Model picker: kind tabs, search, and a horizontally scrolling tile strip
- * (desktop) or a grid (phone sheet). Tiles are real links; hovering or
+ * Model picker: kind tabs, search, and a two-row horizontally scrolling tile
+ * strip (desktop) or a grid (phone sheet). Tiles are real links; hovering or
  * focusing one prefetches its detail.
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -222,8 +222,12 @@ export function ModelPicker({
 		const index = tiles.indexOf(document.activeElement as HTMLElement);
 		if (index < 0) return;
 		let next = index;
-		if (e.key === "ArrowRight") next = index + 1;
-		else if (e.key === "ArrowLeft") next = index - 1;
+		// The strip is two rows filled column by column.
+		const across = layout === "strip" ? 2 : 1;
+		if (e.key === "ArrowRight") next = index + across;
+		else if (e.key === "ArrowLeft") next = index - across;
+		else if (layout === "strip" && e.key === "ArrowDown") next = index + 1;
+		else if (layout === "strip" && e.key === "ArrowUp") next = index - 1;
 		else if (e.key === "Home") next = 0;
 		else if (e.key === "End") next = tiles.length - 1;
 		else if (
@@ -308,7 +312,7 @@ export function ModelPicker({
 					<div
 						className={cn(
 							layout === "strip"
-								? "flex gap-2 overflow-hidden"
+								? "grid auto-cols-[6rem] grid-flow-col grid-rows-2 gap-2 overflow-hidden"
 								: "grid grid-cols-[repeat(auto-fill,minmax(5.5rem,1fr))] gap-2",
 						)}
 					>
@@ -346,7 +350,7 @@ export function ModelPicker({
 							aria-label={label}
 							className={cn(
 								layout === "strip"
-									? "flex snap-x scroll-px-1 gap-2 overflow-x-auto overscroll-x-contain px-1 py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+									? "grid snap-x auto-cols-[6rem] grid-flow-col grid-rows-2 gap-2 overflow-x-auto overscroll-x-contain scroll-px-1 px-1 py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
 									: "grid max-h-[52dvh] grid-cols-[repeat(auto-fill,minmax(5.5rem,1fr))] gap-2 overflow-y-auto p-1",
 								layout === "strip" &&
 									edges.start &&

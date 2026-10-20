@@ -20,7 +20,10 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
 	ArrowDownIcon,
 	ArrowUpIcon,
+	BracesIcon,
+	BracketsIcon,
 	Columns3Icon,
+	CopyIcon,
 	LanguagesIcon,
 } from "lucide-react";
 import * as React from "react";
@@ -35,10 +38,23 @@ import {
 	MenuSeparator,
 	MenuTrigger,
 } from "@/components/ui/menu";
+import {
+	Popover,
+	PopoverPopup,
+	PopoverTitle,
+	PopoverTrigger,
+} from "@/components/ui/popover";
+import { Spinner } from "@/components/ui/spinner";
+import { copyText } from "@/lib/clipboard";
 import { formatNumber } from "@/lib/format";
 import { useRowHeight } from "@/lib/settings";
 import { asI18n, cellText, type Rec, type Tabular } from "@/lib/table-shape";
 import { cn } from "@/lib/utils";
+
+const JsonViewer = React.lazy(() => import("@/components/viewers/json-viewer"));
+
+/** Width of the row-number column, also the frozen key column's offset. */
+const INDEX_WIDTH = 56;
 
 const features = tableFeatures({
 	rowSortingFeature,
@@ -157,8 +173,11 @@ export function DataGrid({
 
 	const rows = table.getRowModel().rows;
 	const visibleColumns = table.getVisibleLeafColumns();
-	const template = `3.5rem ${visibleColumns.map((c) => `${c.getSize()}px`).join(" ")}`;
-	const totalWidth = 56 + visibleColumns.reduce((n, c) => n + c.getSize(), 0);
+	const frozenId = visibleColumns[0]?.id;
+	const frozenWidth = visibleColumns[0]?.getSize() ?? 0;
+	const template = `${INDEX_WIDTH}px ${visibleColumns.map((c) => `${c.getSize()}px`).join(" ")}`;
+	const totalWidth =
+		INDEX_WIDTH + visibleColumns.reduce((n, c) => n + c.getSize(), 0);
 
 	// ---- virtualization
 	const scrollRef = React.useRef<HTMLDivElement>(null);
@@ -235,7 +254,7 @@ export function DataGrid({
 						style={{ gridTemplateColumns: template, height: rowHeight + 4 }}
 					>
 						<div
-							className="sticky left-0 flex items-center bg-background/95 px-2 text-muted-foreground text-xs"
+							className="sticky left-0 z-[1] flex items-center bg-background px-2 text-muted-foreground text-xs"
 							role="columnheader"
 						>
 							#
@@ -251,9 +270,18 @@ export function DataGrid({
 												? "descending"
 												: "none"
 									}
-									className="flex min-w-0 items-center border-s"
+									className={cn(
+										"flex min-w-0 items-center border-s",
+										header.column.id === frozenId &&
+											"sticky z-[1] border-e bg-background",
+									)}
 									key={header.id}
 									role="columnheader"
+									style={
+										header.column.id === frozenId
+											? { left: INDEX_WIDTH }
+											: undefined
+									}
 								>
 									<button
 										className="flex h-full w-full min-w-0 cursor-pointer items-center gap-1 px-2 text-start font-medium font-mono text-xs outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
@@ -286,7 +314,7 @@ export function DataGrid({
 								<div
 									aria-rowindex={item.index + 2}
 									className={cn(
-										"absolute top-0 left-0 grid w-full border-b border-border/60 hover:bg-accent/60",
+										"group/row absolute top-0 left-0 grid w-full border-b border-border/60 hover:bg-accent/60",
 										onRowOpen && "cursor-pointer",
 									)}
 									key={item.key}
@@ -304,16 +332,42 @@ export function DataGrid({
 									tabIndex={onRowOpen ? 0 : undefined}
 								>
 									<div
-										className="sticky left-0 flex items-center bg-background px-2 text-muted-foreground text-xs tabular-nums"
+										className="sticky left-0 z-[1] flex items-center bg-background px-2 text-muted-foreground text-xs tabular-nums group-hover/row:bg-accent"
 										role="cell"
 									>
-										{row.index + 1}
+										<span className="group-focus-within/row:hidden group-hover/row:hidden">
+											{row.index + 1}
+										</span>
+										<button
+											aria-label={`Copy row ${row.index + 1} as JSON`}
+											className="hidden size-6 cursor-pointer items-center justify-center rounded-sm outline-none hover:bg-background hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring group-focus-within/row:flex group-hover/row:flex"
+											onClick={(event) => {
+												event.stopPropagation();
+												void copyText(
+													JSON.stringify(row.original, null, 2),
+													"Row JSON",
+												);
+											}}
+											title="Copy row as JSON"
+											type="button"
+										>
+											<CopyIcon className="size-3.5" />
+										</button>
 									</div>
 									{row.getVisibleCells().map((cell) => (
 										<div
-											className="flex min-w-0 items-center border-s border-border/60 px-2"
+											className={cn(
+												"flex min-w-0 items-center border-s border-border/60 px-2",
+												cell.column.id === frozenId &&
+													"sticky z-[1] border-e bg-background group-hover/row:bg-accent",
+											)}
 											key={cell.id}
 											role="cell"
+											style={
+												cell.column.id === frozenId
+													? { left: INDEX_WIDTH, width: frozenWidth }
+													: undefined
+											}
 										>
 											<table.FlexRender cell={cell} />
 										</div>
@@ -395,13 +449,61 @@ function Cell({
 			</span>
 		);
 	}
+	if (typeof value === "object") return <NestedCell value={value} />;
 	const text = cellText(value, resolve);
 	return (
 		<span
 			className="truncate font-mono text-muted-foreground text-xs"
 			title={text}
 		>
-			{Array.isArray(value) && value.length === 0 ? "[]" : text}
+			{text}
 		</span>
+	);
+}
+
+/** `{…} 3 keys` / `[…] 5` chip that opens the value as a JSON tree. */
+function NestedCell({ value }: { value: object }): React.ReactElement {
+	const isArray = Array.isArray(value);
+	const size = isArray ? value.length : Object.keys(value).length;
+	if (size === 0) {
+		return (
+			<span className="font-mono text-muted-foreground/60 text-xs">
+				{isArray ? "[]" : "{}"}
+			</span>
+		);
+	}
+	const Icon = isArray ? BracketsIcon : BracesIcon;
+	const label = isArray
+		? `${formatNumber(size)} item${size === 1 ? "" : "s"}`
+		: `${formatNumber(size)} key${size === 1 ? "" : "s"}`;
+	return (
+		<Popover>
+			<PopoverTrigger
+				aria-label={`Show ${label}`}
+				className="inline-flex h-5 max-w-full cursor-pointer items-center gap-1 rounded-sm border bg-muted/60 px-1.5 font-mono text-muted-foreground text-xs outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+				onClick={(event) => event.stopPropagation()}
+				onKeyDown={(event) => event.stopPropagation()}
+			>
+				<Icon className="size-3 shrink-0" />
+				<span className="truncate">{label}</span>
+			</PopoverTrigger>
+			<PopoverPopup
+				className="w-[min(32rem,90vw)] [&_[data-slot=popover-viewport]]:p-0"
+				onClick={(event) => event.stopPropagation()}
+			>
+				<PopoverTitle className="sr-only">Nested value</PopoverTitle>
+				<div className="flex h-80 flex-col">
+					<React.Suspense
+						fallback={
+							<div className="flex flex-1 items-center justify-center">
+								<Spinner />
+							</div>
+						}
+					>
+						<JsonViewer value={value} />
+					</React.Suspense>
+				</div>
+			</PopoverPopup>
+		</Popover>
 	);
 }

@@ -15,24 +15,31 @@ import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as React from "react";
 import {
 	Box3,
+	CanvasTexture,
 	type Group,
 	MathUtils,
-	type Mesh,
 	NeutralToneMapping,
 	type PerspectiveCamera,
 	SkeletonHelper,
 	setConsoleFunction,
+	Vector2,
 	Vector3,
 	type WebGLRenderer,
 } from "three";
 import type { AnimationController } from "@/components/studio/animation";
 import type { LoadedModel } from "@/components/studio/load-model";
-import type { StudioPrefs } from "@/components/studio/prefs";
+import type {
+	ShadingId,
+	StudioPrefs,
+	ZUpMode,
+} from "@/components/studio/prefs";
 import {
+	type DirLight,
 	LIGHTING,
 	type LightingPreset,
 	type ResolvedBackground,
 } from "@/components/studio/presets";
+import { applyShading, shadingUniforms } from "@/components/studio/shading";
 import { publishStats } from "@/components/studio/stats-store";
 
 // r3f still constructs THREE.Clock, whose deprecation warning fires on every
@@ -55,7 +62,7 @@ export interface StageHandle {
 
 export interface StageProps {
 	model: LoadedModel | null;
-	zUp: boolean;
+	zUpMode: ZUpMode;
 	hiddenParts: ReadonlySet<string>;
 	prefs: StudioPrefs;
 	background: ResolvedBackground;
@@ -72,6 +79,8 @@ interface Framing {
 	center: Vector3;
 	size: Vector3;
 	radius: number;
+	/** Bumps on every re-frame (keys the baked contact shadow). */
+	version: number;
 }
 
 const DEFAULT_AZIMUTH = MathUtils.degToRad(28);
@@ -157,44 +166,35 @@ function StatsProbe() {
 
 function LightRig({
 	preset,
+	toon,
 	radius,
 }: {
 	preset: LightingPreset;
+	toon: boolean;
 	radius: number;
 }) {
 	const d = Math.max(radius, 0.5) * 4;
 	const at = (p: [number, number, number]) =>
 		new Vector3(...p).normalize().multiplyScalar(d).toArray();
+	const lights: DirLight[] = toon
+		? [preset.toon.key]
+		: [preset.key, preset.fill, preset.rim];
+	const ambient = toon ? preset.toon.ambient : preset.ambient;
+	const hemi = toon ? preset.toon.hemisphere : preset.hemisphere;
 	return (
 		<>
-			<ambientLight intensity={preset.ambient} />
-			<hemisphereLight
-				args={[
-					preset.hemisphere.sky,
-					preset.hemisphere.ground,
-					preset.hemisphere.intensity,
-				]}
-			/>
-			{preset.key.intensity > 0 && (
-				<directionalLight
-					color={preset.key.color}
-					intensity={preset.key.intensity}
-					position={at(preset.key.position)}
-				/>
-			)}
-			{preset.fill.intensity > 0 && (
-				<directionalLight
-					color={preset.fill.color}
-					intensity={preset.fill.intensity}
-					position={at(preset.fill.position)}
-				/>
-			)}
-			{preset.rim.intensity > 0 && (
-				<directionalLight
-					color={preset.rim.color}
-					intensity={preset.rim.intensity}
-					position={at(preset.rim.position)}
-				/>
+			<ambientLight intensity={ambient} />
+			<hemisphereLight args={[hemi.sky, hemi.ground, hemi.intensity]} />
+			{lights.map((l, i) =>
+				l.intensity > 0 ? (
+					<directionalLight
+						color={l.color}
+						intensity={l.intensity}
+						// biome-ignore lint/suspicious/noArrayIndexKey: fixed rig slots
+						key={i}
+						position={at(l.position)}
+					/>
+				) : null,
 			)}
 		</>
 	);
@@ -225,7 +225,83 @@ function StudioEnvironment({ preset }: { preset: LightingPreset }) {
 	);
 }
 
+/** Keeps the toon rim and outline uniforms in sync with the view. */
+function ShadingSync({ preset }: { preset: LightingPreset }) {
+	const gl = useThree((s) => s.gl);
+	const invalidate = useThree((s) => s.invalidate);
+	const size = React.useMemo(() => new Vector2(), []);
+	React.useEffect(() => {
+		shadingUniforms.rimColor.value.set(preset.toon.rim.color);
+		shadingUniforms.rimStrength.value = preset.toon.rim.strength;
+		invalidate();
+	}, [preset, invalidate]);
+	useFrame(() => {
+		gl.getDrawingBufferSize(size);
+		shadingUniforms.resolution.value.copy(size);
+		shadingUniforms.outlinePx.value = 1.25 * gl.getPixelRatio();
+	});
+	return null;
+}
+
+// ------------------------------------------------------------- floor
+
+let floorTexture: CanvasTexture | null = null;
+
+/** Radial alpha falloff with a faint ring near the rim. */
+function getFloorTexture(): CanvasTexture {
+	if (floorTexture) return floorTexture;
+	const canvas = document.createElement("canvas");
+	canvas.width = canvas.height = 256;
+	const ctx = canvas.getContext("2d");
+	if (ctx) {
+		const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+		g.addColorStop(0, "#ffffff");
+		g.addColorStop(0.45, "#e6e6e6");
+		g.addColorStop(0.84, "#2a2a2a");
+		g.addColorStop(0.9, "#3a3a3a");
+		g.addColorStop(0.915, "#5c5c5c");
+		g.addColorStop(0.93, "#262626");
+		g.addColorStop(1, "#000000");
+		ctx.fillStyle = g;
+		ctx.fillRect(0, 0, 256, 256);
+	}
+	floorTexture = new CanvasTexture(canvas);
+	return floorTexture;
+}
+
+function FloorDisc({
+	radius,
+	color,
+	opacity,
+}: {
+	radius: number;
+	color: string;
+	opacity: number;
+}) {
+	const texture = React.useMemo(getFloorTexture, []);
+	return (
+		<mesh
+			position={[0, -0.003 * radius, 0]}
+			raycast={() => {}}
+			renderOrder={-1}
+			rotation={[-Math.PI / 2, 0, 0]}
+		>
+			<circleGeometry args={[radius, 96]} />
+			<meshBasicMaterial
+				alphaMap={texture}
+				color={color}
+				depthWrite={false}
+				opacity={opacity}
+				toneMapped={false}
+				transparent
+			/>
+		</mesh>
+	);
+}
+
 // ------------------------------------------------------------- model
+
+let framingVersion = 0;
 
 function measure(object: Group): Framing {
 	object.updateMatrixWorld(true);
@@ -234,7 +310,12 @@ function measure(object: Group): Framing {
 		box.set(new Vector3(-0.5, 0, -0.5), new Vector3(0.5, 1, 0.5));
 	const size = box.getSize(new Vector3());
 	const center = box.getCenter(new Vector3());
-	return { center, size, radius: Math.max(size.length() / 2, 1e-3) };
+	return {
+		center,
+		size,
+		radius: Math.max(size.length() / 2, 1e-3),
+		version: ++framingVersion,
+	};
 }
 
 function frameCamera(
@@ -249,12 +330,14 @@ function frameCamera(
 	const depth = Math.max(size.x, size.z);
 	const fitH = size.y / 2 / Math.tan(vFov / 2);
 	const fitW = Math.max(size.x, size.z) / 2 / Math.tan(hFov / 2);
-	const distance = Math.max(fitH, fitW) * 1.22 + depth / 2;
-	camera.near = Math.max(radius / 500, 0.001);
-	camera.far = radius * 400;
+	const distance = Math.max(fitH, fitW) * 1.15 + depth / 2;
+	// Depth range sized to the model: close-ups stay crisp, no z-fighting.
+	camera.near = Math.max(radius * 0.01, 0.001);
+	camera.far = radius * 40;
 	camera.updateProjectionMatrix();
 	controls.minDistance = radius * 0.08;
 	controls.maxDistance = radius * 14;
+	shadingUniforms.outlineRef.value = distance;
 	const offset = new Vector3().setFromSphericalCoords(
 		distance,
 		DEFAULT_POLAR,
@@ -277,19 +360,40 @@ function frameCamera(
 
 interface MountProps {
 	model: LoadedModel | null;
-	zUp: boolean;
+	zUpMode: ZUpMode;
 	hiddenParts: ReadonlySet<string>;
 	wireframe: boolean;
+	shading: ShadingId;
+	outlines: boolean;
 	onFramed: (framing: Framing | null) => void;
 	onShown: (model: LoadedModel | null) => void;
 	controls: React.RefObject<CameraControls | null>;
 }
 
+const reducedMotion = () =>
+	typeof window !== "undefined" &&
+	window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/** Fades the canvas in so a freshly framed model never pops. */
+function fadeIn(canvas: HTMLCanvasElement): void {
+	if (reducedMotion()) return;
+	canvas.style.transition = "none";
+	canvas.style.opacity = "0";
+	requestAnimationFrame(() => {
+		requestAnimationFrame(() => {
+			canvas.style.transition = "opacity 280ms cubic-bezier(0.2, 0, 0, 1)";
+			canvas.style.opacity = "1";
+		});
+	});
+}
+
 function ModelMount({
 	model,
-	zUp,
+	zUpMode,
 	hiddenParts,
 	wireframe,
+	shading,
+	outlines,
 	onFramed,
 	onShown,
 	controls,
@@ -301,9 +405,12 @@ function ModelMount({
 	const outer = React.useRef<Group>(null);
 	const turn = React.useRef<Group>(null);
 	const [current, setCurrent] = React.useState<LoadedModel | null>(null);
-	const firstFrame = React.useRef(true);
+	const framed = React.useRef<LoadedModel | null>(null);
+	const look = React.useRef({ shading, outlines, wireframe });
+	look.current = { shading, outlines, wireframe };
 
-	// Pre-compile shaders off-screen, then swap the new model in.
+	// Pre-compile shaders off-screen (with the final materials), then swap
+	// the new model in.
 	React.useEffect(() => {
 		if (model === current) return;
 		if (!model) {
@@ -311,6 +418,8 @@ function ModelMount({
 			return;
 		}
 		let cancelled = false;
+		const l = look.current;
+		applyShading(model.content, l.shading, l.outlines, l.wireframe);
 		(gl as WebGLRenderer)
 			.compileAsync(model.content, camera, scene)
 			.catch(() => {})
@@ -331,16 +440,18 @@ function ModelMount({
 		};
 	}, [current]);
 
-	// Orientation, ground placement and framing.
+	// Orientation, ground placement and framing, all before the first paint.
 	React.useLayoutEffect(() => {
 		const o = outer.current;
 		const t = turn.current;
 		if (!o || !t) return;
 		if (!current) {
+			framed.current = null;
 			onFramed(null);
 			onShown(null);
 			return;
 		}
+		const zUp = zUpMode === "auto" ? current.detectedZUp : zUpMode === "on";
 		t.rotation.set(zUp ? -Math.PI / 2 : 0, 0, 0);
 		o.position.set(0, 0, 0);
 		const raw = measure(o);
@@ -352,11 +463,15 @@ function ModelMount({
 		const framing = measure(o);
 		onFramed(framing);
 		const c = controls.current;
-		if (c) frameCamera(c, camera, framing, !firstFrame.current);
-		firstFrame.current = false;
+		const swapped = framed.current !== current;
+		// A new model snaps into place behind a fade; re-orienting the same
+		// model glides.
+		if (c) frameCamera(c, camera, framing, !swapped);
+		if (swapped) fadeIn(gl.domElement);
+		framed.current = current;
 		invalidate();
 		onShown(current);
-	}, [current, zUp, camera, controls, invalidate, onFramed, onShown]);
+	}, [current, zUpMode, camera, controls, gl, invalidate, onFramed, onShown]);
 
 	React.useEffect(() => {
 		if (!current) return;
@@ -368,19 +483,9 @@ function ModelMount({
 
 	React.useEffect(() => {
 		if (!current) return;
-		current.content.traverse((node) => {
-			const mesh = node as Mesh;
-			if (!mesh.isMesh) return;
-			const mats = Array.isArray(mesh.material)
-				? mesh.material
-				: [mesh.material];
-			for (const m of mats) {
-				if (m && "wireframe" in m)
-					(m as { wireframe: boolean }).wireframe = wireframe;
-			}
-		});
+		applyShading(current.content, shading, outlines, wireframe);
 		invalidate();
-	}, [current, wireframe, invalidate]);
+	}, [current, shading, outlines, wireframe, invalidate]);
 
 	return (
 		<group ref={outer}>
@@ -506,7 +611,7 @@ function ControlsLock({
 
 export function Stage({
 	model,
-	zUp,
+	zUpMode,
 	hiddenParts,
 	prefs,
 	background,
@@ -523,6 +628,9 @@ export function Stage({
 	const preset = LIGHTING[prefs.lighting];
 	const radius = framing?.radius ?? 1;
 	const height = framing?.size.y ?? 1;
+	const footprint = framing
+		? Math.max(Math.hypot(framing.size.x, framing.size.z) * 0.5, height * 0.24)
+		: 1;
 	const animating = Boolean(animation);
 
 	const handleShown = React.useCallback(
@@ -561,29 +669,43 @@ export function Stage({
 			<RendererSettings exposure={prefs.exposure} />
 			<AdaptivePixelRatio cap={prefs.dprCap} />
 			{prefs.stats && <StatsProbe />}
-			<LightRig preset={preset} radius={radius} />
+			<LightRig
+				preset={preset}
+				radius={radius}
+				toon={prefs.shading === "toon"}
+			/>
 			<StudioEnvironment key={prefs.lighting} preset={preset} />
+			<ShadingSync preset={preset} />
 			<ModelMount
 				controls={controls}
 				hiddenParts={hiddenParts}
 				model={model}
 				onFramed={setFraming}
 				onShown={handleShown}
+				outlines={prefs.outlines}
+				shading={prefs.shading}
 				wireframe={prefs.wireframe}
-				zUp={zUp}
+				zUpMode={zUpMode}
 			/>
+			{prefs.floor && shown && framing && (
+				<FloorDisc
+					color={background.floor.color}
+					opacity={background.floor.opacity}
+					radius={footprint}
+				/>
+			)}
 			{shown?.rigged && prefs.skeleton && <Skeleton model={shown} />}
 			{prefs.groundShadow && shown && framing && (
 				<ContactShadows
-					blur={2.6}
-					color={background.dark ? "#000000" : "#1c1a2b"}
-					far={Math.max(height * 0.5, 0.25)}
+					blur={2.2}
+					color={background.dark ? "#000000" : "#2a2440"}
+					far={Math.max(height * 0.4, 0.2)}
 					frames={animating ? Number.POSITIVE_INFINITY : 1}
-					key={`${shown.key}:${zUp}:${visibilityKey}:${prefs.wireframe}`}
-					opacity={background.dark ? 0.7 : 0.45}
+					key={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}`}
+					opacity={background.dark ? 0.8 : 0.55}
 					position={[0, 0, 0]}
 					resolution={1024}
-					scale={radius * 4}
+					scale={footprint * 2.6}
 				/>
 			)}
 			{prefs.grid && (

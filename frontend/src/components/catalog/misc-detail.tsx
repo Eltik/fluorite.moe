@@ -25,6 +25,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	type FacilityDetail as Facility,
+	facilityTint,
+	humanizeCode,
 	type ItemDetail as Item,
 	KIND_SINGULAR,
 	type NpcDetail as Npc,
@@ -43,6 +45,7 @@ export function ItemDetail({
 	data,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Item>): React.ReactElement {
 	const groups = React.useMemo(() => {
 		const map = new Map<string, Item["obtainWays"]>();
@@ -60,13 +63,16 @@ export function ItemDetail({
 	return (
 		<DetailPage>
 			<DetailHero
-				actions={<GenderToggle onChange={onGenderChange} value={gender} />}
+				actions={
+					gendered && (
+						<GenderToggle onChange={onGenderChange} showLabel value={gender} />
+					)
+				}
 				chips={<InfoChip>{data.itemType.name}</InfoChip>}
 				icon={data.art.iconBig ?? data.art.icon}
 				kind="items"
 				name={data.name}
 				rarity={data.rarity}
-				subtitle={<span className="font-mono text-xs">{data.id}</span>}
 			/>
 			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
 				<div className="flex flex-col gap-4">
@@ -169,6 +175,7 @@ export function NpcDetail({
 	onTabChange,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Npc>): React.ReactElement {
 	const hasModel = Boolean(data.model?.rigged || data.model?.parts.length);
 	return (
@@ -176,7 +183,13 @@ export function NpcDetail({
 			<DetailHero
 				actions={
 					<>
-						<GenderToggle onChange={onGenderChange} value={gender} />
+						{gendered && (
+							<GenderToggle
+								onChange={onGenderChange}
+								showLabel
+								value={gender}
+							/>
+						)}
 						{hasModel && (
 							<Button
 								render={<Link {...studioLink("npcs", data.id)} />}
@@ -195,9 +208,9 @@ export function NpcDetail({
 						{data.faction && <InfoChip>{data.faction}</InfoChip>}
 					</>
 				}
+				icon={data.icon}
 				kind="npcs"
 				name={data.name}
-				subtitle={<span className="font-mono text-xs">{data.id}</span>}
 			/>
 			<DetailTabs
 				onTabChange={onTabChange}
@@ -243,7 +256,12 @@ export function NpcDetail({
 						value: "model",
 						label: "Model",
 						content: () => (
-							<ModelPanel id={data.id} kind="npcs" model={data.model} />
+							<ModelPanel
+								id={data.id}
+								kind="npcs"
+								model={data.model}
+								name={data.name}
+							/>
 						),
 					},
 				]}
@@ -258,17 +276,24 @@ export function FacilityDetail({
 	data,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Facility>): React.ReactElement {
 	const { range } = data;
+	const name = data.name === data.id ? humanizeCode(data.id) : data.name;
+	const type = humanizeCode(data.type);
 	return (
 		<DetailPage>
 			<DetailHero
-				actions={<GenderToggle onChange={onGenderChange} value={gender} />}
+				actions={
+					gendered && (
+						<GenderToggle onChange={onGenderChange} showLabel value={gender} />
+					)
+				}
 				art={data.art.image}
 				artClassName="object-contain object-right p-4"
 				chips={
 					<>
-						<InfoChip>{data.type}</InfoChip>
+						<InfoChip color={facilityTint(data.type)}>{type}</InfoChip>
 						<InfoChip>
 							{data.needPower ? (
 								<ZapIcon className="size-3.5" />
@@ -283,8 +308,7 @@ export function FacilityDetail({
 				}
 				icon={data.art.iconBig ?? data.art.icon}
 				kind="facilities"
-				name={data.name}
-				subtitle={<span className="font-mono text-xs">{data.id}</span>}
+				name={name}
 			/>
 			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
 				<div className="flex flex-col gap-4">
@@ -320,7 +344,7 @@ export function FacilityDetail({
 					</Section>
 					{Object.values(data.art).filter(Boolean).length > 0 && (
 						<Section title="Art">
-							<ArtGallery art={data.art} name={data.name} />
+							<ArtGallery art={data.art} name={name} />
 						</Section>
 					)}
 				</div>
@@ -328,7 +352,7 @@ export function FacilityDetail({
 					<Panel>
 						<Facts
 							items={[
-								{ label: "Type", value: data.type },
+								{ label: "Type", value: type },
 								{
 									label: "Power",
 									value: data.needPower ? (

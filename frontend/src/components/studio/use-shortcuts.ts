@@ -92,6 +92,11 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 				case "w":
 					setPrefs({ wireframe: !getPrefs().wireframe });
 					break;
+				case "t":
+					setPrefs({
+						shading: getPrefs().shading === "toon" ? "standard" : "toon",
+					});
+					break;
 				case " ":
 					if (!anim || e.target instanceof HTMLButtonElement) return;
 					anim.toggle();

@@ -6,3 +6,4 @@ backend/data/
 /tasks
 **/target/
 *.exe
+.playwright-mcp/

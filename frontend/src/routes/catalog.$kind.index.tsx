@@ -1,13 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { SearchXIcon } from "lucide-react";
+import {
+	ArrowDownWideNarrowIcon,
+	ArrowUpNarrowWideIcon,
+	SearchXIcon,
+} from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
 import {
 	CatalogFilters,
 	type Facet,
 } from "@/components/catalog/catalog-filters";
-import { CatalogGrid } from "@/components/catalog/catalog-grid";
+import { CatalogGrid, type GridItem } from "@/components/catalog/catalog-grid";
 import { PageHeader } from "@/components/page-header";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState } from "@/components/status-views";
@@ -31,6 +35,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import type { CatalogKind } from "@/lib/api";
 import {
 	catalogListQuery,
+	facilityTint,
+	humanizeCode,
+	itemTypeRank,
 	KIND_LABELS,
 	type ListItem,
 	loaderLanguage,
@@ -41,12 +48,27 @@ import { useSettings } from "@/lib/settings";
 
 const SORTS = ["default", "name", "rarity", "id"] as const;
 type Sort = (typeof SORTS)[number];
+type Dir = "asc" | "desc";
 
-const SORT_LABELS: Record<Sort, string> = {
-	default: "Default order",
-	name: "Name",
-	rarity: "Rarity",
-	id: "ID",
+function sortLabel(sort: Sort, kind: CatalogKind): string {
+	switch (sort) {
+		case "default":
+			return kind === "items" ? "Type, then rarity" : "Game order";
+		case "name":
+			return "Name";
+		case "rarity":
+			return "Rarity";
+		case "id":
+			return "ID";
+	}
+}
+
+/** The direction each sort reads naturally in. */
+const NATURAL_DIR: Record<Sort, Dir> = {
+	default: "asc",
+	name: "asc",
+	rarity: "desc",
+	id: "asc",
 };
 
 const searchSchema = z.object({
@@ -56,6 +78,7 @@ const searchSchema = z.object({
 	/** Comma-separated rarities. */
 	rarity: searchText,
 	sort: z.enum(SORTS).optional().catch(undefined),
+	dir: z.enum(["asc", "desc"]).optional().catch(undefined),
 });
 
 export const Route = createFileRoute("/catalog/$kind/")({
@@ -81,6 +104,13 @@ export const Route = createFileRoute("/catalog/$kind/")({
 
 const getScroller = () => document.getElementById("content");
 
+function dirLabel(sort: Sort, dir: Dir): string {
+	if (sort === "name" || sort === "id") return dir === "asc" ? "A–Z" : "Z–A";
+	if (sort === "rarity")
+		return dir === "desc" ? "Highest first" : "Lowest first";
+	return dir === "asc" ? "Default" : "Reversed";
+}
+
 function splitList(value: string | undefined): string[] {
 	return value ? value.split(",").filter(Boolean) : [];
 }
@@ -102,7 +132,27 @@ function CatalogListPage(): React.ReactElement {
 			prevQuery?.queryKey[1] === kind ? prev : undefined,
 	});
 	const label = KIND_LABELS[kind];
-	const all = query.data?.items;
+	// "NPCs" stays an acronym in running text.
+	const lower = kind === "npcs" ? label : label.toLowerCase();
+	const raw = query.data?.items;
+	// Facilities without a localized name fall back to their id, and their
+	// types are raw codes; make both readable and tint by category.
+	const all = React.useMemo<GridItem[] | undefined>(() => {
+		if (!raw || kind !== "facilities") return raw;
+		return raw.map((item) => {
+			const type = item.tags.find((t) => t.kind === "buildingType");
+			return {
+				...item,
+				name: item.name === item.id ? humanizeCode(item.id) : item.name,
+				tags: item.tags.map((t) =>
+					t.kind === "buildingType" && t.name === t.code
+						? { ...t, name: humanizeCode(t.code) }
+						: t,
+				),
+				tint: facilityTint(type?.code),
+			};
+		});
+	}, [raw, kind]);
 
 	const selectedTags = React.useMemo(
 		() => new Set(splitList(search.tags)),
@@ -114,11 +164,64 @@ function CatalogListPage(): React.ReactElement {
 	);
 	const sort: Sort = search.sort ?? "default";
 
+	const dir: Dir = search.dir ?? NATURAL_DIR[sort];
+
+	const tagGroups = React.useMemo(() => {
+		const groups = new Map<string, Set<string>>();
+		for (const key of selectedTags) {
+			const i = key.indexOf(":");
+			const tagKind = key.slice(0, i);
+			const set = groups.get(tagKind) ?? new Set<string>();
+			// A chip can stand for several codes sharing one name (`a|b`).
+			for (const code of key.slice(i + 1).split("|")) set.add(code);
+			groups.set(tagKind, set);
+		}
+		return groups;
+	}, [selectedTags]);
+
+	const deferredQ = React.useDeferredValue(search.q ?? "");
+	const tokens = React.useMemo(
+		() => deferredQ.trim().toLowerCase().split(/\s+/).filter(Boolean),
+		[deferredQ],
+	);
+
+	/** Whether `item` passes every active filter except the one named `skip`. */
+	const passes = React.useCallback(
+		(item: ListItem, skip?: string) => {
+			if (
+				skip !== "rarity" &&
+				selectedRarities.size &&
+				!selectedRarities.has(item.rarity ?? 0)
+			)
+				return false;
+			for (const [tagKind, codes] of tagGroups) {
+				if (tagKind === skip) continue;
+				if (!item.tags.some((t) => t.kind === tagKind && codes.has(t.code)))
+					return false;
+			}
+			if (tokens.length) {
+				const hay = `${item.name} ${item.id}`.toLowerCase();
+				if (!tokens.every((t) => hay.includes(t))) return false;
+			}
+			return true;
+		},
+		[selectedRarities, tagGroups, tokens],
+	);
+
+	/** Item-type sizes, used to rank the types the order list does not name. */
+	const typeCounts = React.useMemo(() => {
+		const counts = new Map<string, number>();
+		for (const t of query.data?.types ?? []) counts.set(t.code, t.count);
+		return counts;
+	}, [query.data?.types]);
+
+	// Facet values keep a stable order (by overall size, or by browse order for
+	// item types); counts reflect the other active filters.
 	const facets = React.useMemo<Facet[]>(() => {
 		if (!all) return [];
 		const byKind = new Map<
 			string,
-			Map<string, { name: string; count: number }>
+			Map<string, { name: string; total: number; count: number }>
 		>();
 		for (const item of all) {
 			for (const tag of item.tags) {
@@ -128,17 +231,59 @@ function CatalogListPage(): React.ReactElement {
 					byKind.set(tag.kind, values);
 				}
 				const entry = values.get(tag.code);
-				if (entry) entry.count++;
-				else values.set(tag.code, { name: tag.name || tag.code, count: 1 });
+				if (entry) entry.total++;
+				else
+					values.set(tag.code, {
+						name: tag.name || tag.code,
+						total: 1,
+						count: 0,
+					});
 			}
 		}
-		return [...byKind].map(([tagKind, values]) => ({
-			kind: tagKind,
-			values: [...values]
-				.map(([code, v]) => ({ code, name: v.name, count: v.count }))
-				.sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
-		}));
-	}, [all]);
+		for (const [tagKind, values] of byKind) {
+			for (const item of all) {
+				if (!passes(item, tagKind)) continue;
+				for (const tag of item.tags) {
+					if (tag.kind !== tagKind) continue;
+					const entry = values.get(tag.code);
+					if (entry) entry.count++;
+				}
+			}
+		}
+		return [...byKind].map(([tagKind, values]) => {
+			// Different codes can resolve to one name (NPC factions and titles are
+			// per-character text keys); merge them into one chip.
+			const byName = new Map<
+				string,
+				{ codes: string[]; name: string; count: number; total: number }
+			>();
+			for (const [code, v] of values) {
+				const merged = byName.get(v.name);
+				if (merged) {
+					merged.codes.push(code);
+					merged.count += v.count;
+					merged.total += v.total;
+				} else byName.set(v.name, { codes: [code], ...v });
+			}
+			return {
+				kind: tagKind,
+				values: [...byName.values()]
+					.map((v) => ({
+						code: v.codes.join("|"),
+						name: v.name,
+						count: v.count,
+						total: v.total,
+					}))
+					.sort((a, b) =>
+						tagKind === "itemType"
+							? itemTypeRank(a.code.split("|")[0], typeCounts) -
+									itemTypeRank(b.code.split("|")[0], typeCounts) ||
+								a.name.localeCompare(b.name)
+							: b.total - a.total || a.name.localeCompare(b.name),
+					),
+			};
+		});
+	}, [all, passes, typeCounts]);
 
 	const rarities = React.useMemo(() => {
 		if (!all) return [];
@@ -147,40 +292,66 @@ function CatalogListPage(): React.ReactElement {
 		return [...set].sort((a, b) => b - a);
 	}, [all]);
 
-	const deferredQ = React.useDeferredValue(search.q ?? "");
-	const items = React.useMemo<ListItem[]>(() => {
-		if (!all) return [];
-		const tokens = deferredQ.trim().toLowerCase().split(/\s+/).filter(Boolean);
-		const tagGroups = new Map<string, Set<string>>();
-		for (const key of selectedTags) {
-			const i = key.indexOf(":");
-			const tagKind = key.slice(0, i);
-			const set = tagGroups.get(tagKind) ?? new Set<string>();
-			set.add(key.slice(i + 1));
-			tagGroups.set(tagKind, set);
+	const rarityCounts = React.useMemo(() => {
+		const counts = new Map<number, number>();
+		for (const item of all ?? []) {
+			if (!item.rarity || !passes(item, "rarity")) continue;
+			counts.set(item.rarity, (counts.get(item.rarity) ?? 0) + 1);
 		}
-		const out = all.filter((item) => {
-			if (selectedRarities.size && !selectedRarities.has(item.rarity ?? 0))
-				return false;
-			for (const [tagKind, codes] of tagGroups) {
-				if (!item.tags.some((t) => t.kind === tagKind && codes.has(t.code)))
-					return false;
+		return counts;
+	}, [all, passes]);
+
+	const matched = React.useMemo<ListItem[]>(
+		() => (all ? all.filter((item) => passes(item)) : []),
+		[all, passes],
+	);
+
+	const items = React.useMemo<GridItem[]>(() => {
+		let out: GridItem[] = matched;
+		// Numbered series (`achv_…_1`, `_2`, `_3` with one name) collapse into
+		// their first tier, unless the user is searching for a specific one.
+		if (kind === "items" && tokens.length === 0) {
+			const heads = new Map<string, GridItem>();
+			const collapsed: GridItem[] = [];
+			for (const item of matched) {
+				const stem = item.id.replace(/_\d+$/, "");
+				if (stem === item.id) {
+					collapsed.push(item);
+					continue;
+				}
+				const key = `${stem}\u0000${item.name}`;
+				const head = heads.get(key);
+				if (head) head.series = (head.series ?? 1) + 1;
+				else {
+					const copy: GridItem = { ...item, series: 1 };
+					heads.set(key, copy);
+					collapsed.push(copy);
+				}
 			}
-			if (tokens.length) {
-				const hay = `${item.name} ${item.id}`.toLowerCase();
-				if (!tokens.every((t) => hay.includes(t))) return false;
-			}
-			return true;
-		});
-		if (sort === "name") out.sort((a, b) => a.name.localeCompare(b.name));
+			out = collapsed;
+		} else {
+			out = [...matched];
+		}
+		const byName = (a: ListItem, b: ListItem) => a.name.localeCompare(b.name);
+		const byRarity = (a: ListItem, b: ListItem) =>
+			(b.rarity ?? 0) - (a.rarity ?? 0);
+		const typeOf = (item: ListItem) =>
+			item.tags.find((t) => t.kind === "itemType")?.code;
+		if (sort === "name") out.sort(byName);
 		else if (sort === "id") out.sort((a, b) => a.id.localeCompare(b.id));
 		else if (sort === "rarity")
+			out.sort((a, b) => byRarity(a, b) || byName(a, b));
+		else if (kind === "items")
 			out.sort(
 				(a, b) =>
-					(b.rarity ?? 0) - (a.rarity ?? 0) || a.name.localeCompare(b.name),
+					itemTypeRank(typeOf(a), typeCounts) -
+						itemTypeRank(typeOf(b), typeCounts) ||
+					byRarity(a, b) ||
+					byName(a, b),
 			);
+		if (dir !== NATURAL_DIR[sort]) out.reverse();
 		return out;
-	}, [all, deferredQ, selectedTags, selectedRarities, sort]);
+	}, [matched, kind, tokens.length, sort, dir, typeCounts]);
 
 	const setSearch = (patch: Partial<z.infer<typeof searchSchema>>) =>
 		void navigate({
@@ -204,12 +375,14 @@ function CatalogListPage(): React.ReactElement {
 		});
 	};
 	const filtered = Boolean(search.q || search.tags || search.rarity);
+	const collapsedCount = matched.length - items.length;
 	const clear = () =>
 		setSearch({ q: undefined, tags: undefined, rarity: undefined });
 
 	const sortItems = SORTS.filter(
 		(s) => s !== "rarity" || rarities.length > 1,
-	).map((s) => ({ value: s, label: SORT_LABELS[s] }));
+	).map((s) => ({ value: s, label: sortLabel(s, kind) }));
+	const reversed = dir !== NATURAL_DIR[sort];
 
 	return (
 		<div className="mx-auto flex w-full max-w-7xl flex-col gap-5 p-4 md:p-6 lg:p-8">
@@ -217,8 +390,8 @@ function CatalogListPage(): React.ReactElement {
 				description={
 					all
 						? filtered
-							? `${items.length.toLocaleString()} of ${all.length.toLocaleString()} ${label.toLowerCase()}`
-							: `${all.length.toLocaleString()} ${label.toLowerCase()} · text in ${query.data?.lang ?? textLanguage}`
+							? `${matched.length.toLocaleString()} of ${all.length.toLocaleString()} ${lower}${collapsedCount > 0 ? ` · numbered series grouped into ${items.length.toLocaleString()} cards` : ""}`
+							: `${all.length.toLocaleString()} ${lower} · text in ${query.data?.lang ?? textLanguage}${collapsedCount > 0 ? ` · numbered series grouped into ${items.length.toLocaleString()} cards` : ""}`
 						: "Mapped from the game tables with resolved names."
 				}
 				title={label}
@@ -234,7 +407,7 @@ function CatalogListPage(): React.ReactElement {
 								className="min-w-0 flex-1 sm:max-w-sm"
 								label={`Search ${label}`}
 								onCommit={(value) => setSearch({ q: value || undefined })}
-								placeholder={`Search ${label.toLowerCase()} by name or id…`}
+								placeholder={`Search ${lower} by name or id…`}
 								value={search.q ?? ""}
 							/>
 							<Select
@@ -242,6 +415,7 @@ function CatalogListPage(): React.ReactElement {
 								onValueChange={(value) =>
 									setSearch({
 										sort: value === "default" ? undefined : (value as Sort),
+										dir: undefined,
 									})
 								}
 								value={sort}
@@ -261,12 +435,33 @@ function CatalogListPage(): React.ReactElement {
 									))}
 								</SelectPopup>
 							</Select>
+							<Button
+								aria-label={`Sort direction: ${dirLabel(sort, dir)}. Click to reverse.`}
+								onClick={() =>
+									setSearch({
+										dir: reversed ? undefined : dir === "asc" ? "desc" : "asc",
+									})
+								}
+								size={sort === "default" ? "icon-sm" : "sm"}
+								title="Reverse the order"
+								variant="outline"
+							>
+								{dir === "asc" ? (
+									<ArrowUpNarrowWideIcon />
+								) : (
+									<ArrowDownWideNarrowIcon />
+								)}
+								{sort !== "default" && (
+									<span className="max-sm:sr-only">{dirLabel(sort, dir)}</span>
+								)}
+							</Button>
 						</div>
 						{all ? (
 							<CatalogFilters
 								facets={facets}
 								onClear={search.tags || search.rarity ? clear : undefined}
 								onToggleRarity={toggleRarity}
+								rarityCounts={rarityCounts}
 								onToggleTag={toggleTag}
 								rarities={rarities}
 								selected={selectedTags}
@@ -298,7 +493,7 @@ function CatalogListPage(): React.ReactElement {
 								<EmptyMedia variant="icon">
 									<SearchXIcon />
 								</EmptyMedia>
-								<EmptyTitle>No {label.toLowerCase()} match</EmptyTitle>
+								<EmptyTitle>No {lower} match</EmptyTitle>
 								<EmptyDescription>
 									{search.q
 										? `Nothing matches “${search.q}” with the current filters.`

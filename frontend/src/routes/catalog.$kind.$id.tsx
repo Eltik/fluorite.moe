@@ -94,6 +94,19 @@ function EntityPage(): React.ReactElement {
 				: undefined,
 	});
 
+	// The toggle only matters when the text has {F}/{M} variants; fetch the
+	// other variant (cached, so switching is instant) and compare.
+	const otherGender: Gender = gender === "f" ? "m" : "f";
+	const other = useQuery({
+		...entityQuery(kind, id, textLanguage, otherGender),
+		enabled: Boolean(query.data) && !query.isPlaceholderData,
+	});
+	const gendered = React.useMemo(() => {
+		if (gender === "m") return true;
+		if (!query.data || !other.data) return false;
+		return JSON.stringify(query.data) !== JSON.stringify(other.data);
+	}, [gender, query.data, other.data]);
+
 	const onTabChange = React.useCallback(
 		(tab: string) =>
 			void navigate({
@@ -137,6 +150,7 @@ function EntityPage(): React.ReactElement {
 					data={data}
 					key={`${kind}/${id}`}
 					gender={gender}
+					gendered={gendered}
 					onGenderChange={onGenderChange}
 					onTabChange={onTabChange}
 					tab={search.tab}

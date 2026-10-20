@@ -3,7 +3,7 @@ import { cn } from "@/lib/utils";
 
 const W = 640;
 const H = 200;
-const PAD = { top: 14, right: 14, bottom: 26, left: 46 };
+const PAD = { top: 26, right: 16, bottom: 28, left: 52 };
 
 function niceTicks(min: number, max: number, count = 4): number[] {
 	if (min === max) return [min];
@@ -37,8 +37,10 @@ export function LineChart({
 	cursor,
 	onSelect,
 	markers = [],
+	markerLabels,
 	label,
 	formatValue = compactNumber,
+	formatX = (v) => `Lv ${v}`,
 	className,
 }: {
 	x: number[];
@@ -46,6 +48,10 @@ export function LineChart({
 	cursor?: number;
 	onSelect?: (index: number) => void;
 	markers?: number[];
+	/** Short labels drawn at the top of each marker (same order as `markers`). */
+	markerLabels?: string[];
+	/** Label of an x value in the hover readout. */
+	formatX?: (v: number) => string;
 	label: string;
 	formatValue?: (v: number) => string;
 	className?: string;
@@ -126,14 +132,14 @@ export function LineChart({
 			{ticks.map((t) => (
 				<g key={t}>
 					<line
-						className="stroke-border"
+						className="stroke-border/70"
 						x1={PAD.left}
 						x2={W - PAD.right}
 						y1={py(t)}
 						y2={py(t)}
 					/>
 					<text
-						className="fill-muted-foreground text-[11px] tabular-nums"
+						className="fill-foreground/70 text-[12px] tabular-nums"
 						dominantBaseline="middle"
 						textAnchor="end"
 						x={PAD.left - 8}
@@ -143,20 +149,31 @@ export function LineChart({
 					</text>
 				</g>
 			))}
-			{markers.map((m) => (
-				<line
-					className="stroke-muted-foreground/40"
-					key={m}
-					strokeDasharray="3 4"
-					x1={px(m)}
-					x2={px(m)}
-					y1={PAD.top}
-					y2={PAD.top + innerH}
-				/>
+			{markers.map((m, i) => (
+				<g key={m}>
+					<line
+						className="stroke-foreground/35"
+						strokeDasharray="3 4"
+						x1={px(m)}
+						x2={px(m)}
+						y1={PAD.top - 4}
+						y2={PAD.top + innerH}
+					/>
+					{markerLabels?.[i] && (
+						<text
+							className="fill-foreground/70 text-[11px] tabular-nums"
+							textAnchor="middle"
+							x={px(m)}
+							y={PAD.top - 9}
+						>
+							{markerLabels[i]}
+						</text>
+					)}
+				</g>
 			))}
 			{xTickIdx.map((i) => (
 				<text
-					className="fill-muted-foreground text-[11px] tabular-nums"
+					className="fill-foreground/70 text-[12px] tabular-nums"
 					key={i}
 					textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}
 					x={px(i)}
@@ -191,6 +208,36 @@ export function LineChart({
 						stroke="currentColor"
 						strokeWidth={2.5}
 					/>
+					{(() => {
+						const text = `${formatX(x[cursor as number] as number)} · ${formatValue(y[cursor as number] as number)}`;
+						const w = text.length * 6.6 + 16;
+						const left = Math.max(
+							PAD.left,
+							Math.min(W - PAD.right - w, cx - w / 2),
+						);
+						const top = cy - 34 < PAD.top - 2 ? cy + 12 : cy - 34;
+						return (
+							<g aria-hidden pointerEvents="none">
+								<rect
+									className="fill-popover stroke-border"
+									height={22}
+									rx={6}
+									width={w}
+									x={left}
+									y={top}
+								/>
+								<text
+									className="fill-popover-foreground font-medium text-[12px] tabular-nums"
+									dominantBaseline="central"
+									textAnchor="middle"
+									x={left + w / 2}
+									y={top + 11}
+								>
+									{text}
+								</text>
+							</g>
+						);
+					})()}
 				</g>
 			)}
 		</svg>

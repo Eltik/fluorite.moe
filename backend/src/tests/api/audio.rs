@@ -142,6 +142,23 @@ async fn entries_filter_and_page() {
     assert!(v["entries"][0].get("audio").is_none());
     assert_eq!(v["entries"][0]["codec"], "bank");
 
+    // `playable=true` drops soundbank refs (no media) and keeps the rest.
+    let all = body_json(get(&app, "/api/audio/entries").await).await;
+    let banks = v["total"].as_u64().unwrap();
+    assert!(banks > 0);
+    let v = body_json(get(&app, "/api/audio/entries?playable=true").await).await;
+    assert_eq!(
+        v["total"].as_u64().unwrap(),
+        all["total"].as_u64().unwrap() - banks
+    );
+    assert!(
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["kind"] != "bank" && e.get("audio").is_some())
+    );
+
     assert_eq!(
         get(&app, "/api/audio/entries?pack=nope").await.status(),
         StatusCode::NOT_FOUND

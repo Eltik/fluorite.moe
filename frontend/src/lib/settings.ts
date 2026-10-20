@@ -54,6 +54,28 @@ function snapshot(): Settings {
 	return current;
 }
 
+/** BCP-47 tags for the game's text languages (`html[lang]` follows the text). */
+export const LANGUAGE_TAGS: Record<string, string> = {
+	EN: "en",
+	CN: "zh-Hans",
+	TC: "zh-Hant",
+	JP: "ja",
+	KR: "ko",
+	BR: "pt-BR",
+	DE: "de",
+	FR: "fr",
+	ID: "id",
+	IT: "it",
+	MX: "es-MX",
+	RU: "ru",
+	TH: "th",
+	VN: "vi",
+};
+
+export function languageTag(code: string): string {
+	return LANGUAGE_TAGS[code] ?? "en";
+}
+
 function prefersDark(): boolean {
 	return window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
@@ -69,6 +91,7 @@ function apply(settings: Settings): void {
 	root.classList.toggle("dark", dark);
 	root.style.colorScheme = dark ? "dark" : "light";
 	root.dataset.density = settings.density;
+	root.lang = languageTag(settings.textLanguage);
 }
 
 export function updateSettings(patch: Partial<Settings>): void {
@@ -120,4 +143,6 @@ export function useRowHeight(): number {
  */
 export const PREHYDRATION_SCRIPT = `(function(){try{var s=JSON.parse(localStorage.getItem(${JSON.stringify(
 	SETTINGS_KEY,
-)})||"{}");var t=s.theme;var d=t==="dark"||((!t||t==="system")&&matchMedia("(prefers-color-scheme: dark)").matches);var r=document.documentElement;if(d)r.classList.add("dark");r.style.colorScheme=d?"dark":"light";r.dataset.density=s.density==="compact"?"compact":"comfortable";}catch(e){}})();`;
+)})||"{}");var t=s.theme;var d=t==="dark"||((!t||t==="system")&&matchMedia("(prefers-color-scheme: dark)").matches);var r=document.documentElement;if(d)r.classList.add("dark");r.style.colorScheme=d?"dark":"light";r.dataset.density=s.density==="compact"?"compact":"comfortable";var l=${JSON.stringify(
+	LANGUAGE_TAGS,
+)}[s.textLanguage];if(l)r.lang=l;}catch(e){}})();`;

@@ -265,6 +265,8 @@ export interface ItemDetail extends DetailBase {
 
 export interface NpcDetail extends DetailBase {
 	kind: "npcs";
+	/** Portrait under the `textures` root, when the game ships one. */
+	icon?: string | null;
 	title?: string | null;
 	faction?: string | null;
 	dataKey?: string | null;
@@ -454,6 +456,177 @@ export function sortAttrs(codes: string[]): string[] {
 		}
 		return a.localeCompare(b);
 	});
+}
+
+// ---------------------------------------------------------------- tag icons
+
+const SPRITES = "beyond/dynamicassets/gameplay/ui/sprites";
+
+const PROFESSION_ICON: Record<string, number> = {
+	GUARD: 0,
+	DEFENDER: 2,
+	SUPPORTER: 4,
+	CASTER: 5,
+	VANGUARD: 7,
+	ASSAULT: 8,
+};
+
+const ELEMENT_ICON: Record<string, string> = {
+	Physical: "physical",
+	Fire: "fire",
+	Natural: "nature",
+	Cryst: "cold",
+	Pulse: "pulse",
+};
+
+const WEAPON_TYPE_ICON: Record<string, string> = {
+	Sword: "01",
+	Wand: "02",
+	Claymores: "03",
+	Lance: "05",
+	Pistol: "06",
+};
+
+/**
+ * Game sprite (under the `textures` root) for a class / element / weapon-type
+ * tag, so cards can show the glyph instead of a truncated word. The sprites
+ * are single-colour silhouettes; render them as a mask in `currentColor`.
+ */
+export function tagIcon(tag: { kind: string; code: string }): string | null {
+	switch (tag.kind) {
+		case "profession": {
+			const n = PROFESSION_ICON[tag.code];
+			return n === undefined
+				? null
+				: `${SPRITES}/charprofessionicon/icon_profession_${n}.png`;
+		}
+		case "element": {
+			const file = ELEMENT_ICON[tag.code];
+			return file
+				? `${SPRITES}/elementicon/icon_charattrtype_${file}.png`
+				: null;
+		}
+		case "weaponType": {
+			const n = WEAPON_TYPE_ICON[tag.code];
+			return n ? `${SPRITES}/weaponexhibit/icon_weapontype_${n}.png` : null;
+		}
+		default:
+			return null;
+	}
+}
+
+/** Element accent colours (game palette), keyed by element code. */
+export const ELEMENT_COLORS: Record<string, string> = {
+	Physical: "#888888",
+	Fire: "#FF623D",
+	Pulse: "#FFC000",
+	Cryst: "#21C6D0",
+	Natural: "#9EDC23",
+};
+
+/**
+ * Variant of an entity that shares its name with another one (the two
+ * Endministrators): `m` / `f`, from the id suffix.
+ */
+export function entityVariant(id: string): Gender | null {
+	const m = /_endmin([mf])$/.exec(id);
+	return m ? (m[1] as Gender) : null;
+}
+
+/** Whether a page's text can differ by Endministrator gender ({F}/{M}). */
+export function hasGenderedText(id: string): boolean {
+	return entityVariant(id) !== null || /endmin/i.test(id);
+}
+
+/** `ENDFIELD INDUSTRIES` → `Endfield Industries`; leaves mixed-case text alone. */
+export function titleCaseShouting(text: string): string {
+	if (!/[A-Z]/.test(text) || text !== text.toUpperCase()) return text;
+	return text
+		.toLowerCase()
+		.replace(
+			/(^|[\s\-/(])(\p{L})/gu,
+			(_, sep: string, c: string) => `${sep}${c.toUpperCase()}`,
+		);
+}
+
+/** `MachineCrafter` / `battle_cannon_1` → `Machine Crafter` / `Battle cannon 1`. */
+export function humanizeCode(code: string): string {
+	const words = code
+		.replace(/([a-z])([A-Z])/g, "$1 $2")
+		.replace(/[_-]+/g, " ")
+		.trim();
+	return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** Facility category tints, by building type prefix. */
+const FACILITY_TINTS: [RegExp, string][] = [
+	[/^Battle/, "#e5484d"],
+	[/^Power|^TravelPole|^Hub|^SubHub/, "#f5a524"],
+	[/^Fluid|^VirtualFluid|^Sewage|^UdPipe/, "#3e9bf5"],
+	[/^Soil|^Seed|^EnvGen/, "#46a758"],
+	[/^Decorate|^Sign/, "#d6409f"],
+	[/^Machine|^Miner|^GasMiner/, "#f76b15"],
+	[/^Storager|^Loader|^Unloader|^Bus|^Deposit/, "#8e4ec6"],
+];
+
+export function facilityTint(type: string | undefined): string {
+	if (type)
+		for (const [re, color] of FACILITY_TINTS) if (re.test(type)) return color;
+	return "#7c8494";
+}
+
+// ---------------------------------------------------------------- item order
+
+/**
+ * Item types in the order a player browses them; anything unlisted sorts
+ * between `FIRST` and `LAST` by size. Collectibles and cosmetics go last.
+ */
+const ITEM_TYPE_FIRST = [
+	"Material",
+	"Weapon",
+	"Equip",
+	"WeaponGem",
+	"ConsumableItem",
+	"APItem",
+	"TacticalItem",
+	"CharPotentialUp",
+	"Char",
+	"Gift",
+	"Seed",
+	"NormalBuilding",
+	"FuncBuilding",
+	"Blueprint",
+	"SysBluePrint",
+	"EquipFormula",
+	"FormulaUnlock",
+	"FormulaLevelUp",
+	"ItemCase",
+	"InnManagementDish",
+	"InnManagementRecipe",
+	"MissionItem",
+];
+const ITEM_TYPE_LAST = [
+	"PhotoSticker",
+	"PhotoAnim",
+	"PhotoFilter",
+	"BusinessCardTopic",
+	"UserAvatarFrame",
+	"UserAvatar",
+	"UnlockCharPicture",
+	"AchievementItem",
+];
+
+/** Sort rank of an item type code (lower first); `counts` breaks ties. */
+export function itemTypeRank(
+	code: string | undefined,
+	counts?: Map<string, number>,
+): number {
+	if (!code) return 5000;
+	const first = ITEM_TYPE_FIRST.indexOf(code);
+	if (first !== -1) return first;
+	const last = ITEM_TYPE_LAST.indexOf(code);
+	if (last !== -1) return 10_000 + last;
+	return 1000 - Math.min(999, counts?.get(code) ?? 0);
 }
 
 /** Rarity accent colours (game palette). */

@@ -1,6 +1,11 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { AudioLinesIcon, RepeatIcon, SearchXIcon } from "lucide-react";
+import {
+	AudioLinesIcon,
+	RepeatIcon,
+	RotateCcwIcon,
+	SearchXIcon,
+} from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
 import { audioEngine, useAudioState } from "@/components/audio/engine";
@@ -15,8 +20,10 @@ import { PageHeader } from "@/components/page-header";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState, ListSkeleton } from "@/components/status-views";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import {
 	Empty,
+	EmptyContent,
 	EmptyDescription,
 	EmptyHeader,
 	EmptyMedia,
@@ -44,17 +51,33 @@ import { formatNumber } from "@/lib/format";
 import { pageTitle } from "@/lib/route-meta";
 
 const KINDS = ["stream", "external", "bank"] as const;
-const KIND_LABELS: Record<AudioKind | "all", string> = {
-	all: "All kinds",
+/** No `kind` in the URL means "playable": everything except soundbank refs. */
+type KindFilter = AudioKind | "all" | "playable";
+const KIND_OPTIONS: KindFilter[] = [
+	"playable",
+	"stream",
+	"external",
+	"bank",
+	"all",
+];
+const KIND_LABELS: Record<KindFilter, string> = {
+	playable: "Playable",
 	stream: "Sound & music",
 	external: "Voice lines",
-	bank: "Soundbanks",
+	bank: "Soundbanks (no media)",
+	all: "Everything",
 };
+
+/** Skeleton this long means something is wrong; offer a retry. */
+const STALL_MS = 6000;
 
 const searchSchema = z.object({
 	pack: z.string().optional().catch(undefined),
 	lang: z.string().optional().catch(undefined),
-	kind: z.enum(KINDS).optional().catch(undefined),
+	kind: z
+		.enum([...KINDS, "all"])
+		.optional()
+		.catch(undefined),
 	q: z.string().optional().catch(undefined),
 });
 
@@ -76,6 +99,19 @@ function isTypingTarget(target: EventTarget | null): boolean {
 	);
 }
 
+/** True once `active` has stayed true for `ms` (restarted when `key` changes). */
+function useStalled(active: boolean, ms: number, key: string): boolean {
+	const [stalled, setStalled] = React.useState(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: restart per key
+	React.useEffect(() => {
+		setStalled(false);
+		if (!active) return;
+		const t = setTimeout(() => setStalled(true), ms);
+		return () => clearTimeout(t);
+	}, [active, ms, key]);
+	return stalled;
+}
+
 function AudioPage(): React.ReactElement {
 	const search = Route.useSearch();
 	const navigate = Route.useNavigate();
@@ -86,10 +122,12 @@ function AudioPage(): React.ReactElement {
 		});
 
 	const summary = useQuery(audioSummaryQuery());
+	const kind = search.kind === "all" ? undefined : search.kind;
 	const filters: AudioFilters = {
 		pack: search.pack,
 		lang: search.lang,
-		kind: search.kind,
+		kind,
+		playable: search.kind === undefined ? true : undefined,
 		q: search.q?.trim() || undefined,
 	};
 	const list = useInfiniteQuery(audioEntriesQuery(filters));
@@ -114,6 +152,7 @@ function AudioPage(): React.ReactElement {
 
 	// A new filter starts the cursor over.
 	const filterKey = JSON.stringify(filters);
+	const stalled = useStalled(list.isPending, STALL_MS, filterKey);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset on filter change only
 	React.useEffect(() => setSelected(-1), [filterKey]);
 
@@ -122,7 +161,18 @@ function AudioPage(): React.ReactElement {
 			const e = entries[index];
 			if (!e) return;
 			setSelected(index);
-			if (!e.audio) return;
+			if (!e.audio) {
+				audioEngine.unavailable(
+					{
+						key: entryKey(e),
+						src: "",
+						title: entryTitle(e),
+						subtitle: entrySubtitle(e),
+					},
+					"Soundbank reference: no decoded media to play",
+				);
+				return;
+			}
 			audioEngine.play({
 				key: entryKey(e),
 				src: e.audio,
@@ -160,8 +210,13 @@ function AudioPage(): React.ReactElement {
 			switch (event.key) {
 				case " ":
 				case "k":
-					if (s.track) audioEngine.toggle();
-					else playAt(Math.max(0, selected));
+					if (s.track && s.status !== "error") audioEngine.toggle();
+					else {
+						// First playable entry at or after the cursor.
+						let i = Math.max(0, selected);
+						while (i < entries.length && !entries[i]?.audio) i++;
+						playAt(i < entries.length ? i : Math.max(0, selected));
+					}
 					break;
 				case "n":
 				case "N":
@@ -197,19 +252,23 @@ function AudioPage(): React.ReactElement {
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [entries.length, selected, playAt, step]);
+	}, [entries, selected, playAt, step]);
 
 	const data = summary.data;
 	const packItems = [
 		{ value: "all", label: "All packs" },
 		...(data?.packs ?? [])
-			.filter((p) => !search.kind || p.counts[search.kind] > 0)
+			.filter((p) =>
+				kind
+					? p.counts[kind] > 0
+					: search.kind === "all" || p.counts.stream + p.counts.external > 0,
+			)
 			.map((p) => ({
 				value: p.name,
 				label: `${p.name} (${formatNumber(p.counts.total)})`,
 			})),
 	];
-	const kindItems = (["all", ...KINDS] as const).map((k) => ({
+	const kindItems = KIND_OPTIONS.map((k) => ({
 		value: k,
 		label: KIND_LABELS[k],
 	}));
@@ -275,10 +334,10 @@ function AudioPage(): React.ReactElement {
 					items={kindItems}
 					onValueChange={(v) =>
 						setSearch({
-							kind: v === "all" ? undefined : (v as AudioKind),
+							kind: v === "playable" ? undefined : (v as AudioKind | "all"),
 						})
 					}
-					value={search.kind ?? "all"}
+					value={search.kind ?? "playable"}
 				>
 					<SelectTrigger
 						aria-label="Kind"
@@ -335,7 +394,32 @@ function AudioPage(): React.ReactElement {
 
 			<div className="flex min-h-64 flex-1 flex-col overflow-hidden rounded-xl border bg-card shadow-xs/5">
 				{list.isPending ? (
-					<ListSkeleton rows={14} />
+					stalled ? (
+						<Empty role="status">
+							<EmptyHeader>
+								<EmptyMedia variant="icon">
+									<Spinner />
+								</EmptyMedia>
+								<EmptyTitle>Still loading…</EmptyTitle>
+								<EmptyDescription>
+									The audio index is taking longer than usual. The API may still
+									be starting up, or the connection stalled.
+								</EmptyDescription>
+							</EmptyHeader>
+							<EmptyContent>
+								<Button
+									onClick={() => void list.refetch()}
+									size="sm"
+									variant="outline"
+								>
+									<RotateCcwIcon />
+									Retry
+								</Button>
+							</EmptyContent>
+						</Empty>
+					) : (
+						<ListSkeleton rows={14} />
+					)
 				) : list.isError ? (
 					<ErrorState error={list.error} onRetry={() => void list.refetch()} />
 				) : entries.length === 0 ? (

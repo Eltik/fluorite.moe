@@ -26,6 +26,7 @@ import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.j
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchBytes, ProgressTracker } from "@/components/studio/bytes";
 import type { StudioModelSource } from "@/components/studio/catalog-source";
+import { disposeShading } from "@/components/studio/shading";
 import { api, fileUrl, modelFileUrl, type TreeEntry } from "@/lib/api";
 import { basename, dirname } from "@/lib/format";
 
@@ -373,7 +374,10 @@ async function loadRigged(
 				bytes: buf.byteLength,
 			},
 			warnings: [],
-			dispose: () => disposeObject(content),
+			dispose: () => {
+				disposeShading(content);
+				disposeObject(content);
+			},
 		};
 	} finally {
 		tracker.dispose();
@@ -475,7 +479,7 @@ async function loadParts(
 				if (!shared) {
 					shared = new MeshStandardMaterial({
 						map: texture,
-						roughness: 0.62,
+						roughness: 0.8,
 						metalness: 0,
 						side: DoubleSide,
 					});
@@ -536,7 +540,10 @@ async function loadParts(
 				bytes,
 			},
 			warnings,
-			dispose: () => disposeObject(content),
+			dispose: () => {
+				disposeShading(content);
+				disposeObject(content);
+			},
 		};
 	} catch (error) {
 		for (const obj of created) disposeObject(obj);

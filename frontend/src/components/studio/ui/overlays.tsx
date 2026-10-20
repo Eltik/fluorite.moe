@@ -81,12 +81,14 @@ export function EmptyStage({
 }): React.ReactElement {
 	return (
 		<div className="pointer-events-none absolute inset-x-0 top-[18dvh] z-10 flex justify-center p-6">
-			<div className="pointer-events-auto flex max-w-xs flex-col items-center gap-3 text-center">
-				<div className="flex size-12 items-center justify-center rounded-2xl border bg-popover/70 shadow-sm backdrop-blur">
+			<GlassCard className="pointer-events-auto flex max-w-xs flex-col items-center gap-3 px-6 py-5 text-center">
+				<div className="flex size-11 items-center justify-center rounded-xl bg-primary/12">
 					<SparklesIcon aria-hidden="true" className="size-5 text-primary" />
 				</div>
 				<div className="flex flex-col gap-1">
-					<h2 className="font-semibold text-base">Pick something to look at</h2>
+					<h2 className="font-semibold text-base text-foreground">
+						Pick something to look at
+					</h2>
 					<p className="text-muted-foreground text-sm">
 						Operators, enemies, weapons and NPCs, straight from the game files.
 					</p>
@@ -94,7 +96,7 @@ export function EmptyStage({
 				<Button onClick={onBrowse} size="sm">
 					Browse models
 				</Button>
-			</div>
+			</GlassCard>
 		</div>
 	);
 }
@@ -216,12 +218,13 @@ export function WelcomeHint({
 	);
 }
 
-const SHORTCUTS: { keys: string[]; label: string }[] = [
+const SHORTCUTS: { keys: string[]; label: string; clips?: true }[] = [
 	{ keys: ["M"], label: "Open the model picker" },
 	{ keys: ["P"], label: "Parts" },
-	{ keys: ["A"], label: "Animations (when exported)" },
+	{ keys: ["A"], label: "Animations", clips: true },
 	{ keys: ["B"], label: "Backdrop" },
 	{ keys: ["L"], label: "Lighting" },
+	{ keys: ["T"], label: "Toon or standard shading" },
 	{ keys: ["F"], label: "Reset the view" },
 	{ keys: ["C"], label: "Lock or unlock the camera" },
 	{ keys: ["O"], label: "Auto-rotate" },
@@ -229,9 +232,9 @@ const SHORTCUTS: { keys: string[]; label: string }[] = [
 	{ keys: ["W"], label: "Wireframe" },
 	{ keys: ["S"], label: "Save a screenshot" },
 	{ keys: ["H"], label: "Hide or show the interface" },
-	{ keys: ["Space"], label: "Play or pause" },
-	{ keys: ["←", "→"], label: "Step one frame" },
-	{ keys: ["R"], label: "Restart the animation" },
+	{ keys: ["Space"], label: "Play or pause", clips: true },
+	{ keys: ["←", "→"], label: "Step one frame", clips: true },
+	{ keys: ["R"], label: "Restart the animation", clips: true },
 	{ keys: ["Esc"], label: "Close the open panel" },
 	{ keys: ["?"], label: "This help" },
 ];
@@ -245,9 +248,12 @@ const GESTURES: { input: string; mouse: string; touch: string }[] = [
 export function HelpDialog({
 	open,
 	onOpenChange,
+	hasClips,
 }: {
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
+	/** Playback shortcuts only apply to models with animation clips. */
+	hasClips: boolean;
 }): React.ReactElement {
 	return (
 		<Dialog onOpenChange={onOpenChange} open={open}>
@@ -280,7 +286,7 @@ export function HelpDialog({
 							Keyboard
 						</h3>
 						<dl className="flex flex-col gap-1.5 text-sm">
-							{SHORTCUTS.map((s) => (
+							{SHORTCUTS.filter((s) => hasClips || !s.clips).map((s) => (
 								<div
 									className="flex items-center justify-between gap-3"
 									key={s.label}

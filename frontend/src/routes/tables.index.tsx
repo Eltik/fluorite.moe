@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { SearchXIcon, TableIcon } from "lucide-react";
+import { ClockIcon, SearchXIcon, TableIcon } from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
 import { PageHeader } from "@/components/page-header";
@@ -17,6 +17,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { TableInfo } from "@/lib/api";
 import { formatBytes, formatNumber } from "@/lib/format";
 import { tablesQuery } from "@/lib/queries";
+import { useRecent } from "@/lib/recent";
 import { pageTitle } from "@/lib/route-meta";
 
 const searchSchema = z.object({
@@ -79,8 +80,14 @@ function TablesPage(): React.ReactElement {
 			<PageHeader
 				actions={
 					<>
+						<span
+							className="text-muted-foreground text-xs max-sm:hidden"
+							id="tables-sort-label"
+						>
+							Sort by
+						</span>
 						<ToggleGroup
-							aria-label="Sort tables"
+							aria-labelledby="tables-sort-label"
 							onValueChange={(value) => {
 								const next = value[0];
 								if (next === "name" || next === "size") {
@@ -97,8 +104,20 @@ function TablesPage(): React.ReactElement {
 							value={[sort]}
 							variant="outline"
 						>
-							<ToggleGroupItem value="name">A–Z</ToggleGroupItem>
-							<ToggleGroupItem value="size">Size</ToggleGroupItem>
+							<ToggleGroupItem
+								aria-label="Name, grouped by prefix"
+								title="Name, grouped by prefix"
+								value="name"
+							>
+								Name A–Z
+							</ToggleGroupItem>
+							<ToggleGroupItem
+								aria-label="Size, largest first"
+								title="Size, largest first"
+								value="size"
+							>
+								Size ↓
+							</ToggleGroupItem>
 						</ToggleGroup>
 						<SearchInput
 							className="w-64 max-w-full"
@@ -124,6 +143,8 @@ function TablesPage(): React.ReactElement {
 				icon={<TableIcon />}
 				title="Tables"
 			/>
+
+			{!needle && <RecentTables />}
 
 			{query.isError ? (
 				<ErrorState error={query.error} onRetry={() => void query.refetch()} />
@@ -172,6 +193,38 @@ function TablesPage(): React.ReactElement {
 				</div>
 			)}
 		</div>
+	);
+}
+
+/** Tables opened recently in this browser (from the shared recent list). */
+function RecentTables(): React.ReactElement | null {
+	const recent = useRecent()
+		.filter((e) => e.root === "tables" && e.path.endsWith(".json"))
+		.slice(0, 6);
+	if (recent.length === 0) return null;
+	return (
+		<section aria-label="Recently opened">
+			<h2 className="mb-2 flex items-center gap-1.5 font-medium text-sm">
+				<ClockIcon className="size-3.5 text-muted-foreground" />
+				Recently opened
+			</h2>
+			<ul className="flex flex-wrap gap-1.5">
+				{recent.map((e) => {
+					const name = e.path.replace(/\.json$/, "");
+					return (
+						<li key={e.path}>
+							<Link
+								className="inline-flex h-7 items-center rounded-md border bg-card px-2.5 text-sm shadow-xs/5 outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+								params={{ name }}
+								to="/tables/$name"
+							>
+								{name}
+							</Link>
+						</li>
+					);
+				})}
+			</ul>
+		</section>
 	);
 }
 

@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
-import { BoxesIcon, LockIcon, MicIcon, SearchIcon } from "lucide-react";
+import { BoxesIcon, LockIcon, MicIcon } from "lucide-react";
 import * as React from "react";
-import { AudioButton } from "@/components/audio/audio-button";
+import { VoiceLines } from "@/components/audio/voice-lines";
 import { ArtGallery } from "@/components/catalog/art-gallery";
 import { AttributeExplorer } from "@/components/catalog/attribute-explorer";
 import { CostList } from "@/components/catalog/cost-list";
@@ -18,27 +18,17 @@ import {
 } from "@/components/catalog/detail-layout";
 import { EntityImage } from "@/components/catalog/entity-image";
 import { ModelPanel } from "@/components/catalog/model-panel";
+import { ProfileText } from "@/components/catalog/profile-text";
 import { SkillsPanel } from "@/components/catalog/skills-panel";
+import { TagGlyph } from "@/components/catalog/tag-glyph";
 import { RichText } from "@/components/rich-text/rich-text";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
-	InputGroup,
-	InputGroupAddon,
-	InputGroupInput,
-} from "@/components/ui/input-group";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import {
-	AUDIO_LANGUAGE_LABELS,
-	VOICE_LANGUAGES,
-	type VoiceLanguage,
-} from "@/lib/audio";
-import {
 	attrLabel,
 	type OperatorDetail as Operator,
-	richToPlain,
+	titleCaseShouting,
 } from "@/lib/catalog";
-import { useSettings } from "@/lib/settings";
 import { studioLink } from "@/lib/studio";
 
 const SKILL_ORDER = [
@@ -70,6 +60,7 @@ export default function OperatorDetail({
 	onTabChange,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Operator>): React.ReactElement {
 	const stageLabel = (stage: number) =>
 		stage === 0 ? "Base" : `P${ROMAN[stage] ?? stage}`;
@@ -88,7 +79,13 @@ export default function OperatorDetail({
 			<DetailHero
 				actions={
 					<>
-						<GenderToggle onChange={onGenderChange} value={gender} />
+						{gendered && (
+							<GenderToggle
+								onChange={onGenderChange}
+								showLabel
+								value={gender}
+							/>
+						)}
 						{hasModel && (
 							<Button
 								render={<Link {...studioLink("operators", data.id)} />}
@@ -110,8 +107,16 @@ export default function OperatorDetail({
 						<InfoChip color={data.element.color} icon={data.element.icon}>
 							{data.element.name}
 						</InfoChip>
-						<InfoChip>{data.weaponType.name}</InfoChip>
-						{data.department && <InfoChip>{data.department}</InfoChip>}
+						<InfoChip>
+							<TagGlyph
+								className="-ms-1 size-4"
+								tag={{ kind: "weaponType", ...data.weaponType }}
+							/>
+							{data.weaponType.name}
+						</InfoChip>
+						{data.department && (
+							<InfoChip>{titleCaseShouting(data.department)}</InfoChip>
+						)}
 					</>
 				}
 				icon={data.art.icon ?? data.art.roundIcon}
@@ -176,7 +181,12 @@ export default function OperatorDetail({
 						value: "model",
 						label: "Model",
 						content: () => (
-							<ModelPanel id={data.id} kind="operators" model={data.model} />
+							<ModelPanel
+								id={data.id}
+								kind="operators"
+								model={data.model}
+								name={data.name}
+							/>
 						),
 					},
 				]}
@@ -205,11 +215,7 @@ function Overview({ data }: { data: Operator }): React.ReactElement {
 									</Badge>
 								)}
 							</div>
-							<RichText
-								as="p"
-								className="text-pretty text-foreground/90 text-sm leading-relaxed"
-								value={entry.text}
-							/>
+							<ProfileText value={entry.text} />
 						</Panel>
 					);
 				})}
@@ -221,7 +227,10 @@ function Overview({ data }: { data: Operator }): React.ReactElement {
 							{ label: "Class", value: data.profession.name },
 							{ label: "Element", value: data.element.name },
 							{ label: "Weapon", value: data.weaponType.name },
-							{ label: "Faction", value: data.department },
+							{
+								label: "Faction",
+								value: data.department && titleCaseShouting(data.department),
+							},
 							{
 								label: "Main attribute",
 								value: data.mainAttribute
@@ -410,124 +419,6 @@ function Talents({ data }: { data: Operator }): React.ReactElement {
 					</div>
 				</Section>
 			)}
-		</div>
-	);
-}
-
-/**
- * Drop-in spot for voice playback. The audio module will export
- * `<AudioButton src=… />` from `@/components/audio/`; render it here once
- * voice lines carry an audio URL. Intentionally renders nothing for now.
- */
-function VoiceAudioSlot({
-	line,
-	lang,
-	speaker,
-}: {
-	line: Operator["voiceLines"][number];
-	lang: VoiceLanguage;
-	speaker: string;
-}): React.ReactElement {
-	return (
-		<AudioButton
-			src={line.audio?.[lang]}
-			subtitle={`${speaker} · ${lang}`}
-			title={line.title}
-		/>
-	);
-}
-
-/** The voice language matching the text language, when the game records one. */
-function defaultVoiceLanguage(textLanguage: string): VoiceLanguage {
-	const lang = textLanguage === "TC" ? "CN" : textLanguage;
-	return (VOICE_LANGUAGES as readonly string[]).includes(lang)
-		? (lang as VoiceLanguage)
-		: "EN";
-}
-
-function VoiceLines({ data }: { data: Operator }): React.ReactElement {
-	const [filter, setFilter] = React.useState("");
-	const { textLanguage } = useSettings();
-	const [voiceLang, setVoiceLang] = React.useState<VoiceLanguage>(() =>
-		defaultVoiceLanguage(textLanguage),
-	);
-	const hasAudio = data.voiceLines.some((l) => l.audio);
-	const needle = filter.trim().toLowerCase();
-	const lines = needle
-		? data.voiceLines.filter(
-				(l) =>
-					l.title.toLowerCase().includes(needle) ||
-					richToPlain(l.text).toLowerCase().includes(needle),
-			)
-		: data.voiceLines;
-	return (
-		<div className="flex flex-col gap-4">
-			<div className="flex flex-wrap items-center gap-3">
-				<InputGroup className="max-w-sm">
-					<InputGroupInput
-						aria-label="Filter voice lines"
-						onChange={(e) => setFilter(e.target.value)}
-						placeholder="Filter voice lines…"
-						size="sm"
-						type="search"
-						value={filter}
-					/>
-					<InputGroupAddon>
-						<SearchIcon />
-					</InputGroupAddon>
-				</InputGroup>
-				{hasAudio && (
-					<ToggleGroup
-						aria-label="Voice language"
-						onValueChange={(next) => {
-							const v = next[0];
-							if (v) setVoiceLang(v as VoiceLanguage);
-						}}
-						size="sm"
-						value={[voiceLang]}
-						variant="outline"
-					>
-						{VOICE_LANGUAGES.map((lang) => (
-							<ToggleGroupItem
-								key={lang}
-								title={AUDIO_LANGUAGE_LABELS[lang] ?? lang}
-								value={lang}
-							>
-								{lang}
-							</ToggleGroupItem>
-						))}
-					</ToggleGroup>
-				)}
-			</div>
-			<ul className="divide-y overflow-hidden rounded-xl border bg-card">
-				{lines.map((line) => (
-					<li
-						className="flex gap-4 px-4 py-3 max-sm:flex-col max-sm:gap-1"
-						key={line.id}
-					>
-						<div className="flex shrink-0 items-start gap-2 sm:w-44">
-							<VoiceAudioSlot
-								lang={voiceLang}
-								line={line}
-								speaker={data.name}
-							/>
-							<span className="font-medium text-muted-foreground text-xs leading-5">
-								{line.title}
-							</span>
-						</div>
-						<RichText
-							as="p"
-							className="min-w-0 flex-1 text-pretty text-sm leading-relaxed"
-							value={line.text}
-						/>
-					</li>
-				))}
-				{lines.length === 0 && (
-					<li className="px-4 py-10 text-center text-muted-foreground text-sm">
-						No voice lines match “{filter}”.
-					</li>
-				)}
-			</ul>
 		</div>
 	);
 }

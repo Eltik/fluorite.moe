@@ -1,4 +1,5 @@
 /** Settings popover body: display toggles and renderer options. */
+import { CircleHelpIcon, MoonIcon, SunIcon } from "lucide-react";
 import type * as React from "react";
 import {
 	DPR_CAPS,
@@ -53,16 +54,63 @@ export function SettingsPanel({
 	rigged,
 	hasModel,
 	detectedZUp,
+	compact,
+	themeDark,
+	onHelp,
+	onToggleTheme,
 }: {
 	prefs: StudioPrefs;
 	rigged: boolean;
 	hasModel: boolean;
 	detectedZUp: boolean;
+	/** Phones: also offers help and the theme switch (hidden from the top bar). */
+	compact: boolean;
+	themeDark: boolean;
+	onHelp: () => void;
+	onToggleTheme: () => void;
 }): React.ReactElement {
 	return (
-		<div className="flex w-72 flex-col gap-3">
+		<div className="flex max-h-[calc(100dvh-5.5rem)] w-72 max-w-[calc(100vw-2rem)] flex-col gap-3 overflow-y-auto">
+			{compact && (
+				<div className="flex gap-2">
+					<Button
+						className="flex-1"
+						onClick={onHelp}
+						size="sm"
+						variant="outline"
+					>
+						<CircleHelpIcon aria-hidden="true" />
+						Controls
+					</Button>
+					<Button
+						className="flex-1"
+						onClick={onToggleTheme}
+						size="sm"
+						variant="outline"
+					>
+						{themeDark ? (
+							<SunIcon aria-hidden="true" />
+						) : (
+							<MoonIcon aria-hidden="true" />
+						)}
+						{themeDark ? "Light theme" : "Dark theme"}
+					</Button>
+				</div>
+			)}
 			<section className="flex flex-col">
 				<PanelHeading>Scene</PanelHeading>
+				<Row
+					checked={prefs.shading === "toon"}
+					hint="Cel shading with outlines; off for the standard look"
+					label="Toon shading"
+					onChange={(toon) => setPrefs({ shading: toon ? "toon" : "standard" })}
+					shortcut="T"
+				/>
+				<Row
+					checked={prefs.floor}
+					label="Floor disc"
+					onChange={(floor) => setPrefs({ floor })}
+				/>
 				<Row
 					checked={prefs.grid}
 					label="Floor grid"

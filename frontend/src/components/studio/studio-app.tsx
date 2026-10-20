@@ -178,9 +178,10 @@ function Studio(): React.ReactElement {
 		const t = window.setTimeout(() => setFlyout("models"), 150);
 		return () => window.clearTimeout(t);
 	}, []);
-	const [pickerTab, setPickerTab] = React.useState<StudioKind>(
-		kind ?? "operators",
-	);
+	const pickerTab: StudioKind = prefs.pickerKind;
+	const setPickerTab = React.useCallback((k: StudioKind) => {
+		setPrefs({ pickerKind: k });
+	}, []);
 	const [uiHidden, setUiHidden] = React.useState(false);
 	const [locked, setLocked] = React.useState(false);
 	const [helpOpen, setHelpOpen] = React.useState(false);
@@ -214,7 +215,7 @@ function Studio(): React.ReactElement {
 
 	React.useEffect(() => {
 		if (kind) setPickerTab(kind);
-	}, [kind]);
+	}, [kind, setPickerTab]);
 
 	// ---------------------------------------------------------- data
 
@@ -360,11 +361,6 @@ function Studio(): React.ReactElement {
 
 	// ---------------------------------------------------------- view
 
-	const zUp = shown
-		? prefs.zUp === "auto"
-			? shown.detectedZUp
-			: prefs.zUp === "on"
-		: false;
 	const background = resolveBackground(
 		search.bg,
 		prefs.background,
@@ -442,7 +438,6 @@ function Studio(): React.ReactElement {
 		animation,
 	});
 
-	const hasClips = Boolean(animation);
 	const loading = load.status === "loading" ? load : null;
 	const showEmpty = !kind && !loading && !shown;
 	const loadError = load.status === "error" && !loading ? load : null;
@@ -472,7 +467,7 @@ function Studio(): React.ReactElement {
 					onContextLost={setContextLost}
 					onShown={handleShown}
 					prefs={prefs}
-					zUp={zUp}
+					zUpMode={prefs.zUp}
 				/>
 			</div>
 
@@ -483,7 +478,9 @@ function Studio(): React.ReactElement {
 					total={loading.total}
 				/>
 			)}
-			{showEmpty && !uiHidden && <EmptyStage onBrowse={openPicker} />}
+			{showEmpty && !uiHidden && flyout !== "models" && (
+				<EmptyStage onBrowse={openPicker} />
+			)}
 			{loadError && !shown && (
 				<ErrorStage
 					message={loadError.message}
@@ -515,7 +512,7 @@ function Studio(): React.ReactElement {
 				inert={uiHidden || undefined}
 			>
 				{/* Top-left: back + model identity */}
-				<div className="absolute start-3 top-3 flex max-w-[calc(100vw-9.5rem)] flex-col gap-2 sm:start-4 sm:top-4 sm:max-w-md">
+				<div className="absolute start-3 top-3 flex max-w-[calc(100vw-7.25rem)] flex-col gap-2 sm:start-4 sm:top-4 sm:max-w-md">
 					<GlassCard className="pointer-events-auto flex items-center gap-1.5 p-1.5 pe-3">
 						<IconButton
 							label={
@@ -585,9 +582,11 @@ function Studio(): React.ReactElement {
 					)}
 				</div>
 
-				{/* Top-right: help, hide UI, theme, settings */}
+				{/* Top-right: help, hide UI, theme, settings. Phones keep only hide
+				    and settings; help and theme move into the settings panel. */}
 				<GlassCard className="pointer-events-auto absolute end-3 top-3 flex items-center gap-0.5 p-1 sm:end-4 sm:top-4">
 					<IconButton
+						className="max-sm:hidden"
 						label="Controls and shortcuts"
 						onClick={() => setHelpOpen(true)}
 						shortcut="?"
@@ -605,6 +604,7 @@ function Studio(): React.ReactElement {
 						<EyeOffIcon />
 					</IconButton>
 					<IconButton
+						className="max-sm:hidden"
 						label={themeDark ? "Switch to light theme" : "Switch to dark theme"}
 						onClick={() =>
 							updateSettings({ theme: themeDark ? "light" : "dark" })
@@ -628,10 +628,19 @@ function Studio(): React.ReactElement {
 							sideOffset={8}
 						>
 							<SettingsPanel
+								compact={mobile}
 								detectedZUp={shown?.detectedZUp ?? false}
 								hasModel={Boolean(shown)}
+								onHelp={() => {
+									setFlyout(null);
+									setHelpOpen(true);
+								}}
+								onToggleTheme={() =>
+									updateSettings({ theme: themeDark ? "light" : "dark" })
+								}
 								prefs={prefs}
 								rigged={Boolean(shown?.rigged)}
+								themeDark={themeDark}
 							/>
 						</PopoverPopup>
 					</Popover>
@@ -649,10 +658,12 @@ function Studio(): React.ReactElement {
 
 				{/* Bottom: transport + toolbar */}
 				<div className="absolute inset-x-0 bottom-0 flex flex-col items-center gap-2 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:pb-4">
-					<TransportBar
-						className="pointer-events-auto"
-						controller={animation}
-					/>
+					{animation && (
+						<TransportBar
+							className="pointer-events-auto"
+							controller={animation}
+						/>
+					)}
 					<GlassCard
 						aria-label="Studio tools"
 						className="pointer-events-auto flex max-w-full items-center gap-0.5 overflow-x-auto p-1 [scrollbar-width:none]"
@@ -703,7 +714,7 @@ function Studio(): React.ReactElement {
 								onHiddenChange={setHiddenParts}
 							/>
 						</Flyout>
-						{hasClips && animation ? (
+						{animation && (
 							<Flyout
 								{...flyoutProps("animations")}
 								title="Animations"
@@ -718,13 +729,6 @@ function Studio(): React.ReactElement {
 							>
 								<ClipList controller={animation} onSelect={selectClip} />
 							</Flyout>
-						) : (
-							<ToolbarButton
-								disabled
-								hint="Animations aren't exported yet"
-								icon={<ClapperboardIcon />}
-								label="Animations"
-							/>
 						)}
 						<Flyout
 							{...flyoutProps("background")}
@@ -760,7 +764,7 @@ function Studio(): React.ReactElement {
 						</Flyout>
 						<div
 							aria-hidden="true"
-							className="mx-0.5 h-8 w-px shrink-0 bg-border"
+							className="mx-0.5 h-8 w-px shrink-0 bg-border max-sm:hidden"
 						/>
 						<ToolbarButton
 							active={locked}
@@ -787,7 +791,11 @@ function Studio(): React.ReactElement {
 				</div>
 			</div>
 
-			<HelpDialog onOpenChange={setHelpOpen} open={helpOpen} />
+			<HelpDialog
+				hasClips={Boolean(animation)}
+				onOpenChange={setHelpOpen}
+				open={helpOpen}
+			/>
 			<span className="sr-only" aria-live="polite">
 				{shown ? `${shown.name} is ready` : ""}
 			</span>

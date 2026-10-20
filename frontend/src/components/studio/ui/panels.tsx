@@ -7,6 +7,7 @@ import {
 	type BackgroundId,
 	LIGHTING_IDS,
 	type LightingId,
+	type ShadingId,
 	type StudioPrefs,
 	setPrefs,
 } from "@/components/studio/prefs";
@@ -17,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -156,6 +158,39 @@ export function PartsPanel({
 	);
 }
 
+// ------------------------------------------------------------- radios
+
+/**
+ * Roving focus for a custom radiogroup: only the checked option is tabbable
+ * (so a flyout's initial focus lands on the current choice), and the arrow
+ * keys move between options and select them.
+ */
+function onRadioKeyDown(
+	e: React.KeyboardEvent<HTMLElement>,
+	columns = 1,
+): void {
+	const radios = [
+		...e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'),
+	];
+	const index = radios.indexOf(document.activeElement as HTMLElement);
+	if (index < 0) return;
+	const delta =
+		e.key === "ArrowRight"
+			? 1
+			: e.key === "ArrowLeft"
+				? -1
+				: e.key === "ArrowDown"
+					? columns
+					: e.key === "ArrowUp"
+						? -columns
+						: 0;
+	if (!delta) return;
+	e.preventDefault();
+	const next = radios[(index + delta + radios.length) % radios.length];
+	next?.focus();
+	next?.click();
+}
+
 // ------------------------------------------------------------- background
 
 export function BackgroundPanel({
@@ -175,6 +210,7 @@ export function BackgroundPanel({
 			<div
 				aria-label="Backdrop"
 				className="grid grid-cols-4 gap-2 sm:grid-cols-4"
+				onKeyDown={(e) => onRadioKeyDown(e, 4)}
 				role="radiogroup"
 			>
 				{BACKGROUND_IDS.map((id) => {
@@ -186,11 +222,13 @@ export function BackgroundPanel({
 							aria-label={def.label}
 							className="group flex flex-col items-center gap-1 rounded-lg p-1 text-[0.6875rem] text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
 							key={id}
-							onClick={() => {
+							onClick={(e) => {
 								onSelect(id);
-								if (id === "custom") colorRef.current?.click();
+								// Only a real click opens the colour picker, not arrow keys.
+								if (id === "custom" && e.detail > 0) colorRef.current?.click();
 							}}
 							role="radio"
+							tabIndex={checked ? 0 : -1}
 							type="button"
 						>
 							<span
@@ -233,6 +271,13 @@ export function BackgroundPanel({
 				</span>
 			</label>
 			<label className="flex items-center justify-between gap-2 text-sm">
+				<span>Floor disc</span>
+				<Switch
+					checked={prefs.floor}
+					onCheckedChange={(floor) => setPrefs({ floor })}
+				/>
+			</label>
+			<label className="flex items-center justify-between gap-2 text-sm">
 				<span>Floor grid</span>
 				<Switch
 					checked={prefs.grid}
@@ -252,10 +297,49 @@ export function LightingPanel({
 }): React.ReactElement {
 	return (
 		<div className="flex w-full flex-col gap-3 sm:w-72">
+			<div className="flex items-center justify-between gap-3">
+				<span className="flex flex-col">
+					<span className="font-medium text-sm" id="shading-label">
+						Shading
+					</span>
+					<span className="text-muted-foreground text-xs">
+						{prefs.shading === "toon"
+							? "Cel bands and ink outlines"
+							: "Smooth physically based light"}
+					</span>
+				</span>
+				<ToggleGroup
+					aria-labelledby="shading-label"
+					onValueChange={(v) => {
+						const next = v[0] as ShadingId | undefined;
+						if (next) setPrefs({ shading: next });
+					}}
+					size="sm"
+					value={[prefs.shading]}
+					variant="outline"
+				>
+					<ToggleGroupItem value="toon">Toon</ToggleGroupItem>
+					<ToggleGroupItem value="standard">Standard</ToggleGroupItem>
+				</ToggleGroup>
+			</div>
+			<label
+				className={cn(
+					"flex items-center justify-between gap-2 text-sm",
+					prefs.shading !== "toon" && "text-muted-foreground",
+				)}
+			>
+				<span>Outlines</span>
+				<Switch
+					checked={prefs.outlines && prefs.shading === "toon"}
+					disabled={prefs.shading !== "toon"}
+					onCheckedChange={(outlines) => setPrefs({ outlines })}
+				/>
+			</label>
 			<PanelHeading>Lighting</PanelHeading>
 			<div
 				aria-label="Lighting preset"
 				className="flex flex-col gap-1"
+				onKeyDown={(e) => onRadioKeyDown(e)}
 				role="radiogroup"
 			>
 				{LIGHTING_IDS.map((id: LightingId) => {
@@ -273,6 +357,7 @@ export function LightingPanel({
 							key={id}
 							onClick={() => setPrefs({ lighting: id })}
 							role="radio"
+							tabIndex={checked ? 0 : -1}
 							type="button"
 						>
 							<span className="flex min-w-0 flex-1 flex-col">

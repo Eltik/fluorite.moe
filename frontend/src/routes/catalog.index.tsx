@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import {
+	ArrowRightIcon,
 	BookOpenIcon,
 	FactoryIcon,
 	type LucideIcon,
@@ -96,19 +97,24 @@ function CatalogIndex(): React.ReactElement {
 						</li>
 					);
 				})}
-				<li>
+				<li className="sm:col-span-2 lg:col-span-3">
 					<Link
-						className="flex h-full items-start gap-3 rounded-xl border bg-card p-4 shadow-xs/5 outline-none transition-[box-shadow,border-color] hover:border-foreground/16 hover:shadow-md/5 focus-visible:ring-2 focus-visible:ring-ring"
+						className="group flex h-full flex-col gap-3 rounded-xl border bg-card p-4 shadow-xs/5 outline-none transition-[box-shadow,border-color] hover:border-foreground/16 hover:shadow-md/5 focus-visible:ring-2 focus-visible:ring-ring sm:flex-row sm:items-center sm:gap-4"
 						to="/story"
 					>
 						<span className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted text-muted-foreground">
 							<BookOpenIcon className="size-4.5" />
 						</span>
-						<span className="flex min-w-0 flex-col gap-0.5">
+						<span className="flex min-w-0 flex-1 flex-col gap-0.5">
 							<span className="font-medium">Story</span>
 							<span className="text-muted-foreground text-sm">
-								Read every dialog as a chat transcript, with choices
+								Every mission, level and NPC dialog, read as a chat transcript
+								with choices and both Endministrator variants.
 							</span>
+						</span>
+						<span className="inline-flex shrink-0 items-center gap-1 font-medium text-muted-foreground text-sm transition-colors group-hover:text-foreground">
+							Start reading
+							<ArrowRightIcon className="size-4" />
 						</span>
 					</Link>
 				</li>

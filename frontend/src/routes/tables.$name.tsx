@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import type { SortingState } from "@tanstack/react-table";
 import {
 	BracesIcon,
+	CopyIcon,
 	DownloadIcon,
 	LanguagesIcon,
 	Table2Icon,
@@ -27,6 +28,7 @@ import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ViewerFallback } from "@/components/viewers/file-preview";
 import { API_URL, api } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import { formatNumber } from "@/lib/format";
 import { tableQuery } from "@/lib/queries";
 import { pushRecent } from "@/lib/recent";
@@ -269,8 +271,23 @@ function TablePage(): React.ReactElement {
 									)
 								: ""}
 						</SheetTitle>
-						<SheetDescription>
-							{name} · row {(search.row ?? 0) + 1}
+						<SheetDescription className="flex items-center gap-2">
+							<span>
+								{name} · row {(search.row ?? 0) + 1}
+							</span>
+							{openRow && (
+								<Button
+									className="ms-auto"
+									onClick={() =>
+										void copyText(JSON.stringify(openRow, null, 2), "Row JSON")
+									}
+									size="xs"
+									variant="outline"
+								>
+									<CopyIcon />
+									Copy JSON
+								</Button>
+							)}
 						</SheetDescription>
 					</SheetHeader>
 					<SheetPanel className="flex min-h-0 flex-1 flex-col p-0">

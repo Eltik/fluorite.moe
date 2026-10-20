@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link, useMatches } from "@tanstack/react-router";
+import { Link, useLocation, useMatches } from "@tanstack/react-router";
 import {
 	LanguagesIcon,
 	MonitorIcon,
@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import * as React from "react";
 import { useCommandPalette } from "@/components/shell/command-palette";
+import { sectionFor } from "@/components/shell/nav-config";
 import { StatusIndicator } from "@/components/shell/status-indicator";
 import {
 	Breadcrumb,
@@ -84,19 +85,16 @@ export function TopBar(): React.ReactElement {
 
 function Crumbs(): React.ReactElement {
 	const matches = useMatches();
+	const pathname = useLocation({ select: (l) => l.pathname });
 	const items = React.useMemo(() => {
 		const out: { label: string; to?: string }[] = [];
-		// The deepest route that declares a section wins (e.g. "Data").
-		const sectionMatch = [...matches]
-			.reverse()
-			.find((m) => m.staticData.section);
-		const section = sectionMatch?.staticData.section;
-		if (section && sectionMatch) {
+		// The breadcrumb root mirrors the sidebar (Catalog, Game files…), so
+		// pages are filed where the user found them, not where a route says.
+		const section = sectionFor(pathname);
+		if (section?.label) {
 			out.push({
-				label: crumbLabel(
-					section,
-					sectionMatch.params as Record<string, string>,
-				),
+				label: section.label,
+				to: section.link ? (section.link.to as string | undefined) : undefined,
 			});
 		}
 		for (const match of matches) {
@@ -108,10 +106,13 @@ function Crumbs(): React.ReactElement {
 				match.loaderData,
 			);
 			if (out[out.length - 1]?.label === label) continue;
+			// "Catalog › Overview" reads as one place: collapse the index crumb.
+			if (section?.link && match.pathname.replace(/\/$/, "") === section.href)
+				continue;
 			out.push({ label, to: match.pathname });
 		}
 		return out;
-	}, [matches]);
+	}, [matches, pathname]);
 
 	return (
 		<Breadcrumb className="min-w-0">
@@ -150,7 +151,7 @@ function SearchTrigger(): React.ReactElement {
 				variant="outline"
 			>
 				<SearchIcon />
-				<span className="flex-1 text-start font-normal">Search files…</span>
+				<span className="flex-1 text-start font-normal">Search…</span>
 				<Kbd>⌘K</Kbd>
 			</Button>
 			<Button

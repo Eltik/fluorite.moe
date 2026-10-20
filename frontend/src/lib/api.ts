@@ -111,6 +111,11 @@ export interface TableInfo {
 	size: number;
 }
 
+/** `GET /api/catalog`: entity counts per catalog kind. */
+export interface CatalogKinds {
+	kinds: { kind: CatalogKind; count: number }[];
+}
+
 export interface CatalogItem {
 	id: string;
 	name: string;
@@ -344,6 +349,10 @@ export const api = {
 	): Promise<string> {
 		const res = await send(`/files/${root}/${encodePath(path)}`, { signal });
 		return res.text();
+	},
+
+	catalogKinds(signal?: AbortSignal): Promise<CatalogKinds> {
+		return request("/api/catalog", { signal });
 	},
 
 	catalog(

@@ -26,9 +26,11 @@ body {
   --animate-toast-success-even: toast-success-even 0.32s cubic-bezier(0.5, 1, 0.89, 1);
   --animate-toast-error-odd: toast-error-odd 0.28s cubic-bezier(0.5, 1, 0.89, 1);
   --animate-toast-error-even: toast-error-even 0.28s cubic-bezier(0.5, 1, 0.89, 1);
-  --font-heading: 'Inter Variable', sans-serif;
-  --font-mono: 'Geist Mono Variable', monospace;
-  --font-sans: 'Inter Variable', sans-serif;
+  --font-heading: var(--font-text);
+  --font-mono: 'Geist Mono Variable', ui-monospace, var(--font-cjk), monospace;
+  --font-sans: var(--font-text);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
   --color-sidebar-primary: var(--sidebar-primary);
@@ -177,7 +179,10 @@ body {
   --popover-foreground: var(--color-neutral-800);
   --primary: var(--color-neutral-800);
   --primary-foreground: var(--color-neutral-50);
-  --ring: var(--color-neutral-400);
+  /* Focus ring: brand violet, >= 3:1 against both the page and cards. */
+  --ring: var(--color-violet-600);
+  --brand: var(--color-violet-600);
+  --brand-foreground: var(--color-violet-700);
   --secondary: --alpha(var(--color-black) / 4%);
   --secondary-foreground: var(--color-neutral-800);
   --chart-1: var(--color-orange-600);
@@ -196,7 +201,10 @@ body {
   --sidebar-foreground: color-mix(in srgb, var(--color-neutral-800) 64%, var(--sidebar));
   --sidebar-primary: var(--color-neutral-800);
   --sidebar-primary-foreground: var(--color-neutral-50);
-  --sidebar-ring: var(--color-neutral-400);
+  --sidebar-ring: var(--color-violet-600);
+  /* Latin face first, then per-script CJK fallbacks (see :lang rules below). */
+  --font-cjk: "PingFang SC", "Hiragino Sans", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --font-text: 'Inter Variable', system-ui, -apple-system, "Segoe UI", var(--font-cjk);
 }
 
 .dark {
@@ -222,7 +230,9 @@ body {
   --popover-foreground: var(--color-neutral-100);
   --primary: var(--color-neutral-100);
   --primary-foreground: var(--color-neutral-800);
-  --ring: var(--color-neutral-500);
+  --ring: var(--color-violet-400);
+  --brand: var(--color-violet-400);
+  --brand-foreground: var(--color-violet-300);
   --secondary: --alpha(var(--color-white) / 4%);
   --secondary-foreground: var(--color-neutral-100);
   --chart-1: var(--color-blue-700);
@@ -240,7 +250,36 @@ body {
   --sidebar-foreground: color-mix(in srgb, var(--color-neutral-100) 64%, var(--sidebar));
   --sidebar-primary: var(--color-neutral-100);
   --sidebar-primary-foreground: var(--color-neutral-800);
-  --sidebar-ring: var(--color-neutral-400);
+  --sidebar-ring: var(--color-violet-400);
+}
+
+/*
+ * html[lang] follows the game text language (lib/settings.ts). Han glyphs
+ * differ per locale, so each CJK language gets its own system/Noto stack.
+ */
+:root:lang(ja) {
+  --font-cjk: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Noto Sans CJK JP", "Yu Gothic UI", Meiryo, sans-serif;
+}
+:root:lang(ko) {
+  --font-cjk: "Apple SD Gothic Neo", "Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", sans-serif;
+}
+:root:lang(zh-Hans) {
+  --font-cjk: "PingFang SC", "Noto Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+}
+:root:lang(zh-Hant) {
+  --font-cjk: "PingFang TC", "Noto Sans TC", "Noto Sans CJK TC", "Microsoft JhengHei", sans-serif;
+}
+:root:lang(th) {
+  --font-text: 'Inter Variable', "Noto Sans Thai", Thonburi, Tahoma, system-ui, sans-serif;
+}
+
+/*
+ * Compact density tightens the whole spacing scale (paddings, gaps, control
+ * heights) and steps the base text down, instead of a few one-off paddings.
+ */
+:root[data-density="compact"] {
+  --spacing: 0.225rem;
+  font-size: 93.75%;
 }
 
 @layer base {
@@ -256,8 +295,10 @@ body {
   html {
     @apply font-sans antialiased;
   }
+  /* A visible 2px ring for every focusable element (WCAG 2.4.11/2.4.13). */
   :focus-visible {
-    @apply outline-ring;
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
   }
 }
 

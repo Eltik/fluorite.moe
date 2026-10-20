@@ -7,8 +7,10 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { FolderIcon, ImageIcon, SearchXIcon } from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
+import { FolderCards } from "@/components/gallery/folder-cards";
 import { Lightbox } from "@/components/gallery/lightbox";
 import { type GridItem, TextureGrid } from "@/components/gallery/texture-grid";
+import { TextureHighlights } from "@/components/gallery/texture-highlights";
 import { PageHeader } from "@/components/page-header";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState } from "@/components/status-views";
@@ -34,7 +36,6 @@ const searchSchema = z.object({
 });
 
 const PAGE = 240;
-const SUBFOLDER_PREVIEW = 18;
 
 const textureSearch = (q: string) =>
 	infiniteQueryOptions({
@@ -146,7 +147,9 @@ function TexturesPage(): React.ReactElement {
 						? "Loading…"
 						: searching
 							? `${formatNumber(total)} textures match “${query}”${dir ? ` in ${basename(dir)}` : ""}`
-							: `${formatNumber(folders.length)} folders · ${formatNumber(items.length)} textures in this folder`
+							: items.length === 0 && folders.length > 0
+								? `${formatNumber(folders.length)} folders`
+								: `${formatNumber(folders.length)} folders · ${formatNumber(items.length)} textures in this folder`
 				}
 				icon={<ImageIcon />}
 				title="Textures"
@@ -154,7 +157,9 @@ function TexturesPage(): React.ReactElement {
 
 			<FolderCrumbs dir={dir} />
 
-			{!searching && folders.length > 0 && <FolderChips folders={folders} />}
+			{!searching && folders.length > 0 && (
+				<FolderCards compact={items.length > 0} folders={folders} />
+			)}
 
 			{active.isError ? (
 				<ErrorState
@@ -168,6 +173,14 @@ function TexturesPage(): React.ReactElement {
 						<Skeleton className="aspect-square rounded-lg" key={i} />
 					))}
 				</div>
+			) : items.length === 0 && !searching && folders.length > 0 ? (
+				dir === "" ? (
+					<TextureHighlights
+						onOpen={(path) =>
+							void navigate({ search: (prev) => ({ ...prev, view: path }) })
+						}
+					/>
+				) : null
 			) : items.length === 0 ? (
 				<Empty>
 					<EmptyHeader>
@@ -180,7 +193,7 @@ function TexturesPage(): React.ReactElement {
 						<EmptyDescription>
 							{searching
 								? "Try fewer or different words. Each word must appear somewhere in the path."
-								: "This folder only contains subfolders."}
+								: "This folder is empty."}
 						</EmptyDescription>
 					</EmptyHeader>
 				</Empty>
@@ -268,48 +281,5 @@ function FolderCrumbs({ dir }: { dir: string }): React.ReactElement | null {
 				})}
 			</ol>
 		</nav>
-	);
-}
-
-function FolderChips({
-	folders,
-}: {
-	folders: { path: string; name: string; children?: number }[];
-}): React.ReactElement {
-	const [expanded, setExpanded] = React.useState(false);
-	const shown = expanded ? folders : folders.slice(0, SUBFOLDER_PREVIEW);
-	return (
-		<ul aria-label="Subfolders" className="flex flex-wrap gap-1.5">
-			{shown.map((folder) => (
-				<li key={folder.path}>
-					<Link
-						className="inline-flex h-7 items-center gap-1.5 rounded-md border bg-card px-2 text-sm shadow-xs/5 outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
-						search={{ dir: folder.path }}
-						to="/textures"
-					>
-						<FolderIcon className="size-3.5 fill-current/10 text-muted-foreground" />
-						{folder.name}
-						{folder.children !== undefined && (
-							<span className="text-muted-foreground text-xs tabular-nums">
-								{formatNumber(folder.children)}
-							</span>
-						)}
-					</Link>
-				</li>
-			))}
-			{folders.length > SUBFOLDER_PREVIEW && (
-				<li>
-					<Button
-						onClick={() => setExpanded((v) => !v)}
-						size="sm"
-						variant="ghost"
-					>
-						{expanded
-							? "Show fewer"
-							: `+${folders.length - SUBFOLDER_PREVIEW} more`}
-					</Button>
-				</li>
-			)}
-		</ul>
 	);
 }

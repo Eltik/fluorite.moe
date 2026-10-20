@@ -28,11 +28,19 @@ const IDLE: AudioState = { track: null, status: "idle", time: 0, duration: 0 };
 
 let state: AudioState = IDLE;
 let element: HTMLAudioElement | null = null;
+let loadTimer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
+
+/** A clip still buffering after this long is reported as failed. */
+const LOAD_TIMEOUT_MS = 20_000;
 const endedListeners = new Set<(track: AudioTrack) => void>();
 
 function set(patch: Partial<AudioState>): void {
 	state = { ...state, ...patch };
+	if (state.status !== "loading" && loadTimer) {
+		clearTimeout(loadTimer);
+		loadTimer = undefined;
+	}
 	for (const l of listeners) l();
 }
 
@@ -86,15 +94,27 @@ export const audioEngine = {
 		const url = audioSrc(track.src);
 		const el = audio();
 		if (!url) {
-			set({ track, status: "error", error: "No playable source" });
+			const keep = state.track?.key === track.key ? state.error : undefined;
+			set({ track, status: "error", error: keep ?? "No playable source" });
 			return;
 		}
-		if (state.track?.key === track.key && el.src === url) {
+		if (
+			state.track?.key === track.key &&
+			el.src === url &&
+			state.status !== "error"
+		) {
 			if (el.ended) el.currentTime = 0;
 			void el.play().catch(() => {});
 			return;
 		}
 		set({ track, status: "loading", time: 0, duration: 0, error: undefined });
+		clearTimeout(loadTimer);
+		loadTimer = setTimeout(() => {
+			if (state.track?.key === track.key && state.status === "loading") {
+				el.pause();
+				set({ status: "error", error: "Timed out loading this clip" });
+			}
+		}, LOAD_TIMEOUT_MS);
 		el.src = url;
 		void el.play().catch((e: unknown) => {
 			// AbortError: superseded by another play() call.
@@ -102,6 +122,16 @@ export const audioEngine = {
 			if (state.track?.key === track.key && state.status !== "error")
 				set({ status: "error", error: "Playback was blocked" });
 		});
+	},
+
+	/**
+	 * Make `track` current without playing it and explain why (e.g. a
+	 * soundbank ref with no decoded media), so the player bar says something
+	 * instead of silently ignoring the click.
+	 */
+	unavailable(track: AudioTrack, message: string): void {
+		if (element && !element.paused) element.pause();
+		set({ track, status: "error", time: 0, duration: 0, error: message });
 	},
 
 	pause(): void {

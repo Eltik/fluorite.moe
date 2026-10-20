@@ -11,6 +11,8 @@ export interface ResolvedBackground {
 	css: string;
 	/** Whether the backdrop is dark (drives grid / shadow contrast). */
 	dark: boolean;
+	/** Ground disc tint and centre opacity. */
+	floor: { color: string; opacity: number };
 	/** Paints the same backdrop into a 2D canvas (screenshots). */
 	paint: (ctx: CanvasRenderingContext2D, w: number, h: number) => void;
 }
@@ -100,6 +102,9 @@ const STAGE_DARK: Stop[] = [
 	{ at: 1, color: "#09080d" },
 ];
 
+const LIGHT_FLOOR = { color: "#cfccdc", opacity: 0.7 };
+const DARK_FLOOR = { color: "#3a3550", opacity: 0.55 };
+
 /**
  * Resolves a background choice (`?bg=` overrides the saved preference) into
  * renderable CSS plus a screenshot painter.
@@ -121,17 +126,41 @@ export function resolveBackground(
 	if (id === "auto") id = themeDark ? "stage-dark" : "stage-light";
 	switch (id) {
 		case "stage-light":
-			return { id, dark: false, ...radial(STAGE_LIGHT) };
+			return { id, dark: false, floor: LIGHT_FLOOR, ...radial(STAGE_LIGHT) };
 		case "stage-dark":
-			return { id, dark: true, ...radial(STAGE_DARK) };
+			return { id, dark: true, floor: DARK_FLOOR, ...radial(STAGE_DARK) };
 		case "black":
-			return { id, dark: true, ...solid("#000000") };
+			return {
+				id,
+				dark: true,
+				floor: { color: "#2a2733", opacity: 0.55 },
+				...solid("#000000"),
+			};
 		case "white":
-			return { id, dark: false, ...solid("#ffffff") };
+			return {
+				id,
+				dark: false,
+				floor: { color: "#d9d7e3", opacity: 0.6 },
+				...solid("#ffffff"),
+			};
 		case "grey":
-			return { id, dark: true, ...solid("#7f7f86") };
-		case "custom":
-			return { id, dark: luminance(custom) < 0.5, ...solid(custom) };
+			return {
+				id,
+				dark: true,
+				floor: { color: "#a4a3ad", opacity: 0.45 },
+				...solid("#7f7f86"),
+			};
+		case "custom": {
+			const dark = luminance(custom) < 0.5;
+			return {
+				id,
+				dark,
+				floor: dark
+					? { color: "#ffffff", opacity: 0.08 }
+					: { color: "#000000", opacity: 0.07 },
+				...solid(custom),
+			};
+		}
 	}
 }
 
@@ -163,6 +192,16 @@ export interface LightingPreset {
 	rim: DirLight;
 	environment: number;
 	formers: Former[];
+	/** Light rig used with toon shading (no environment, no specular). */
+	toon: ToonLights;
+}
+
+export interface ToonLights {
+	ambient: number;
+	hemisphere: { sky: string; ground: string; intensity: number };
+	key: DirLight;
+	/** Screen-space fresnel rim added in the toon shader. */
+	rim: { color: string; strength: number };
 }
 
 export const LIGHTING: Record<LightingId, LightingPreset> = {
@@ -175,6 +214,12 @@ export const LIGHTING: Record<LightingId, LightingPreset> = {
 		fill: { color: "#dfe6ff", intensity: 0.7, position: [-4, 2, 2] },
 		rim: { color: "#c9b8ff", intensity: 1.6, position: [-1.5, 3, -4.5] },
 		environment: 0.65,
+		toon: {
+			ambient: 0.25,
+			hemisphere: { sky: "#fffaf4", ground: "#8f8aa8", intensity: 1 },
+			key: { color: "#fff6ec", intensity: 2.3, position: [1.8, 3.6, 4.5] },
+			rim: { color: "#efe9ff", strength: 0.3 },
+		},
 		formers: [
 			{
 				form: "rect",
@@ -210,6 +255,12 @@ export const LIGHTING: Record<LightingId, LightingPreset> = {
 		fill: { color: "#ffffff", intensity: 0.8, position: [-3, 2, 3] },
 		rim: { color: "#ffffff", intensity: 0.5, position: [0, 3, -4] },
 		environment: 1,
+		toon: {
+			ambient: 0.45,
+			hemisphere: { sky: "#ffffff", ground: "#b4b0c2", intensity: 1.3 },
+			key: { color: "#ffffff", intensity: 1.6, position: [1.5, 3, 5] },
+			rim: { color: "#ffffff", strength: 0.12 },
+		},
 		formers: [
 			{
 				form: "rect",
@@ -233,6 +284,12 @@ export const LIGHTING: Record<LightingId, LightingPreset> = {
 		fill: { color: "#7d8bd6", intensity: 0.15, position: [-4, 1, 3] },
 		rim: { color: "#a78bfa", intensity: 3.4, position: [-2.5, 2.5, -4] },
 		environment: 0.3,
+		toon: {
+			ambient: 0.1,
+			hemisphere: { sky: "#d9d4ff", ground: "#4a4266", intensity: 0.65 },
+			key: { color: "#ffe9d2", intensity: 2.8, position: [4.5, 3, 1.5] },
+			rim: { color: "#b79dff", strength: 0.75 },
+		},
 		formers: [
 			{ form: "rect", intensity: 4, position: [5, 2, 2], scale: [2, 6, 1] },
 			{
@@ -260,6 +317,12 @@ export const LIGHTING: Record<LightingId, LightingPreset> = {
 		fill: { color: "#ffffff", intensity: 0, position: [0, 1, 1] },
 		rim: { color: "#ffffff", intensity: 0, position: [0, 1, -1] },
 		environment: 0.2,
+		toon: {
+			ambient: 1.2,
+			hemisphere: { sky: "#ffffff", ground: "#ffffff", intensity: 2 },
+			key: { color: "#ffffff", intensity: 0, position: [0, 1, 1] },
+			rim: { color: "#ffffff", strength: 0 },
+		},
 		formers: [
 			{
 				form: "rect",

@@ -121,6 +121,8 @@ export interface AudioFilters {
 	lang?: string;
 	kind?: AudioKind;
 	q?: string;
+	/** Drop soundbank refs (they have no media to play). */
+	playable?: boolean;
 }
 
 const PAGE = 200;
@@ -136,18 +138,26 @@ export const audioSummaryQuery = () =>
 export const audioEntriesQuery = (filters: AudioFilters) =>
 	infiniteQueryOptions({
 		queryKey: ["audio", "entries", filters],
-		queryFn: ({ pageParam, signal }) =>
-			getJson<AudioEntriesPage>(
+		queryFn: ({ pageParam, signal }) => {
+			const { playable, ...rest } = filters;
+			return getJson<AudioEntriesPage>(
 				"/api/audio/entries",
-				{ ...filters, offset: pageParam, limit: PAGE },
+				{
+					...rest,
+					playable: playable ? "true" : undefined,
+					offset: pageParam,
+					limit: PAGE,
+				},
 				signal,
-			),
+			);
+		},
 		initialPageParam: 0,
 		getNextPageParam: (last) => {
 			const next = last.offset + last.entries.length;
 			return next < last.total && last.entries.length > 0 ? next : undefined;
 		},
 		staleTime: 5 * 60_000,
+		retry: 2,
 	});
 
 export const voiceQuery = (charId: string, lang: string) =>

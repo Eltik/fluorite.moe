@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { RotateCcwIcon } from "lucide-react";
 import type * as React from "react";
+import { RelativeTime } from "@/components/shell/relative-time";
 import { Button } from "@/components/ui/button";
 import {
 	Popover,
@@ -9,7 +10,6 @@ import {
 	PopoverTrigger,
 } from "@/components/ui/popover";
 import { API_URL } from "@/lib/api";
-import { formatDateTime, formatRelative } from "@/lib/format";
 import { statusQuery } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
@@ -58,8 +58,17 @@ export function StatusIndicator(): React.ReactElement {
 						)}
 					/>
 				</span>
-				<span className="hidden font-mono text-xs tabular-nums md:inline">
-					{status.data ? `v${status.data.version}` : LABEL[health]}
+				<span className="hidden text-xs md:inline">
+					{status.data ? (
+						<>
+							API{" "}
+							<span className="font-mono tabular-nums">
+								v{status.data.version}
+							</span>
+						</>
+					) : (
+						`API ${LABEL[health].toLowerCase()}`
+					)}
 				</span>
 			</PopoverTrigger>
 			<PopoverPopup align="end" className="w-72">
@@ -91,11 +100,8 @@ export function StatusIndicator(): React.ReactElement {
 						<dt className="text-muted-foreground">Schema</dt>
 						<dd className="text-end font-mono">v{status.data.schemaVersion}</dd>
 						<dt className="text-muted-foreground">Updated</dt>
-						<dd
-							className="text-end"
-							title={formatDateTime(status.data.updatedAt)}
-						>
-							{formatRelative(status.data.updatedAt)}
+						<dd className="text-end">
+							<RelativeTime iso={status.data.updatedAt} />
 						</dd>
 					</dl>
 				) : (

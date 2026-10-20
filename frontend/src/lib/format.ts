@@ -39,14 +39,47 @@ export function formatRelative(iso: string, now: number = Date.now()): string {
 	return "just now";
 }
 
+const MONTHS = [
+	"Jan",
+	"Feb",
+	"Mar",
+	"Apr",
+	"May",
+	"Jun",
+	"Jul",
+	"Aug",
+	"Sep",
+	"Oct",
+	"Nov",
+	"Dec",
+];
+
+/**
+ * `Oct 20, 2026, 08:35 UTC`. Built by hand from UTC fields so the server
+ * (Node ICU) and the browser render identical text: `toLocaleString` differs
+ * between ICU builds ("at" vs ","), which breaks hydration.
+ */
 export function formatDateTime(iso: string): string {
 	const date = new Date(iso);
 	if (Number.isNaN(date.getTime())) return iso;
-	return date.toLocaleString("en-US", {
-		dateStyle: "medium",
-		timeStyle: "short",
-		timeZone: "UTC",
-	});
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}, ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC`;
+}
+
+/** `Oct 20, 2026` (UTC, deterministic across server and client). */
+export function formatDate(iso: string): string {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return iso;
+	return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
+}
+
+/** `2.1M`, `73k`, `1.5k`, `340`: short counts for badges and summaries. */
+export function formatCompact(n: number): string {
+	if (n >= 1_000_000)
+		return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+	if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+	if (n >= 1_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+	return String(n);
 }
 
 export function extname(name: string): string {

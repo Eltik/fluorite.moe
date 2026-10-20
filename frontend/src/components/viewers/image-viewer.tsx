@@ -14,6 +14,28 @@ import { cn } from "@/lib/utils";
 const MIN_SCALE = 0.05;
 const MAX_SCALE = 32;
 
+/** Upscale small images at most this much when fitting. */
+const MAX_FIT_SCALE = 6;
+const MODE_KEY = "fluorite.imageViewer.mode";
+
+type ZoomMode = "fit" | "actual";
+
+function readMode(): ZoomMode {
+	try {
+		return localStorage.getItem(MODE_KEY) === "actual" ? "actual" : "fit";
+	} catch {
+		return "fit";
+	}
+}
+
+function writeMode(mode: ZoomMode): void {
+	try {
+		localStorage.setItem(MODE_KEY, mode);
+	} catch {
+		// Storage blocked: the mode just is not remembered.
+	}
+}
+
 interface View {
 	scale: number;
 	x: number;
@@ -23,6 +45,8 @@ interface View {
 /**
  * Zoomable, pannable image on a checkerboard. Wheel / pinch-zoom around the
  * cursor, drag to pan, double-click toggles fit and 1:1. Keyboard: + - 0 1.
+ * Opens in the last mode the viewer chose (fit, which also enlarges small
+ * images, or actual size), remembered per browser.
  */
 export function ImageViewer({
 	src,
@@ -57,29 +81,54 @@ export function ImageViewer({
 		setFailed(false);
 	}, [src]);
 
-	const fit = React.useCallback(() => {
+	const [mode, setMode] = React.useState<ZoomMode>(readMode);
+	const chooseMode = React.useCallback((next: ZoomMode) => {
+		setMode(next);
+		writeMode(next);
+	}, []);
+
+	const fitScaleFor = React.useCallback(() => {
 		const frame = frameRef.current;
-		if (!frame || !natural) return;
-		const scale = Math.min(
-			1,
+		if (!frame || !natural) return null;
+		return Math.min(
+			MAX_FIT_SCALE,
 			(frame.clientWidth - 32) / natural.w,
 			(frame.clientHeight - 32) / natural.h,
 		);
-		setFitScale(scale);
-		setView({ scale, x: 0, y: 0 });
 	}, [natural]);
 
+	const fit = React.useCallback(() => {
+		const scale = fitScaleFor();
+		if (scale === null) return;
+		setFitScale(scale);
+		setView({ scale, x: 0, y: 0 });
+	}, [fitScaleFor]);
+
+	const actual = React.useCallback(() => {
+		const scale = fitScaleFor();
+		if (scale !== null) setFitScale(scale);
+		setView({ scale: 1, x: 0, y: 0 });
+	}, [fitScaleFor]);
+
+	// Apply the remembered mode to each new image and on resize.
+	const applyMode = mode === "fit" ? fit : actual;
+	const applyRef = React.useRef(applyMode);
+	applyRef.current = applyMode;
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: once per loaded image
 	React.useLayoutEffect(() => {
-		fit();
-	}, [fit]);
+		applyRef.current();
+	}, [natural]);
 
 	React.useEffect(() => {
 		const frame = frameRef.current;
 		if (!frame) return;
-		const observer = new ResizeObserver(() => fit());
+		const observer = new ResizeObserver(() => {
+			if (mode === "fit") fit();
+		});
 		observer.observe(frame);
 		return () => observer.disconnect();
-	}, [fit]);
+	}, [fit, mode]);
 
 	const zoomAt = React.useCallback(
 		(factor: number, clientX?: number, clientY?: number) => {
@@ -119,9 +168,13 @@ export function ImageViewer({
 	const onKeyDown = (event: React.KeyboardEvent) => {
 		if (event.key === "+" || event.key === "=") zoomAt(1.25);
 		else if (event.key === "-") zoomAt(0.8);
-		else if (event.key === "0") fit();
-		else if (event.key === "1") setView({ scale: 1, x: 0, y: 0 });
-		else return;
+		else if (event.key === "0") {
+			chooseMode("fit");
+			fit();
+		} else if (event.key === "1") {
+			chooseMode("actual");
+			actual();
+		} else return;
 		event.preventDefault();
 	};
 
@@ -153,15 +206,27 @@ export function ImageViewer({
 				</Button>
 				<Button
 					aria-label="Fit to view"
-					onClick={fit}
+					aria-pressed={mode === "fit"}
+					className={cn(mode === "fit" && "bg-accent text-foreground")}
+					onClick={() => {
+						chooseMode("fit");
+						fit();
+					}}
 					size="icon-sm"
+					title="Fit to view (0)"
 					variant="ghost"
 				>
 					<MaximizeIcon />
 				</Button>
 				<Button
-					onClick={() => setView({ scale: 1, x: 0, y: 0 })}
+					aria-pressed={mode === "actual"}
+					className={cn(mode === "actual" && "bg-accent text-foreground")}
+					onClick={() => {
+						chooseMode("actual");
+						actual();
+					}}
 					size="xs"
+					title="Actual size (1)"
 					variant="ghost"
 				>
 					1:1
@@ -180,11 +245,15 @@ export function ImageViewer({
 			<div
 				aria-label={`${alt}. Scroll to zoom, drag to pan, 0 to fit, 1 for actual size.`}
 				className="relative min-h-0 flex-1 cursor-grab touch-none select-none overflow-hidden bg-checker outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset active:cursor-grabbing"
-				onDoubleClick={() =>
-					Math.abs(view.scale - fitScale) < 0.001
-						? setView({ scale: 1, x: 0, y: 0 })
-						: fit()
-				}
+				onDoubleClick={() => {
+					if (Math.abs(view.scale - fitScale) < 0.001) {
+						chooseMode("actual");
+						actual();
+					} else {
+						chooseMode("fit");
+						fit();
+					}
+				}}
 				onKeyDown={onKeyDown}
 				onPointerDown={(event) => {
 					event.currentTarget.setPointerCapture(event.pointerId);
@@ -229,7 +298,9 @@ export function ImageViewer({
 							className={cn(
 								"absolute top-1/2 left-1/2 max-w-none",
 								!natural && "opacity-0",
-								view.scale > 2 && "[image-rendering:pixelated]",
+								view.scale > 2 &&
+									Math.abs(view.scale - fitScale) > 0.001 &&
+									"[image-rendering:pixelated]",
 							)}
 							decoding="async"
 							draggable={false}

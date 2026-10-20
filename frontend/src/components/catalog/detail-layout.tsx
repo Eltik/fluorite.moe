@@ -1,12 +1,10 @@
-import { Link } from "@tanstack/react-router";
-import { ChevronRightIcon } from "lucide-react";
 import * as React from "react";
 import { EntityImage } from "@/components/catalog/entity-image";
 import { RarityStars, rarityStyle } from "@/components/catalog/rarity";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { type CatalogKind, fileUrl } from "@/lib/api";
-import { type Gender, KIND_LABELS } from "@/lib/catalog";
+import type { Gender } from "@/lib/catalog";
 import { cn } from "@/lib/utils";
 
 /** What each kind's detail body receives from the route. */
@@ -16,6 +14,8 @@ export interface DetailProps<T> {
 	onTabChange: (tab: string) => void;
 	gender: Gender;
 	onGenderChange: (gender: Gender) => void;
+	/** Whether this entry's text differs by Endministrator gender. */
+	gendered?: boolean;
 }
 
 export function DetailPage({
@@ -30,47 +30,11 @@ export function DetailPage({
 	);
 }
 
-/** In-page trail: Catalog › Operators › Name (the top bar shows it too on desktop). */
-export function DetailCrumbs({
-	kind,
-	name,
-}: {
-	kind: CatalogKind;
-	name: string;
-}): React.ReactElement {
-	return (
-		<nav aria-label="Breadcrumb" className="text-muted-foreground text-xs">
-			<ol className="flex min-w-0 items-center gap-1">
-				<li>
-					<Link className="hover:text-foreground" to="/catalog">
-						Catalog
-					</Link>
-				</li>
-				<ChevronRightIcon aria-hidden className="size-3 shrink-0 opacity-60" />
-				<li>
-					<Link
-						className="hover:text-foreground"
-						params={{ kind }}
-						to="/catalog/$kind"
-					>
-						{KIND_LABELS[kind]}
-					</Link>
-				</li>
-				<ChevronRightIcon aria-hidden className="size-3 shrink-0 opacity-60" />
-				<li aria-current="page" className="truncate text-foreground/80">
-					{name}
-				</li>
-			</ol>
-		</nav>
-	);
-}
-
 /**
  * Hero header. `art` is a large illustration shown on the right (faded into
  * the card); `icon` the square thumbnail on the left.
  */
 export function DetailHero({
-	kind,
 	name,
 	subtitle,
 	icon,
@@ -81,6 +45,7 @@ export function DetailHero({
 	actions,
 	children,
 }: {
+	/** The entry's kind (the top bar shows the breadcrumb trail). */
 	kind: CatalogKind;
 	name: string;
 	subtitle?: React.ReactNode;
@@ -130,7 +95,6 @@ export function DetailHero({
 				/>
 			) : null}
 			<div className="flex min-h-48 flex-col gap-4 p-4 sm:min-h-64 sm:p-6">
-				<DetailCrumbs kind={kind} name={name} />
 				<div className="flex flex-1 items-end gap-4">
 					<EntityImage
 						alt=""
@@ -328,11 +292,14 @@ export function Facts({
 export function GenderToggle({
 	value,
 	onChange,
+	showLabel = false,
 }: {
 	value: Gender;
 	onChange: (gender: Gender) => void;
+	/** Prefix the ♀/♂ pair with a visible "Endministrator" label. */
+	showLabel?: boolean;
 }): React.ReactElement {
-	return (
+	const toggle = (
 		<ToggleGroup
 			aria-label="Endministrator gender for {F}/{M} text"
 			onValueChange={(next) => {
@@ -351,6 +318,13 @@ export function GenderToggle({
 				♂
 			</ToggleGroupItem>
 		</ToggleGroup>
+	);
+	if (!showLabel) return toggle;
+	return (
+		<div className="inline-flex items-center gap-2 bg-transparent! backdrop-blur-none!">
+			<span className="text-muted-foreground text-xs">Endministrator</span>
+			{toggle}
+		</div>
 	);
 }
 

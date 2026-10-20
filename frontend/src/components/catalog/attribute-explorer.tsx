@@ -97,6 +97,16 @@ export function AttributeExplorer({
 		return out;
 	}, [hasStages, breakStage, n, markerLevels, level]);
 
+	const markerLabels = React.useMemo(
+		() =>
+			markers.map((i) =>
+				hasStages
+					? stageLabel(breakStage[i] as number)
+					: `Lv ${level[i] as number}`,
+			),
+		[markers, hasStages, stageLabel, breakStage, level],
+	);
+
 	const fixedEntries = React.useMemo(() => {
 		const merged = { ...constants, ...(fixed ?? {}) };
 		return sortAttrs(Object.keys(merged)).map(
@@ -167,6 +177,7 @@ export function AttributeExplorer({
 								return text.endsWith("%") ? text : compactNumber(v);
 							}}
 							label={`${attrLabel(attr)} by level`}
+							markerLabels={markerLabels}
 							markers={markers}
 							onSelect={setRow}
 							x={level}

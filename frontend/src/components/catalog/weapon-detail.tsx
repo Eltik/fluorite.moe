@@ -17,6 +17,7 @@ import {
 } from "@/components/catalog/detail-layout";
 import { ModelPanel } from "@/components/catalog/model-panel";
 import { SkillsPanel } from "@/components/catalog/skills-panel";
+import { TagGlyph } from "@/components/catalog/tag-glyph";
 import { RichText } from "@/components/rich-text/rich-text";
 import { Button } from "@/components/ui/button";
 import type { AttrSeries, WeaponDetail as Weapon } from "@/lib/catalog";
@@ -28,6 +29,7 @@ export default function WeaponDetail({
 	onTabChange,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Weapon>): React.ReactElement {
 	const atk = React.useMemo<AttrSeries>(
 		() => ({
@@ -48,7 +50,13 @@ export default function WeaponDetail({
 			<DetailHero
 				actions={
 					<>
-						<GenderToggle onChange={onGenderChange} value={gender} />
+						{gendered && (
+							<GenderToggle
+								onChange={onGenderChange}
+								showLabel
+								value={gender}
+							/>
+						)}
 						{hasModel && (
 							<Button
 								render={<Link {...studioLink("weapons", data.id)} />}
@@ -65,7 +73,13 @@ export default function WeaponDetail({
 				artClassName="object-contain object-right p-4"
 				chips={
 					<>
-						<InfoChip>{data.weaponType.name}</InfoChip>
+						<InfoChip>
+							<TagGlyph
+								className="-ms-1 size-4"
+								tag={{ kind: "weaponType", ...data.weaponType }}
+							/>
+							{data.weaponType.name}
+						</InfoChip>
 						<InfoChip>Max Lv {data.maxLevel}</InfoChip>
 					</>
 				}
@@ -170,7 +184,12 @@ export default function WeaponDetail({
 						value: "model",
 						label: "Model",
 						content: () => (
-							<ModelPanel id={data.id} kind="weapons" model={data.model} />
+							<ModelPanel
+								id={data.id}
+								kind="weapons"
+								model={data.model}
+								name={data.name}
+							/>
 						),
 					},
 				]}

@@ -5,18 +5,28 @@ import {
 	ChevronLeftIcon,
 	ChevronRightIcon,
 	PlayIcon,
-	TypeIcon,
+	Settings2Icon,
 } from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
 import { GenderToggle } from "@/components/catalog/detail-layout";
 import { DefaultPending, ErrorState } from "@/components/status-views";
+import {
+	cleanSpeakerName,
+	partLabel,
+	saveLastRead,
+} from "@/components/story/story-labels";
 import { StoryReader } from "@/components/story/story-reader";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
+import {
+	Popover,
+	PopoverPopup,
+	PopoverTitle,
+	PopoverTrigger,
+} from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { isApiError } from "@/lib/api";
 import {
@@ -100,6 +110,20 @@ function DialogPage(): React.ReactElement {
 	const list = useQuery(storyListQuery(textLanguage));
 	const located = locateDialog(list.data, dialogId);
 
+	const loadedTitle = query.data?.title;
+	const loadedId = query.data?.id;
+	React.useEffect(() => {
+		if (!loadedId) return;
+		const g = located?.group;
+		const label = g ? partLabel(dialogShortLabel(loadedId, g.id)) : undefined;
+		const title = loadedTitle || g?.title;
+		saveLastRead({
+			id: loadedId,
+			title: title && label ? `${title} · ${label}` : (title ?? label),
+			at: Date.now(),
+		});
+	}, [loadedId, loadedTitle, located?.group]);
+
 	const [typewriter, setTypewriter] = React.useState(true);
 	React.useEffect(() => setTypewriter(readTypewriter()), []);
 	const toggleTypewriter = (on: boolean) => {
@@ -144,7 +168,18 @@ function DialogPage(): React.ReactElement {
 	const prev = index > 0 ? siblings[index - 1] : undefined;
 	const next =
 		index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : undefined;
-	const groupLabel = located?.group.title || located?.group.id;
+	const groupLabel = located?.group.title || undefined;
+	const groupId = located?.group.id ?? dialog.group ?? "";
+	const part = (id: string) => partLabel(dialogShortLabel(id, groupId));
+	const heading = dialog.title || located?.group.title || part(dialogId);
+	const speakers = [
+		...new Set(
+			dialog.nodes
+				.map((n) => n.speaker?.name)
+				.filter((n): n is string => Boolean(n))
+				.map(cleanSpeakerName),
+		),
+	];
 
 	return (
 		<div className="mx-auto flex w-full max-w-3xl flex-col gap-4 p-4 md:p-6 lg:p-8">
@@ -176,15 +211,18 @@ function DialogPage(): React.ReactElement {
 				<div className="flex flex-wrap items-end justify-between gap-3">
 					<div className="min-w-0">
 						<h1 className="text-balance font-heading font-semibold text-xl tracking-tight sm:text-2xl">
-							{dialog.title || located?.group.title || dialogId}
+							{heading}
 						</h1>
-						<p className="font-mono text-muted-foreground text-xs">
-							{dialogId}
-							{siblings.length > 1 && index >= 0 && (
-								<span className="font-sans">
-									{" "}
-									· part {index + 1} of {siblings.length}
-								</span>
+						<p className="text-muted-foreground text-xs" title={dialogId}>
+							{siblings.length > 1 && index >= 0
+								? `${part(dialogId)} · ${index + 1} of ${siblings.length}`
+								: part(dialogId)}
+							{speakers.length > 0 && (
+								<>
+									{" · "}
+									{speakers.slice(0, 4).join(", ")}
+									{speakers.length > 4 ? ` +${speakers.length - 4}` : ""}
+								</>
 							)}
 						</p>
 					</div>
@@ -210,47 +248,89 @@ function DialogPage(): React.ReactElement {
 							Read all
 						</ToggleGroupItem>
 					</ToggleGroup>
-					{mode === "play" && (
-						<Toggle
-							aria-label="Typewriter reveal"
-							onPressedChange={toggleTypewriter}
-							pressed={typewriter}
-							size="sm"
-							title="Reveal lines letter by letter (off when reduced motion is on)"
-							variant="outline"
-						>
-							<TypeIcon />
-							<span className="max-sm:hidden">Typewriter</span>
-						</Toggle>
-					)}
-					<div className="flex items-center gap-2">
-						<Switch
-							checked={Boolean(search.alt)}
-							disabled={!hasAlt}
-							id="alt-text"
-							onCheckedChange={(checked) =>
-								setSearch({ alt: checked || undefined })
-							}
-						/>
-						<Label
-							className={hasAlt ? "" : "text-muted-foreground"}
-							htmlFor="alt-text"
-							title={
-								hasAlt ? undefined : "This dialog has no gender-specific lines"
+					<Popover>
+						<PopoverTrigger
+							render={
+								<Button
+									aria-label="Reader settings"
+									size="sm"
+									title="Reader settings"
+									variant="outline"
+								/>
 							}
 						>
-							Alternate gender text
-						</Label>
-					</div>
-					<div className="ms-auto flex items-center gap-2">
-						<span className="text-muted-foreground text-xs max-sm:hidden">
-							Endmin
+							<Settings2Icon />
+							<span className="max-sm:hidden">Settings</span>
+						</PopoverTrigger>
+						<PopoverPopup align="start" className="w-72">
+							<PopoverTitle className="mb-3 text-sm">Reader</PopoverTitle>
+							<div className="flex flex-col gap-3">
+								<div className="flex items-start gap-3">
+									<Switch
+										aria-describedby="typewriter-hint"
+										checked={typewriter}
+										disabled={mode !== "play"}
+										id="typewriter"
+										onCheckedChange={toggleTypewriter}
+									/>
+									<div className="flex flex-col gap-0.5">
+										<Label htmlFor="typewriter">Typewriter reveal</Label>
+										<span
+											className="text-muted-foreground text-xs"
+											id="typewriter-hint"
+										>
+											Play mode types lines out letter by letter (off when
+											reduced motion is on).
+										</span>
+									</div>
+								</div>
+								<div className="flex items-start gap-3">
+									<Switch
+										aria-describedby="alt-text-hint"
+										aria-label="Alternate gender text"
+										checked={Boolean(search.alt)}
+										disabled={!hasAlt}
+										id="alt-text"
+										onCheckedChange={(checked) =>
+											setSearch({ alt: checked || undefined })
+										}
+									/>
+									<div className="flex flex-col gap-0.5">
+										<Label
+											className={hasAlt ? "" : "text-muted-foreground"}
+											htmlFor="alt-text"
+										>
+											Show alternate gender text
+										</Label>
+										<span
+											className="text-muted-foreground text-xs"
+											id="alt-text-hint"
+										>
+											{hasAlt
+												? "Also show how gendered lines read for the other Endministrator."
+												: "This dialog has no gender-specific lines."}
+										</span>
+									</div>
+								</div>
+							</div>
+						</PopoverPopup>
+					</Popover>
+					<fieldset
+						className="ms-auto flex min-w-0 items-center gap-2 border-0 p-0"
+						title="Which Endministrator the dialog addresses ({F}/{M} text)"
+					>
+						<legend className="sr-only">Endministrator variant</legend>
+						<span
+							aria-hidden
+							className="text-muted-foreground text-xs max-sm:hidden"
+						>
+							Endministrator
 						</span>
 						<GenderToggle
 							onChange={(g) => setSearch({ gender: g === "f" ? undefined : g })}
 							value={gender}
 						/>
-					</div>
+					</fieldset>
 				</div>
 				{mode === "play" && (
 					<p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground text-xs max-sm:hidden">
@@ -297,7 +377,7 @@ function DialogPage(): React.ReactElement {
 							variant="outline"
 						>
 							<ChevronLeftIcon />
-							Part {dialogShortLabel(prev, located?.group.id ?? "")}
+							{part(prev)}
 						</Button>
 					) : (
 						<span />
@@ -314,7 +394,7 @@ function DialogPage(): React.ReactElement {
 							size="sm"
 							variant="outline"
 						>
-							Part {dialogShortLabel(next, located?.group.id ?? "")}
+							{part(next)}
 							<ChevronRightIcon />
 						</Button>
 					)}

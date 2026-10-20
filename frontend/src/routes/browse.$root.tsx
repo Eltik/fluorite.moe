@@ -1,6 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link, notFound } from "@tanstack/react-router";
-import { ArrowLeftIcon, FolderOpenIcon } from "lucide-react";
+import {
+	createFileRoute,
+	Link,
+	notFound,
+	redirect,
+} from "@tanstack/react-router";
+import { ArrowLeftIcon, FolderOpenIcon, FolderXIcon } from "lucide-react";
 import * as React from "react";
 import { z } from "zod";
 import {
@@ -12,13 +17,14 @@ import { ErrorState, ListSkeleton } from "@/components/status-views";
 import { Button } from "@/components/ui/button";
 import {
 	Empty,
+	EmptyContent,
 	EmptyDescription,
 	EmptyHeader,
 	EmptyMedia,
 	EmptyTitle,
 } from "@/components/ui/empty";
 import { FilePreview } from "@/components/viewers/file-preview";
-import { isRoot, type Root, type TreeEntry } from "@/lib/api";
+import { isApiError, isRoot, type Root, type TreeEntry } from "@/lib/api";
 import { basename, dirname, formatNumber } from "@/lib/format";
 import { ROOT_META } from "@/lib/nav";
 import { treeQuery } from "@/lib/queries";
@@ -42,8 +48,22 @@ export const Route = createFileRoute("/browse/$root")({
 		stringify: ({ root }) => ({ root }),
 	},
 	loaderDeps: ({ search }) => ({ path: search.path }),
-	loader: ({ context, params, deps }) =>
-		context.queryClient.query(treeQuery(params.root, deps.path)),
+	loader: async ({ context, params, deps }) => {
+		try {
+			await context.queryClient.query(treeQuery(params.root, deps.path));
+		} catch (error) {
+			// `?path=` pointing at a file: open it in its folder instead.
+			if (isApiError(error) && error.status === 400 && deps.path) {
+				throw redirect({
+					to: "/browse/$root",
+					params: { root: params.root },
+					search: { path: dirname(deps.path), file: deps.path },
+					replace: true,
+				});
+			}
+			// Anything else is shown inside the listing pane, not as a full page.
+		}
+	},
 	head: ({ params, match }) => {
 		const search = match.search as { path?: string; file?: string };
 		return {
@@ -161,7 +181,41 @@ function BrowsePage(): React.ReactElement {
 					/>
 				</div>
 				{tree.isError ? (
-					<ErrorState error={tree.error} onRetry={() => void tree.refetch()} />
+					isApiError(tree.error) && tree.error.status === 404 ? (
+						<Empty>
+							<EmptyHeader>
+								<EmptyMedia variant="icon">
+									<FolderXIcon />
+								</EmptyMedia>
+								<EmptyTitle>Folder not found</EmptyTitle>
+								<EmptyDescription>
+									Nothing at “{path}” in {meta.label}.
+									<span className="mt-1 block font-mono text-xs">
+										{tree.error.message}
+									</span>
+								</EmptyDescription>
+							</EmptyHeader>
+							<EmptyContent>
+								<Button
+									render={
+										<Link
+											params={{ root }}
+											search={{ path: "" }}
+											to="/browse/$root"
+										/>
+									}
+									variant="outline"
+								>
+									Back to {meta.label}
+								</Button>
+							</EmptyContent>
+						</Empty>
+					) : (
+						<ErrorState
+							error={tree.error}
+							onRetry={() => void tree.refetch()}
+						/>
+					)
 				) : tree.isPending ? (
 					<ListSkeleton rows={18} />
 				) : (

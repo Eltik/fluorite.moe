@@ -19,6 +19,17 @@ export type BackgroundId = (typeof BACKGROUND_IDS)[number];
 export const LIGHTING_IDS = ["studio", "soft", "dramatic", "flat"] as const;
 export type LightingId = (typeof LIGHTING_IDS)[number];
 
+export const SHADING_IDS = ["toon", "standard"] as const;
+export type ShadingId = (typeof SHADING_IDS)[number];
+
+export const PICKER_KINDS = [
+	"operators",
+	"enemies",
+	"weapons",
+	"npcs",
+] as const;
+export type PickerKind = (typeof PICKER_KINDS)[number];
+
 export type ZUpMode = "auto" | "on" | "off";
 
 export const DPR_CAPS = [1, 1.5, 2, 3] as const;
@@ -27,8 +38,11 @@ export interface StudioPrefs {
 	background: BackgroundId;
 	customColor: string;
 	lighting: LightingId;
+	shading: ShadingId;
+	outlines: boolean;
 	exposure: number;
 	grid: boolean;
+	floor: boolean;
 	groundShadow: boolean;
 	wireframe: boolean;
 	skeleton: boolean;
@@ -37,14 +51,19 @@ export interface StudioPrefs {
 	dprCap: number;
 	zUp: ZUpMode;
 	welcomeDismissed: boolean;
+	/** Last tab opened in the model picker. */
+	pickerKind: PickerKind;
 }
 
 export const DEFAULT_PREFS: StudioPrefs = {
 	background: "auto",
 	customColor: "#2b2540",
 	lighting: "studio",
+	shading: "toon",
+	outlines: true,
 	exposure: 1,
 	grid: false,
+	floor: true,
 	groundShadow: true,
 	wireframe: false,
 	skeleton: false,
@@ -53,6 +72,7 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	dprCap: 2,
 	zUp: "auto",
 	welcomeDismissed: false,
+	pickerKind: "operators",
 };
 
 const KEY = "fluorite.studio";
@@ -86,6 +106,8 @@ function read(): StudioPrefs {
 			background: pick(p.background, BACKGROUND_IDS, d.background),
 			customColor: isHexColor(p.customColor) ? p.customColor : d.customColor,
 			lighting: pick(p.lighting, LIGHTING_IDS, d.lighting),
+			shading: pick(p.shading, SHADING_IDS, d.shading),
+			outlines: bool(p.outlines, d.outlines),
 			exposure:
 				typeof p.exposure === "number" &&
 				p.exposure >= 0.25 &&
@@ -93,6 +115,7 @@ function read(): StudioPrefs {
 					? p.exposure
 					: d.exposure,
 			grid: bool(p.grid, d.grid),
+			floor: bool(p.floor, d.floor),
 			groundShadow: bool(p.groundShadow, d.groundShadow),
 			wireframe: bool(p.wireframe, d.wireframe),
 			skeleton: bool(p.skeleton, d.skeleton),
@@ -105,6 +128,7 @@ function read(): StudioPrefs {
 					: d.dprCap,
 			zUp: pick(p.zUp, ["auto", "on", "off"] as const, d.zUp),
 			welcomeDismissed: bool(p.welcomeDismissed, d.welcomeDismissed),
+			pickerKind: pick(p.pickerKind, PICKER_KINDS, d.pickerKind),
 		};
 	} catch {
 		return DEFAULT_PREFS;
@@ -133,9 +157,10 @@ export function setPrefs(patch: Partial<StudioPrefs>): void {
 	for (const listener of listeners) listener();
 }
 
-/** Restores every display preference except the dismissed welcome hint. */
+/** Restores every display preference except the welcome hint and picker tab. */
 export function resetPrefs(): void {
-	setPrefs({ ...DEFAULT_PREFS, welcomeDismissed: snapshot().welcomeDismissed });
+	const { welcomeDismissed, pickerKind } = snapshot();
+	setPrefs({ ...DEFAULT_PREFS, welcomeDismissed, pickerKind });
 }
 
 function subscribe(listener: () => void): () => void {

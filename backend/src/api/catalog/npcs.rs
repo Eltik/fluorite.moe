@@ -1,12 +1,13 @@
 //! NPCs: `NpcTable` (names, titles, factions) with mesh folders from `dataKey`.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use super::assets::{ModelInfo, model_info};
+use super::assets::{ModelInfo, UI, model_info};
 use super::tables::*;
 use super::text::Texts;
 use super::{BaseItem, BaseTag, Env, TagName, dep, finish_detail, sort_id};
@@ -28,7 +29,50 @@ impl Tables {
     }
 }
 
+/// Portrait for an NPC from `charicon/`: `icon_npc_<id>` or `icon_npc_<dataKey>`, an
+/// `icon_npc_<n>_<name>` sprite matching the id's name token, or the operator icon
+/// for operator stand-ins (`npc_0005_chen_spaceship_i001` → `icon_chr_0005_chen`).
+fn npc_icon(
+    env: &Env,
+    npc_names: &HashMap<String, String>,
+    id: &str,
+    data_key: &str,
+) -> Option<String> {
+    let mut names = vec![format!("icon_npc_{id}")];
+    if !data_key.is_empty() {
+        names.push(format!("icon_npc_{data_key}"));
+    }
+    let parts: Vec<&str> = id.split('_').collect();
+    if let [prefix, num, name, ..] = parts.as_slice()
+        && *prefix == "npc"
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        if let Some(file) = npc_names.get(&name.to_ascii_lowercase()) {
+            names.push(file.clone());
+        }
+        names.push(format!("icon_chr_{num}_{name}"));
+    }
+    names.iter().find_map(|n| env.ui("charicon", n))
+}
+
+/// `icon_npc_1001_andrew` → `andrew`, for every NPC sprite in `charicon/`.
+fn npc_icon_names(env: &Env) -> HashMap<String, String> {
+    let dir = env.textures.join(UI).join("charicon");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return HashMap::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|f| {
+            let stem = f.strip_suffix(".png")?.strip_prefix("icon_npc_")?;
+            let name = stem.rsplit('_').next()?;
+            Some((name.to_ascii_lowercase(), format!("icon_npc_{stem}")))
+        })
+        .collect()
+}
+
 pub fn base(t: &Tables, env: &Env) -> Vec<BaseItem> {
+    let npc_names = npc_icon_names(env);
     let mut items: Vec<BaseItem> = t
         .npcs
         .iter()
@@ -54,7 +98,7 @@ pub fn base(t: &Tables, env: &Env) -> Vec<BaseItem> {
                 fallback_name: id.clone(),
                 rarity: None,
                 tags,
-                icon: None,
+                icon: npc_icon(env, &npc_names, id, &n.data_key),
                 has_model: env.meshes.npc(&n.data_key).is_some(),
                 type_code: None,
             }
@@ -76,6 +120,8 @@ pub struct NpcDetail {
     pub faction: Option<String>,
     pub data_key: String,
     pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub model: ModelInfo,
 }
 
@@ -91,6 +137,7 @@ pub fn detail(t: &Tables, env: &Env, texts: &Texts, id: &str) -> Option<Value> {
         faction: texts.plain_opt(n.faction),
         data_key: n.data_key.clone(),
         group_id: n.npc_group_id.clone(),
+        icon: npc_icon(env, &npc_icon_names(env), id, &n.data_key),
         model: model_info(
             &env.output,
             &env.rig,

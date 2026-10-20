@@ -41,6 +41,24 @@ const ModelViewer = React.lazy(() => import("./model-viewer"));
 /** Above this, text previews wait for an explicit click. */
 const LARGE_TEXT_BYTES = 24 * 1024 * 1024;
 const TEXT_FALLBACK_MAX = 4 * 1024 * 1024;
+/** How much of a large file the "first part" preview fetches (one Range request). */
+const HEAD_BYTES = 1024 * 1024;
+
+/** First `HEAD_BYTES` of a file, cut back to the last complete line. */
+async function fetchHead(
+	root: Root,
+	path: string,
+	signal: AbortSignal,
+): Promise<string> {
+	const res = await fetch(fileUrl(root, path), {
+		headers: { Range: `bytes=0-${HEAD_BYTES - 1}` },
+		signal,
+	});
+	if (!res.ok) throw new Error(`Request failed (${res.status})`);
+	const text = await res.text();
+	const cut = text.lastIndexOf("\n");
+	return cut > 0 ? text.slice(0, cut) : text;
+}
 
 function langFor(name: string): HighlightLang | null {
 	const ext = extname(name);
@@ -221,9 +239,21 @@ function TextPreview({
 	size?: number;
 	lang: HighlightLang | null;
 }): React.ReactElement {
-	const [confirmed, setConfirmed] = React.useState(false);
-	const gated = !confirmed && (size ?? 0) > LARGE_TEXT_BYTES;
-	const query = useQuery({ ...fileTextQuery(root, path), enabled: !gated });
+	const large = (size ?? 0) > LARGE_TEXT_BYTES;
+	const [mode, setMode] = React.useState<"gate" | "head" | "full">(
+		large ? "gate" : "full",
+	);
+	const gated = mode === "gate";
+	const query = useQuery({
+		...fileTextQuery(root, path),
+		enabled: mode === "full",
+	});
+	const head = useQuery({
+		queryKey: ["file-head", root, path],
+		queryFn: ({ signal }) => fetchHead(root, path, signal),
+		enabled: mode === "head",
+		staleTime: 10 * 60_000,
+	});
 
 	const parsed = React.useMemo(() => {
 		if (kind !== "json" || query.data === undefined) return null;
@@ -246,15 +276,48 @@ function TextPreview({
 					</EmptyMedia>
 					<EmptyTitle>Large file</EmptyTitle>
 					<EmptyDescription>
-						This file is {formatBytes(size)}. Loading it may take a moment.
+						This file is {formatBytes(size)}. Loading all of it may take a
+						while; the first {formatBytes(HEAD_BYTES)} opens instantly as plain
+						text.
 					</EmptyDescription>
 				</EmptyHeader>
-				<EmptyContent>
-					<Button onClick={() => setConfirmed(true)} variant="outline">
-						Load preview
+				<EmptyContent className="flex-row justify-center">
+					<Button onClick={() => setMode("head")}>
+						Show first {formatBytes(HEAD_BYTES)}
+					</Button>
+					<Button onClick={() => setMode("full")} variant="outline">
+						Load full file
 					</Button>
 				</EmptyContent>
 			</Empty>
+		);
+	}
+	if (mode === "head") {
+		if (head.isError) {
+			return (
+				<ErrorState error={head.error} onRetry={() => void head.refetch()} />
+			);
+		}
+		if (head.data === undefined) return <ViewerFallback />;
+		return (
+			<div className="flex min-h-0 flex-1 flex-col">
+				<div className="flex shrink-0 items-center gap-2 border-b bg-muted/40 px-3 py-1.5 text-muted-foreground text-xs">
+					<FileTextIcon className="size-3.5" />
+					Showing the first {formatBytes(HEAD_BYTES)} of {formatBytes(size)} as
+					text.
+					<Button
+						className="ms-auto"
+						onClick={() => setMode("full")}
+						size="xs"
+						variant="outline"
+					>
+						Load full file
+					</Button>
+				</div>
+				<React.Suspense fallback={<ViewerFallback />}>
+					<CodeViewer code={head.data} key={`${path}#head`} lang={lang} />
+				</React.Suspense>
+			</div>
 		);
 	}
 	if (query.isError) {

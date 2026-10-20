@@ -94,13 +94,17 @@ export function AudioEntryList({
 					const key = entryKey(e);
 					const isCurrent = current === key;
 					const isSelected = item.index === selected;
+					const playable = Boolean(e.audio);
 					return (
 						<div
+							aria-disabled={playable ? undefined : true}
 							aria-selected={isSelected}
 							className={cn(
 								"absolute inset-x-0 flex cursor-pointer items-center gap-3 border-b px-2 transition-colors hover:bg-accent/50 sm:px-3",
 								isSelected && "bg-accent/70 hover:bg-accent/70",
-								isCurrent && "text-primary",
+								isCurrent &&
+									"text-primary shadow-[inset_2px_0_0_var(--color-primary)]",
+								!playable && "cursor-default text-muted-foreground",
 							)}
 							data-index={item.index}
 							key={`${e.pack}/${e.id}`}
@@ -122,7 +126,10 @@ export function AudioEntryList({
 									title={entryTitle(e)}
 								/>
 							) : (
-								<span className="flex size-8 shrink-0 items-center justify-center text-muted-foreground sm:size-7">
+								<span
+									className="flex size-8 shrink-0 items-center justify-center text-muted-foreground/60 sm:size-7"
+									title="Soundbank reference: no decoded media to play"
+								>
 									<PackageIcon className="size-4" />
 								</span>
 							)}
@@ -135,6 +142,15 @@ export function AudioEntryList({
 								</div>
 							</div>
 							<div className="flex shrink-0 items-center gap-2 text-muted-foreground text-xs tabular-nums">
+								{!playable && (
+									<Badge
+										className="hidden sm:inline-flex"
+										size="sm"
+										variant="secondary"
+									>
+										No media
+									</Badge>
+								)}
 								<Badge className="w-9" size="sm" variant="outline">
 									{e.lang}
 								</Badge>

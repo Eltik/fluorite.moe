@@ -197,7 +197,7 @@ const Tile = React.memo(function Tile({
 					<ImageOffIcon className="size-5 text-muted-foreground" />
 				) : (
 					<img
-						alt=""
+						alt={item.name}
 						className={cn(
 							"max-h-full max-w-full object-contain transition-opacity duration-300",
 							state === "loading" ? "opacity-0" : "opacity-100",

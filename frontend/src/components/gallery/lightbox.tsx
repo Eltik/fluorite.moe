@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import {
 	ChevronLeftIcon,
 	ChevronRightIcon,
+	CopyIcon,
 	FolderOpenIcon,
 } from "lucide-react";
 import * as React from "react";
@@ -12,8 +13,10 @@ import {
 	DialogPopup,
 	DialogTitle,
 } from "@/components/ui/dialog";
+import { Kbd } from "@/components/ui/kbd";
 import { ImageViewer } from "@/components/viewers/image-viewer";
 import { fileUrl, thumbUrl } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import { dirname } from "@/lib/format";
 import type { GridItem } from "./texture-grid";
 
@@ -79,7 +82,7 @@ export function Lightbox({
 					<>
 						<div className="flex shrink-0 items-center gap-3 border-b py-2 ps-4 pe-12">
 							<img
-								alt=""
+								alt={item.name}
 								className="size-8 shrink-0 rounded border bg-checker object-contain"
 								src={thumbUrl(item.path, 128)}
 							/>
@@ -87,13 +90,32 @@ export function Lightbox({
 								<DialogTitle className="truncate font-medium text-sm">
 									{item.name}
 								</DialogTitle>
-								<DialogDescription
-									className="truncate text-xs"
-									title={item.path}
-								>
-									{dirname(item.path)}
-								</DialogDescription>
+								<div className="flex min-w-0 items-center gap-1">
+									<DialogDescription
+										className="truncate font-mono text-xs"
+										title={item.path}
+									>
+										{item.path}
+									</DialogDescription>
+									<Button
+										aria-label="Copy path"
+										className="shrink-0"
+										onClick={() => void copyText(item.path, "Path")}
+										size="icon-xs"
+										title="Copy path"
+										variant="ghost"
+									>
+										<CopyIcon />
+									</Button>
+								</div>
 							</div>
+							{items.length > 1 && (
+								<span className="hidden shrink-0 items-center gap-1 text-muted-foreground text-xs md:flex">
+									<Kbd>←</Kbd>
+									<Kbd>→</Kbd>
+									<span>step</span>
+								</span>
+							)}
 							<span className="shrink-0 text-muted-foreground text-xs tabular-nums">
 								{(index ?? 0) + 1} /{" "}
 								{Math.max(total ?? 0, items.length).toLocaleString()}
@@ -120,24 +142,28 @@ export function Lightbox({
 								key={item.path}
 								src={fileUrl("textures", item.path)}
 							/>
-							<Button
-								aria-label="Previous texture"
-								className="absolute top-1/2 left-3 -translate-y-1/2 rounded-full shadow-md"
-								onClick={() => go(-1)}
-								size="icon"
-								variant="outline"
-							>
-								<ChevronLeftIcon />
-							</Button>
-							<Button
-								aria-label="Next texture"
-								className="absolute top-1/2 right-3 -translate-y-1/2 rounded-full shadow-md"
-								onClick={() => go(1)}
-								size="icon"
-								variant="outline"
-							>
-								<ChevronRightIcon />
-							</Button>
+							{items.length > 1 && (
+								<>
+									<Button
+										aria-label="Previous texture"
+										className="absolute top-1/2 left-3 -translate-y-1/2 rounded-full shadow-md"
+										onClick={() => go(-1)}
+										size="icon"
+										variant="outline"
+									>
+										<ChevronLeftIcon />
+									</Button>
+									<Button
+										aria-label="Next texture"
+										className="absolute top-1/2 right-3 -translate-y-1/2 rounded-full shadow-md"
+										onClick={() => go(1)}
+										size="icon"
+										variant="outline"
+									>
+										<ChevronRightIcon />
+									</Button>
+								</>
+							)}
 						</div>
 					</>
 				)}

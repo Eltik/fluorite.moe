@@ -1,7 +1,8 @@
 //! Audio: Wwise packages indexed and served as browser-playable clips.
 //!
 //! - `GET /api/audio`: packages, languages, counts, mapping coverage, tool availability.
-//! - `GET /api/audio/entries?pack=&lang=&q=&kind=&offset=&limit=`: paged entries.
+//! - `GET /api/audio/entries?pack=&lang=&q=&kind=&playable=&offset=&limit=`: paged
+//!   entries (`playable=true` drops soundbank refs, which have no media).
 //! - `GET /audio/{pack}/{id}.{ogg|m4a|wav}`: on-demand transcode, cached under
 //!   `<cache>/audio/`, served with Range/ETag (see [`transcode`]).
 //! - `GET /api/voice/{charId}?lang=`: an operator's voice lines with per-language audio.
@@ -675,6 +676,8 @@ pub struct EntriesQuery {
     pub lang: Option<String>,
     pub q: Option<String>,
     pub kind: Option<String>,
+    /// `true` keeps only entries with decodable media (streams and externals).
+    pub playable: Option<bool>,
     pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -710,6 +713,7 @@ pub async fn entries(
                 .ok_or_else(|| ApiError::bad_request("kind must be bank, stream or external"))?,
         ),
     };
+    let playable = q.playable.unwrap_or(false);
     let needle =
         q.q.as_deref()
             .map(|s| s.trim().to_ascii_lowercase())
@@ -723,6 +727,7 @@ pub async fn entries(
             if packs.as_ref().is_some_and(|p| !p.contains(&e.pack))
                 || lang.as_ref().is_some_and(|x| *x != e.lang)
                 || kind.is_some_and(|k| k != e.kind)
+                || (playable && e.kind == EntryKind::Bank)
             {
                 return false;
             }

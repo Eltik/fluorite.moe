@@ -4,13 +4,14 @@ import { BoxIcon } from "lucide-react";
 import * as React from "react";
 import { EntityImage } from "@/components/catalog/entity-image";
 import { RarityStars, rarityStyle } from "@/components/catalog/rarity";
+import { TagGlyph } from "@/components/catalog/tag-glyph";
 import type { CatalogKind } from "@/lib/api";
-import type { ListItem } from "@/lib/catalog";
+import { entityVariant, type ListItem, tagIcon } from "@/lib/catalog";
 import { useSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
 const GAP = 12;
-const INFO = 66;
+const INFO = 80;
 
 /**
  * Responsive, row-virtualized card grid. Columns follow the container width;
@@ -24,7 +25,7 @@ export function CatalogGrid({
 	label,
 }: {
 	kind: CatalogKind;
-	items: ListItem[];
+	items: GridItem[];
 	scrollElement: () => HTMLElement | null;
 	label: string;
 }): React.ReactElement {
@@ -152,6 +153,16 @@ export function CatalogGrid({
 	);
 }
 
+/** A list entry, optionally standing for a collapsed series of entries. */
+export type GridItem = ListItem & {
+	/** Number of entries this card stands for (a medal series), when > 1. */
+	series?: number;
+	/** Category colour behind the image (white silhouettes need a backdrop). */
+	tint?: string;
+};
+
+const ICON_KINDS = new Set(["profession", "element", "weaponType"]);
+
 const CatalogCard = React.memo(function CatalogCard({
 	kind,
 	item,
@@ -160,35 +171,60 @@ const CatalogCard = React.memo(function CatalogCard({
 	onFocus,
 }: {
 	kind: CatalogKind;
-	item: ListItem;
+	item: GridItem;
 	index: number;
 	tabIndex: number;
 	onFocus: () => void;
 }): React.ReactElement {
-	const tags = item.tags.slice(0, item.rarity ? 1 : 2);
+	const glyphs = item.tags.filter((t) => ICON_KINDS.has(t.kind) && tagIcon(t));
+	const words = item.tags
+		.filter((t) => !glyphs.includes(t))
+		.slice(0, item.rarity || glyphs.length ? 1 : 2);
+	const variant = entityVariant(item.id);
+	const tagSummary = item.tags.map((t) => t.name).join(" · ");
 	return (
 		<Link
+			aria-label={[
+				item.name,
+				variant && (variant === "m" ? "male" : "female"),
+				item.rarity && `${item.rarity} stars`,
+				tagSummary,
+				item.series && `${item.series} in series`,
+			]
+				.filter(Boolean)
+				.join(", ")}
 			className="group/card relative flex h-full flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-xs/5 outline-none transition-[translate,box-shadow,border-color] duration-150 hover:-translate-y-0.5 hover:border-foreground/16 hover:shadow-md/5 focus-visible:ring-2 focus-visible:ring-ring active:translate-y-0 motion-reduce:hover:translate-y-0"
 			data-card={index}
 			onFocus={onFocus}
 			params={{ kind, id: item.id }}
 			style={rarityStyle(item.rarity)}
 			tabIndex={tabIndex}
+			title={tagSummary ? `${item.name} · ${tagSummary}` : item.name}
 			to="/catalog/$kind/$id"
 		>
 			<div
 				className="relative min-h-0 flex-1 overflow-hidden bg-muted/60"
 				style={
-					item.rarity
+					item.tint
 						? {
-								backgroundImage:
-									"radial-gradient(120% 85% at 50% 110%, color-mix(in oklab, var(--rarity) 26%, transparent), transparent 72%)",
+								backgroundColor: `color-mix(in oklab, ${item.tint} 30%, #18181b)`,
+								backgroundImage: `radial-gradient(120% 90% at 50% 0%, color-mix(in oklab, ${item.tint} 45%, transparent), transparent 75%)`,
 							}
-						: undefined
+						: item.rarity
+							? {
+									backgroundImage:
+										"radial-gradient(120% 85% at 50% 110%, color-mix(in oklab, var(--rarity) 26%, transparent), transparent 72%)",
+								}
+							: undefined
 				}
 			>
 				<EntityImage
-					className="size-full p-2 text-2xl transition-transform duration-200 group-hover/card:scale-[1.04] motion-reduce:group-hover/card:scale-100"
+					className={cn(
+						"size-full transition-transform duration-200 group-hover/card:scale-[1.04] motion-reduce:group-hover/card:scale-100",
+						item.tint ? "p-[22%]" : "p-2",
+						// Initials stand in for missing art; keep them quiet.
+						item.icon ? "text-2xl" : "text-lg opacity-60",
+					)}
 					name={item.name}
 					path={item.icon}
 					size={256}
@@ -199,43 +235,58 @@ const CatalogCard = React.memo(function CatalogCard({
 						className="absolute inset-x-0 bottom-0 h-0.75 bg-(--rarity)"
 					/>
 				) : null}
+				{variant && (
+					<span
+						aria-hidden
+						className="absolute top-1.5 left-1.5 inline-flex h-5 items-center gap-0.5 rounded-md bg-background/80 px-1.5 font-semibold text-[0.6875rem] text-foreground backdrop-blur-sm"
+						title={variant === "m" ? "Male variant" : "Female variant"}
+					>
+						{variant === "m" ? "♂ M" : "♀ F"}
+					</span>
+				)}
+				{item.series && item.series > 1 ? (
+					<span
+						aria-hidden
+						className="absolute bottom-2 left-1.5 inline-flex h-5 items-center rounded-md bg-background/80 px-1.5 font-medium text-[0.6875rem] text-muted-foreground tabular-nums backdrop-blur-sm"
+						title={`${item.series} tiers in this series`}
+					>
+						×{item.series}
+					</span>
+				) : null}
 				{item.hasModel && (
 					<span
+						aria-hidden
 						className="absolute top-1.5 right-1.5 inline-flex size-5 items-center justify-center rounded-md bg-background/72 text-muted-foreground backdrop-blur-sm"
 						title="Has a 3D model"
 					>
-						<BoxIcon aria-label="Has a 3D model" className="size-3" />
+						<BoxIcon className="size-3" />
 					</span>
 				)}
 			</div>
 			<div
-				className="flex shrink-0 flex-col gap-1 px-2.5 pt-2 pb-2.5"
+				className="flex shrink-0 flex-col justify-between gap-1 px-2.5 pt-2 pb-2.5"
 				style={{ height: INFO }}
 			>
-				<span
-					className="truncate font-medium text-sm leading-5"
-					title={item.name}
-				>
+				<span className="line-clamp-2 font-medium text-[0.8125rem] leading-[1.125rem]">
 					{item.name}
 				</span>
 				<div className="flex min-w-0 items-center gap-1.5 overflow-hidden">
 					<RarityStars className="shrink-0" rarity={item.rarity} />
-					{tags.map((tag) => (
+					{glyphs.length > 0 && (
+						<span className="ms-auto flex shrink-0 items-center gap-1">
+							{glyphs.map((tag) => (
+								<TagGlyph key={`${tag.kind}:${tag.code}`} tag={tag} />
+							))}
+						</span>
+					)}
+					{words.map((tag) => (
 						<span
-							className={cn(
-								"truncate rounded-sm bg-muted px-1 text-[0.6875rem] text-muted-foreground leading-4",
-							)}
+							className="min-w-0 truncate rounded-sm bg-muted px-1 text-[0.6875rem] text-muted-foreground leading-4"
 							key={`${tag.kind}:${tag.code}`}
-							title={tag.name}
 						>
 							{tag.name}
 						</span>
 					))}
-					{tags.length === 0 && !item.rarity && (
-						<span className="truncate font-mono text-[0.6875rem] text-muted-foreground/80">
-							{item.id}
-						</span>
-					)}
 				</div>
 			</div>
 		</Link>

@@ -1,8 +1,7 @@
 import { Link } from "@tanstack/react-router";
-import { BoxesIcon, BoxIcon, ExternalLinkIcon } from "lucide-react";
-import type * as React from "react";
-import { Panel, Section } from "@/components/catalog/detail-layout";
-import { Badge } from "@/components/ui/badge";
+import { BoxesIcon, BoxIcon, ChevronRightIcon, FileIcon } from "lucide-react";
+import * as React from "react";
+import { Panel } from "@/components/catalog/detail-layout";
 import { Button } from "@/components/ui/button";
 import {
 	Empty,
@@ -15,14 +14,31 @@ import type { CatalogKind, CatalogModel } from "@/lib/api";
 import { fileTarget } from "@/lib/nav";
 import { isStudioKind, studioLink } from "@/lib/studio";
 
-/** "Open in Studio" plus the static mesh parts, each linking to the file browser. */
+const ModelPreview = React.lazy(
+	() => import("@/components/catalog/model-preview"),
+);
+
+/** `body_01` → `Body 01`. */
+function partLabel(name: string): string {
+	return name
+		.replace(/[_-]+/g, " ")
+		.replace(/\b\w/g, (c) => c.toUpperCase())
+		.trim();
+}
+
+/**
+ * Model tab: an inline 3D preview with one clear "Open in Studio", and the
+ * source files tucked into a disclosure for people who want them.
+ */
 export function ModelPanel({
 	kind,
 	id,
+	name = id,
 	model,
 }: {
 	kind: CatalogKind;
 	id: string;
+	name?: string;
 	model: CatalogModel | null | undefined;
 }): React.ReactElement {
 	const parts = model?.parts ?? [];
@@ -35,79 +51,105 @@ export function ModelPanel({
 					</EmptyMedia>
 					<EmptyTitle>No model found</EmptyTitle>
 					<EmptyDescription>
-						No meshes were exported for this entry.
+						No 3D model was exported for this entry.
 					</EmptyDescription>
 				</EmptyHeader>
 			</Empty>
 		);
 	}
+	const studio = isStudioKind(kind) ? kind : null;
+	const files = model.rigged
+		? [{ name: "Rigged model", path: model.rigged, root: "models" as const }]
+		: parts.map((p) => ({
+				name: partLabel(p.name),
+				path: p.path,
+				root: "meshes" as const,
+			}));
 	return (
-		<div className="flex flex-col gap-5">
-			<Panel className="flex flex-wrap items-center justify-between gap-4">
-				<div className="flex min-w-0 items-center gap-3">
-					<div className="flex size-10 shrink-0 items-center justify-center rounded-lg border bg-muted text-muted-foreground">
-						<BoxesIcon className="size-5" />
-					</div>
-					<div className="min-w-0">
-						<div className="font-medium text-sm">
-							{model.rigged ? "Rigged, textured model" : "Static mesh parts"}
-						</div>
-						<div
-							className="truncate font-mono text-muted-foreground text-xs"
-							title={model.dir}
-						>
-							{model.rigged ?? model.dir}
-						</div>
-					</div>
-				</div>
-				{isStudioKind(kind) && (
-					<Button render={<Link {...studioLink(kind, id)} />}>
-						<BoxesIcon />
-						Open in Studio
-					</Button>
-				)}
-			</Panel>
-			{parts.length > 0 && (
-				<Section
-					title="Parts"
-					description={`${parts.length} mesh parts, best LOD per part`}
+		<div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+			{studio ? (
+				<React.Suspense
+					fallback={
+						<div className="aspect-[4/3] max-h-[32rem] w-full rounded-xl border bg-muted/40" />
+					}
 				>
-					<ul className="divide-y overflow-hidden rounded-xl border bg-card">
-						{parts.map((part) => {
-							const target = fileTarget("meshes", part.path);
+					<ModelPreview
+						className="aspect-[4/3] max-h-[32rem] w-full"
+						id={id}
+						kind={studio}
+						model={model}
+						name={name}
+					/>
+				</React.Suspense>
+			) : null}
+			<div className="flex flex-col gap-3">
+				<Panel className="flex flex-col gap-3">
+					<div className="flex items-center gap-3">
+						<div className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-muted text-muted-foreground">
+							<BoxesIcon className="size-4.5" />
+						</div>
+						<div className="min-w-0">
+							<div className="font-medium text-sm">
+								{model.rigged ? "Rigged model" : "3D model"}
+							</div>
+							<div className="text-muted-foreground text-xs">
+								{model.rigged
+									? "Skinned, with textures"
+									: `${parts.length} part${parts.length === 1 ? "" : "s"}`}
+							</div>
+						</div>
+					</div>
+					{studio && (
+						<Button
+							className="w-full"
+							render={<Link {...studioLink(studio, id)} />}
+						>
+							<BoxesIcon />
+							Open in Studio
+						</Button>
+					)}
+					<p className="text-muted-foreground text-xs">
+						Drag to orbit, scroll to zoom.
+						{studio && " The Studio adds lighting, backdrops and capture."}
+					</p>
+				</Panel>
+				<details className="group rounded-xl border bg-card text-sm">
+					<summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+						<ChevronRightIcon className="size-4 transition-transform group-open:rotate-90" />
+						Source files
+						<span className="ms-auto text-xs tabular-nums">{files.length}</span>
+					</summary>
+					<ul className="divide-y border-t">
+						{files.map((file) => {
+							const inner = (
+								<>
+									<FileIcon className="size-3.5 shrink-0 text-muted-foreground" />
+									<span className="min-w-0 flex-1 truncate">{file.name}</span>
+								</>
+							);
+							const row =
+								"flex items-center gap-2 px-3 py-1.5 outline-none hover:bg-accent/50 focus-visible:bg-accent/50";
 							return (
-								<li
-									className="flex items-center gap-3 px-3 py-2"
-									key={part.path}
-								>
-									<BoxIcon className="size-4 shrink-0 text-muted-foreground" />
-									<span className="min-w-0 flex-1">
-										<span className="block truncate font-medium text-sm">
-											{part.name}
-										</span>
-										<span
-											className="block truncate font-mono text-muted-foreground text-xs"
-											dir="rtl"
-											title={part.path}
+								<li key={file.path}>
+									{file.root === "meshes" ? (
+										<Link
+											{...fileTarget("meshes", file.path)}
+											className={row}
+											title={file.path}
 										>
-											<bdi>{part.path}</bdi>
+											{inner}
+										</Link>
+									) : (
+										<span className={row} title={file.path}>
+											{inner}
 										</span>
-									</span>
-									<Badge variant="outline">LOD {part.lod}</Badge>
-									<Button
-										aria-label={`Show ${part.name} in the file browser`}
-										render={<Link {...target} />}
-										size="icon-sm"
-										variant="ghost"
-									>
-										<ExternalLinkIcon />
-									</Button>
+									)}
 								</li>
 							);
 						})}
 					</ul>
-				</Section>
-			)}
+				</details>
+			</div>
 		</div>
 	);
 }

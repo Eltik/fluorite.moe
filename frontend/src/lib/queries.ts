@@ -91,6 +91,20 @@ export const i18nResolveQuery = (lang: string, keys: string[]) =>
 		enabled: keys.length > 0,
 	});
 
+/** Entity counts per catalog kind (sidebar badges, home quick links). */
+export const catalogKindsQuery = () =>
+	queryOptions({
+		queryKey: ["catalog", "kinds"],
+		queryFn: async ({ signal }) => {
+			const { kinds } = await api.catalogKinds(signal);
+			return Object.fromEntries(kinds.map((k) => [k.kind, k.count])) as Partial<
+				Record<CatalogKind, number>
+			>;
+		},
+		staleTime: 10 * MINUTE,
+		retry: 1,
+	});
+
 export const catalogQuery = (kind: CatalogKind, lang: string) =>
 	queryOptions({
 		queryKey: ["catalog", kind, lang],

@@ -43,6 +43,7 @@ export default function EnemyDetail({
 	onTabChange,
 	gender,
 	onGenderChange,
+	gendered,
 }: DetailProps<Enemy>): React.ReactElement {
 	const templateIds = Object.keys(data.attributeTemplates);
 	const [templateId, setTemplateId] = React.useState(
@@ -60,7 +61,13 @@ export default function EnemyDetail({
 			<DetailHero
 				actions={
 					<>
-						<GenderToggle onChange={onGenderChange} value={gender} />
+						{gendered && (
+							<GenderToggle
+								onChange={onGenderChange}
+								showLabel
+								value={gender}
+							/>
+						)}
 						{hasModel && (
 							<Button
 								render={<Link {...studioLink("enemies", data.id)} />}
@@ -252,7 +259,12 @@ export default function EnemyDetail({
 						value: "model",
 						label: "Model",
 						content: () => (
-							<ModelPanel id={data.id} kind="enemies" model={data.model} />
+							<ModelPanel
+								id={data.id}
+								kind="enemies"
+								model={data.model}
+								name={data.name}
+							/>
 						),
 					},
 				]}

@@ -27,6 +27,7 @@ import {
 	sliceRich,
 	waitingOn,
 } from "@/components/story/story-graph";
+import { cleanSpeakerName } from "@/components/story/story-labels";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { useMediaQuery } from "@/hooks/use-media-query";
@@ -60,7 +61,7 @@ function hue(name: string): number {
 function Avatar({ node }: { node: DialogNode }): React.ReactElement {
 	const [failed, setFailed] = React.useState(false);
 	const speaker = node.speaker;
-	const name = speaker?.name ?? "";
+	const name = cleanSpeakerName(speaker?.name ?? "");
 	if (speaker?.icon && !failed) {
 		return (
 			<img
@@ -82,6 +83,24 @@ function Avatar({ node }: { node: DialogNode }): React.ReactElement {
 			}}
 		>
 			{[...name][0] ?? "…"}
+		</span>
+	);
+}
+
+/** Speaker mood as a small tag, tinted per emotion so repeats are scannable. */
+function EmotionTag({ emotion }: { emotion: string }): React.ReactElement {
+	const h = hue(emotion);
+	return (
+		<span
+			className="rounded-full border px-1.5 py-px font-medium text-[0.6875rem] leading-4"
+			style={{
+				background: `oklch(0.7 0.08 ${h} / 0.14)`,
+				borderColor: `oklch(0.7 0.08 ${h} / 0.32)`,
+				color: `light-dark(oklch(0.45 0.09 ${h}), oklch(0.82 0.07 ${h}))`,
+			}}
+			title="Emotion"
+		>
+			{emotion}
 		</span>
 	);
 }
@@ -166,12 +185,10 @@ function LineView({
 			>
 				{!narration && (
 					<div className="flex items-baseline gap-2">
-						<span className="font-medium text-sm">{node.speaker?.name}</span>
-						{node.emotion && (
-							<span className="text-[0.6875rem] text-muted-foreground/80">
-								{node.emotion}
-							</span>
-						)}
+						<span className="font-medium text-sm">
+							{cleanSpeakerName(node.speaker?.name ?? "")}
+						</span>
+						{node.emotion && <EmotionTag emotion={node.emotion} />}
 					</div>
 				)}
 				<div
@@ -478,6 +495,9 @@ function ReadAll({
 	);
 }
 
+/** Lines up to this many characters advance on the first press. */
+const SHORT_LINE = 80;
+
 function isTypingTarget(target: EventTarget | null): boolean {
 	if (!(target instanceof HTMLElement)) return false;
 	return Boolean(
@@ -525,15 +545,23 @@ function Play({
 		[nodes, animate],
 	);
 
+	// A short line still typing is skipped *and* advanced in one press, so
+	// presses are never "eaten"; long lines reveal first, then advance.
+	const typingNode =
+		typing !== -1 ? nodes.get(steps[typing]?.id ?? "") : undefined;
+	const typingShort =
+		typingNode !== undefined && richLength(typingNode.text ?? []) <= SHORT_LINE;
 	const next = React.useCallback(() => {
 		if (typing !== -1 && !skip) {
-			setSkip(true);
-			return;
+			if (!(typingShort && wait.type === "next")) {
+				setSkip(true);
+				return;
+			}
 		}
 		if (wait.type === "next") push(advance(steps, nodes));
 		else if (wait.type === "option" || wait.type === "branch")
 			choicesRef.current?.querySelector<HTMLElement>("button")?.focus();
-	}, [typing, skip, wait.type, steps, nodes, push]);
+	}, [typing, skip, typingShort, wait.type, steps, nodes, push]);
 
 	const back = React.useCallback(() => {
 		setTyping(-1);
@@ -769,7 +797,9 @@ function Play({
 								onClick={next}
 								size="sm"
 							>
-								{typing !== -1 ? "Skip" : "Next"}
+								{typing !== -1 && !(typingShort && wait.type === "next")
+									? "Reveal"
+									: "Next"}
 								<Kbd className="bg-primary-foreground/16 text-primary-foreground max-sm:hidden">
 									Space
 								</Kbd>

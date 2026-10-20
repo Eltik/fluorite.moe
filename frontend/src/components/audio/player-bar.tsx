@@ -25,6 +25,7 @@ export function PlayerBar({
 	fallbackDuration,
 	className,
 	emptyHint,
+	shortcuts = true,
 }: {
 	onPrevious?: () => void;
 	onNext?: () => void;
@@ -32,6 +33,8 @@ export function PlayerBar({
 	fallbackDuration?: number;
 	className?: string;
 	emptyHint?: React.ReactNode;
+	/** Show the Space / N / P keyboard hints (only where they are bound). */
+	shortcuts?: boolean;
 }): React.ReactElement {
 	const s = useAudioState();
 	const duration = s.duration || fallbackDuration || 0;
@@ -87,19 +90,28 @@ export function PlayerBar({
 				<div className="flex min-w-0 items-baseline gap-2 text-sm">
 					{s.track ? (
 						<>
-							<span className="truncate font-medium">
+							<span
+								className={cn(
+									"truncate font-medium",
+									s.status === "error" && "max-w-1/2 shrink-0",
+								)}
+							>
 								{s.track.title ?? s.track.key}
 							</span>
-							{s.track.subtitle && (
-								<span className="hidden truncate text-muted-foreground text-xs sm:inline">
-									{s.track.subtitle}
-								</span>
-							)}
-							{s.status === "error" && (
-								<span className="flex shrink-0 items-center gap-1 text-destructive-foreground text-xs">
-									<CircleAlertIcon className="size-3.5" />
-									{s.error}
-								</span>
+							{s.status === "error" ? (
+								<output
+									className="flex min-w-0 items-center gap-1 self-center text-destructive-foreground text-xs"
+									title={s.error}
+								>
+									<CircleAlertIcon className="size-3.5 shrink-0" />
+									<span className="truncate">{s.error}</span>
+								</output>
+							) : (
+								s.track.subtitle && (
+									<span className="hidden truncate text-muted-foreground text-xs sm:inline">
+										{s.track.subtitle}
+									</span>
+								)
 							)}
 						</>
 					) : (
@@ -128,13 +140,15 @@ export function PlayerBar({
 				</div>
 			</div>
 
-			<div className="hidden shrink-0 items-center gap-1 text-muted-foreground text-xs lg:flex">
-				<Kbd>Space</Kbd>
-				<span>play</span>
-				<Kbd>N</Kbd>
-				<Kbd>P</Kbd>
-				<span>next / prev</span>
-			</div>
+			{shortcuts && (
+				<div className="hidden shrink-0 items-center gap-1 text-muted-foreground text-xs lg:flex">
+					<Kbd>Space</Kbd>
+					<span>play</span>
+					<Kbd>N</Kbd>
+					<Kbd>P</Kbd>
+					<span>next / prev</span>
+				</div>
+			)}
 			<Button
 				aria-label="Download clip"
 				disabled={!href}
