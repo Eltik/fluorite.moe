@@ -305,39 +305,91 @@ async fn fetch_global_range_counting(
     Ok(result)
 }
 
-async fn fetch_range(
+/// Attempts per range request; the CDN occasionally drops a connection mid-body.
+const FETCH_ATTEMPTS: u32 = 5;
+/// Delay before the first retry, doubled after each failed attempt.
+const FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A failed range request, split by whether trying again can help.
+enum FetchError {
+    Transient(String),
+    Fatal(String),
+}
+
+/// Fetch `start..=end_inclusive`, retrying transient failures and resuming after the bytes
+/// already received so a dropped connection does not restart a large chunk.
+pub(crate) async fn fetch_range(
     client: &Client,
     url: &str,
     start: u64,
     end_inclusive: u64,
     downloaded: Option<&AtomicU64>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let range_header = format!("bytes={}-{}", start, end_inclusive);
+    let total = (end_inclusive - start + 1) as usize;
+    let mut body = Vec::with_capacity(total);
+    let mut delay = FETCH_RETRY_DELAY;
+    for attempt in 1..=FETCH_ATTEMPTS {
+        let from = start + body.len() as u64;
+        let error = match fetch_range_into(client, url, from, end_inclusive, downloaded, &mut body)
+            .await
+        {
+            Ok(()) if body.len() == total => return Ok(body),
+            Ok(()) => {
+                FetchError::Transient(format!("body ended after {} of {total} bytes", body.len()))
+            }
+            Err(error) => error,
+        };
+        match error {
+            FetchError::Transient(message) if attempt < FETCH_ATTEMPTS => {
+                eprintln!(
+                    "  retrying range {start}-{end_inclusive} ({attempt}/{FETCH_ATTEMPTS}): {message}"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            FetchError::Transient(message) | FetchError::Fatal(message) => {
+                return Err(format!("{message} (range {start}-{end_inclusive} on {url})").into());
+            }
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
+/// One request for `from..=end_inclusive`, appending the received bytes to `body`.
+async fn fetch_range_into(
+    client: &Client,
+    url: &str,
+    from: u64,
+    end_inclusive: u64,
+    downloaded: Option<&AtomicU64>,
+    body: &mut Vec<u8>,
+) -> Result<(), FetchError> {
     let mut resp = client
         .get(url)
-        .header("Range", &range_header)
+        .header("Range", format!("bytes={from}-{end_inclusive}"))
         .send()
-        .await?;
-
-    if resp.status() != 206 {
-        return Err(format!(
-            "expected HTTP 206, got {} for range {}-{} on {}",
-            resp.status(),
-            start,
-            end_inclusive,
-            url
-        )
-        .into());
+        .await
+        .map_err(|e| FetchError::Transient(e.to_string()))?;
+    let status = resp.status();
+    if status != 206 {
+        let message = format!("expected HTTP 206, got {status}");
+        return Err(if status.is_server_error() || status.as_u16() == 429 {
+            FetchError::Transient(message)
+        } else {
+            FetchError::Fatal(message)
+        });
     }
-
-    let mut body = Vec::with_capacity((end_inclusive - start + 1) as usize);
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| FetchError::Transient(e.to_string()))?
+    {
         if let Some(downloaded) = downloaded {
             downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 /// Returns (part_index, offset_within_part)
