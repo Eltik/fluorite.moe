@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::read::DeflateDecoder;
 use reqwest::Client;
@@ -126,6 +127,16 @@ impl ZipCentralDirectory {
         client: &Client,
         filename: &str,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.extract_counting(client, filename, None).await
+    }
+
+    /// Like [`Self::extract`], adding each received body byte of the entry data to `downloaded`.
+    pub async fn extract_counting(
+        &self,
+        client: &Client,
+        filename: &str,
+        downloaded: Option<&AtomicU64>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let entry = self
             .get(filename)
             .ok_or_else(|| format!("file not found in archive: {}", filename))?;
@@ -146,12 +157,13 @@ impl ZipCentralDirectory {
         // 2. Fetch compressed data
         let data_start = entry.local_header_offset + header_size;
         let data_end = data_start + entry.compressed_size - 1;
-        let compressed = fetch_global_range(
+        let compressed = fetch_global_range_counting(
             client,
             &self.parts,
             &self.cumulative_sizes,
             data_start,
             data_end,
+            downloaded,
         )
         .await?;
 
@@ -237,12 +249,38 @@ async fn fetch_global_range(
     global_start: u64,
     global_end: u64, // inclusive
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fetch_global_range_counting(
+        client,
+        parts,
+        cumulative_sizes,
+        global_start,
+        global_end,
+        None,
+    )
+    .await
+}
+
+async fn fetch_global_range_counting(
+    client: &Client,
+    parts: &[SplitArchivePart],
+    cumulative_sizes: &[u64],
+    global_start: u64,
+    global_end: u64, // inclusive
+    downloaded: Option<&AtomicU64>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let (start_part, start_offset) = global_to_part(cumulative_sizes, global_start);
     let (end_part, end_offset) = global_to_part(cumulative_sizes, global_end);
 
     if start_part == end_part {
         // Common case: entirely within one part
-        return fetch_range(client, &parts[start_part].url, start_offset, end_offset).await;
+        return fetch_range(
+            client,
+            &parts[start_part].url,
+            start_offset,
+            end_offset,
+            downloaded,
+        )
+        .await;
     }
 
     // Rare case: spans multiple parts
@@ -260,7 +298,7 @@ async fn fetch_global_range(
         } else {
             part.size - 1
         };
-        let chunk = fetch_range(client, &part.url, range_start, range_end).await?;
+        let chunk = fetch_range(client, &part.url, range_start, range_end, downloaded).await?;
         result.extend_from_slice(&chunk);
     }
 
@@ -272,9 +310,10 @@ async fn fetch_range(
     url: &str,
     start: u64,
     end_inclusive: u64,
+    downloaded: Option<&AtomicU64>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let range_header = format!("bytes={}-{}", start, end_inclusive);
-    let resp = client
+    let mut resp = client
         .get(url)
         .header("Range", &range_header)
         .send()
@@ -291,7 +330,14 @@ async fn fetch_range(
         .into());
     }
 
-    Ok(resp.bytes().await?.to_vec())
+    let mut body = Vec::with_capacity((end_inclusive - start + 1) as usize);
+    while let Some(chunk) = resp.chunk().await? {
+        if let Some(downloaded) = downloaded {
+            downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Returns (part_index, offset_within_part)

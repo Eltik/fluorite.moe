@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|r| !r.is_banned)
             .collect();
-        roles.sort_by(|a, b| b.level.cmp(&a.level));
+        roles.sort_by_key(|role| std::cmp::Reverse(role.level));
 
         let selected = roles.first().ok_or("Game account not found")?;
         let id = &selected.server_id;

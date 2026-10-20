@@ -11,12 +11,15 @@
 use backend::extraction::blc;
 use backend::extraction::pipeline::{self, VFS_DIRS};
 use backend::extraction::texture;
+use backend::extraction::texture_layout;
+use backend::extraction::texture_sort;
 use backend::extraction::unity_extract::{
     ChkContents, class_name, extract_chk_contents, get_script_type_name, parse_text_asset,
 };
 use backend::extraction::update;
 use backend::extraction::utils::{format_bytes, hex_dump, sanitize_filename};
 use backend::extraction::vfs_decrypt;
+use backend::extraction::zip_range::ZipCentralDirectory;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
@@ -25,7 +28,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use unity_asset_binary::asset::SerializedFileParser;
 use unity_asset_binary::object::ObjectHandle;
 
@@ -311,6 +315,7 @@ async fn cmd_extract(
             };
 
             let options = ChkExtractOptions {
+                chk_name: name,
                 do_json,
                 do_tex,
                 do_gamedata,
@@ -321,6 +326,13 @@ async fn cmd_extract(
             process_chk_contents(&data, &options, &mut stats);
         }
         println!();
+    }
+
+    if do_tex {
+        match texture_layout::rebuild_index(Path::new(&tex_dir)) {
+            Ok(count) => println!("  Texture index entries: {count}"),
+            Err(error) => eprintln!("  FAIL rebuild texture index: {error}"),
+        }
     }
 
     println!("=== Extraction Summary ===");
@@ -366,6 +378,7 @@ struct ExtractStats {
 }
 
 struct ChkExtractOptions<'a> {
+    chk_name: &'a str,
     do_json: bool,
     do_tex: bool,
     do_gamedata: bool,
@@ -459,14 +472,22 @@ fn process_chk_contents(
     }
     if options.do_tex {
         let path = Path::new(options.tex_dir);
+        let mut entries = Vec::new();
         for sf_bytes in &chk.sf_data {
             let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
                 Ok(sf) => sf,
                 Err(_) => continue,
             };
-            let (ok, failed, _, _) = texture::extract_textures(&sf, &chk.resources, path);
-            stats.total_tex_extracted += ok;
-            stats.total_tex_failed += failed;
+            let result = texture::extract_textures(&sf, &chk.resources, path);
+            stats.total_tex_extracted += result.extracted;
+            stats.total_tex_failed += result.failed;
+            entries.extend(result.entries);
+        }
+        if let Err(error) = texture_layout::write_chk_index(path, options.chk_name, &entries) {
+            eprintln!(
+                "    FAIL write texture index for {}: {}",
+                options.chk_name, error
+            );
         }
     }
     true
@@ -517,6 +538,88 @@ fn emit_progress(enabled: bool, phase: &str, done: u64, total: u64, label: &str)
     if enabled {
         println!("@progress {phase} {done} {total} {label}");
     }
+}
+
+/// Byte-level progress for a chunk download phase. While enabled, a background task emits
+/// `@progress <phase> <MiB done> <MiB total> <n>/<total> chunks` once a second.
+struct DownloadProgress {
+    enabled: bool,
+    phase: &'static str,
+    total_bytes: u64,
+    chunks_total: u64,
+    downloaded: Arc<AtomicU64>,
+    chunks_done: Arc<AtomicU64>,
+    ticker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DownloadProgress {
+    fn start(enabled: bool, phase: &'static str, total_bytes: u64, chunks_total: u64) -> Self {
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let chunks_done = Arc::new(AtomicU64::new(0));
+        let ticker = enabled.then(|| {
+            let downloaded = Arc::clone(&downloaded);
+            let chunks_done = Arc::clone(&chunks_done);
+            tokio::spawn(async move {
+                loop {
+                    emit_download_progress(
+                        phase,
+                        downloaded.load(Ordering::Relaxed),
+                        total_bytes,
+                        chunks_done.load(Ordering::Relaxed),
+                        chunks_total,
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            })
+        });
+        Self {
+            enabled,
+            phase,
+            total_bytes,
+            chunks_total,
+            downloaded,
+            chunks_done,
+            ticker,
+        }
+    }
+
+    fn chunk_done(&self) {
+        self.chunks_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish(&mut self) {
+        if let Some(ticker) = self.ticker.take() {
+            ticker.abort();
+        }
+        if self.enabled {
+            emit_download_progress(
+                self.phase,
+                self.total_bytes,
+                self.total_bytes,
+                self.chunks_done.load(Ordering::Relaxed),
+                self.chunks_total,
+            );
+        }
+    }
+}
+
+fn emit_download_progress(phase: &str, done: u64, total: u64, chunks: u64, chunks_total: u64) {
+    const MIB: u64 = 1024 * 1024;
+    emit_progress(
+        true,
+        phase,
+        done.min(total) / MIB,
+        total / MIB,
+        &format!("{chunks}/{chunks_total} chunks"),
+    );
+}
+
+/// Sum of compressed (downloaded) sizes for the listed archive entries.
+fn compressed_total(cd: &ZipCentralDirectory, chks: &[(String, String)]) -> u64 {
+    chks.iter()
+        .filter_map(|(name, _)| cd.get(name))
+        .map(|entry| entry.compressed_size)
+        .sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,6 +679,9 @@ async fn cmd_update(
     let mut chk_dirty = 0u64;
     let mut chk_ok = 0u64;
     let mut chk_failed = 0u64;
+    let mut sort_failed = 0u64;
+    let mut sort_moved = 0u64;
+    let mut sort_chks = 0u64;
     let mut blc_dirty = 0u64;
     let mut blc_ok = 0u64;
     let mut blc_failed = 0u64;
@@ -594,16 +700,22 @@ async fn cmd_update(
 
     let mut existing_chks = HashSet::new();
     let mut dirty = Vec::new();
+    let mut sort_list = Vec::new();
     for (dir, _) in VFS_DIRS {
         for (name, _) in pipeline::list_chk_files(&resolved.cd, dir) {
             let entry = resolved.cd.get(&name).expect("listed ZIP entry missing");
-            let mut digest = update::zip_digest(entry.crc32, entry.uncompressed_size);
+            let base = update::zip_digest(entry.crc32, entry.uncompressed_size);
+            let mut digest = base.clone();
             if no_textures {
                 // Tagged so a later run with textures sees these chks as dirty.
                 digest.push_str("+notex");
+            } else {
+                digest.push_str(&format!("+tex{}", texture_layout::LAYOUT_VERSION));
             }
             existing_chks.insert(name.clone());
-            if update::is_dirty(&state.chk, &name, &digest, force) {
+            if !no_textures && !force && state.chk.get(&name) == Some(&base) {
+                sort_list.push((name, digest));
+            } else if update::is_dirty(&state.chk, &name, &digest, force) {
                 chk_dirty += 1;
                 dirty.push((name, digest));
             }
@@ -611,24 +723,31 @@ async fn cmd_update(
     }
     state.chk.retain(|name, _| existing_chks.contains(name));
     dirty.sort_by(|a, b| a.0.cmp(&b.0));
+    sort_list.sort_by(|a, b| a.0.cmp(&b.0));
     // Downloads run as spawned tasks (at most 4 in flight) so they keep progressing while
     // the current chk is being decoded; memory stays bounded to the in-flight window.
+    let mut chk_progress = DownloadProgress::start(
+        progress,
+        "chk",
+        compressed_total(&resolved.cd, &dirty),
+        chk_dirty,
+    );
+    let chk_downloaded = Arc::clone(&chk_progress.downloaded);
     let mut downloads = stream::iter(dirty.into_iter().map(|(name, digest)| {
         let client = client.clone();
         let cd = Arc::clone(&resolved.cd);
+        let downloaded = Arc::clone(&chk_downloaded);
         tokio::spawn(async move {
-            let result = pipeline::download_chk(&client, &cd, &name)
+            let result = pipeline::download_chk_counting(&client, &cd, &name, &downloaded)
                 .await
                 .map_err(|e| e.to_string());
             (name, digest, result)
         })
     }))
     .buffered(4);
-    emit_progress(progress, "chk", 0, chk_dirty, "");
     while let Some(joined) = downloads.next().await {
         let (name, digest, result) = joined?;
-        let short = name.rsplit('/').next().unwrap_or(&name);
-        emit_progress(progress, "chk", chk_ok + chk_failed, chk_dirty, short);
+        chk_progress.chunk_done();
         let data = match result {
             Ok(data) => data,
             Err(e) => {
@@ -641,6 +760,7 @@ async fn cmd_update(
             process_chk_contents(
                 &data,
                 &ChkExtractOptions {
+                    chk_name: &name,
                     do_json: true,
                     do_tex: !no_textures,
                     do_gamedata: true,
@@ -661,7 +781,104 @@ async fn cmd_update(
             chk_failed += 1;
         }
     }
+    chk_progress.finish();
     update::save_state(state_path, &state)?;
+
+    if !sort_list.is_empty() {
+        let sort_total = sort_list.len() as u64;
+        sort_chks = sort_total;
+        let mut sort_candidates = Vec::new();
+        let mut sorted_chks = Vec::new();
+        let mut sort_progress = DownloadProgress::start(
+            progress,
+            "sort",
+            compressed_total(&resolved.cd, &sort_list),
+            sort_total,
+        );
+        let sort_downloaded = Arc::clone(&sort_progress.downloaded);
+        let mut sort_downloads = stream::iter(sort_list.into_iter().map(|(name, digest)| {
+            let client = client.clone();
+            let cd = Arc::clone(&resolved.cd);
+            let downloaded = Arc::clone(&sort_downloaded);
+            tokio::spawn(async move {
+                let result = pipeline::download_chk_counting(&client, &cd, &name, &downloaded)
+                    .await
+                    .map_err(|e| e.to_string());
+                (name, digest, result)
+            })
+        }))
+        .buffered(4);
+        while let Some(joined) = sort_downloads.next().await {
+            let (name, digest, result) = joined?;
+            sort_progress.chunk_done();
+            let data = match result {
+                Ok(data) => data,
+                Err(error) => {
+                    println!("  {name}: download error: {error}");
+                    sort_failed += 1;
+                    continue;
+                }
+            };
+            let candidates = tokio::task::block_in_place(|| {
+                let chk = extract_chk_contents(&data)?;
+                Some(texture_sort::collect_candidates(&name, &chk))
+            });
+            let Some(candidates) = candidates else {
+                println!("  {name}: not a valid VFS container");
+                sort_failed += 1;
+                continue;
+            };
+            sort_candidates.extend(candidates);
+            sorted_chks.push((name, digest));
+        }
+        sort_progress.finish();
+        if sort_failed == 0 {
+            let report = texture_sort::sort_flat_textures(&tex_dir, &sort_candidates)?;
+            sort_moved = report.moved as u64;
+            for (name, _) in &sorted_chks {
+                let entries = report
+                    .moved_by_chk
+                    .get(name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                texture_layout::write_chk_index(&tex_dir, name, entries)?;
+            }
+            for (name, digest) in sorted_chks {
+                state.chk.insert(name, digest);
+            }
+            update::save_state(state_path, &state)?;
+            println!(
+                "sort: moved {}, already sorted {}, ambiguous {} (see textures/_ambiguous/candidates.jsonl), missing {}, unmatched {}",
+                report.moved,
+                report.already_sorted,
+                report.ambiguous,
+                report.missing,
+                report.unmatched
+            );
+            if report.missing > 0 {
+                println!(
+                    "{} textures have no file (lost to flat-layout name collisions, or never decodable); run update --force to re-extract",
+                    report.missing
+                );
+            }
+        }
+    }
+
+    if !no_textures {
+        if let Err(error) = texture_layout::remove_chk_indexes_except(&tex_dir, &existing_chks) {
+            eprintln!("  FAIL remove stale texture indexes: {error}");
+        }
+        if chk_failed == 0 && sort_failed == 0 {
+            match texture_layout::remove_legacy_flat_textures(&tex_dir) {
+                Ok(removed) if removed > 0 => println!("removed {removed} legacy flat textures"),
+                Ok(_) => {}
+                Err(error) => eprintln!("  FAIL remove legacy flat textures: {error}"),
+            }
+        }
+        if let Err(error) = texture_layout::rebuild_index(&tex_dir) {
+            eprintln!("  FAIL rebuild texture index: {error}");
+        }
+    }
 
     let staging_parent = output.join("decrypted/.staging");
     let decrypted = output.join("decrypted");
@@ -723,7 +940,7 @@ async fn cmd_update(
     }
     emit_progress(progress, "blc", blc_total, blc_total, "");
     update::save_state(state_path, &state)?;
-    let failures = chk_failed + blc_failed;
+    let failures = chk_failed + sort_failed + blc_failed;
     if failures == 0 {
         state.fingerprint = fingerprint;
         state.version = resolved.config.version.clone();
@@ -733,7 +950,7 @@ async fn cmd_update(
     }
     std::fs::create_dir_all(output)?;
     let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
-        "chk_dirty": chk_dirty, "chk_ok": chk_ok, "chk_failed": chk_failed, "blc_dirty": blc_dirty, "blc_ok": blc_ok, "blc_failed": blc_failed,
+        "chk_dirty": chk_dirty, "chk_ok": chk_ok, "chk_failed": chk_failed, "sort_chks": sort_chks, "sort_moved": sort_moved, "sort_failed": sort_failed, "blc_dirty": blc_dirty, "blc_ok": blc_ok, "blc_failed": blc_failed,
         "duration_secs": started.elapsed().as_secs_f64()});
     use std::io::Write;
     let mut log = std::fs::OpenOptions::new()

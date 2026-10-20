@@ -33,11 +33,12 @@ pub fn fingerprint(config: &EndfieldGameConfig) -> String {
         .map(|r| format!("{}:{}", r.name, r.version))
         .collect::<Vec<_>>();
     format!(
-        "version={};res_version={};packs={};resources={}",
+        "version={};res_version={};packs={};resources={};texture_layout={}",
         config.version,
         config.res_version,
         packs.join(","),
-        resources.join(",")
+        resources.join(","),
+        crate::extraction::texture_layout::LAYOUT_VERSION
     )
 }
 

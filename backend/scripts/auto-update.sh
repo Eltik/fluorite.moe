@@ -33,11 +33,16 @@ fmt_secs() {
   printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 ))
 }
 
+fmt_gb() {
+  printf '%d.%d' $(( $1 / 1024 )) $(( $1 % 1024 * 10 / 1024 ))
+}
+
 phase_title() {
   case "$1" in
     build) echo "Building" ;;
     resolve) echo "Checking" ;;
     chk) echo "Assets  " ;;
+    sort) echo "Sorting " ;;
     blc) echo "Tables  " ;;
     *) echo "$1" ;;
   esac
@@ -56,7 +61,12 @@ draw() {
     if (( done_n > 0 && done_n < total )); then
       eta=" eta $(fmt_secs $(( elapsed * (total - done_n) / done_n )))"
     fi
-    line="$(phase_title "$phase") $bar $(printf '%3d' "$pct")% $done_n/$total $(fmt_secs "$elapsed")$eta"
+    local counts="$done_n/$total"
+    case "$phase" in
+      # Download phases report MiB.
+      chk|sort) counts="$(fmt_gb "$done_n")/$(fmt_gb "$total") GB" ;;
+    esac
+    line="$(phase_title "$phase") $bar $(printf '%3d' "$pct")% $counts $(fmt_secs "$elapsed")$eta"
   else
     line="$(phase_title "$phase") ${SPIN:tick % 4:1} $(fmt_secs "$elapsed")"
   fi

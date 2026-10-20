@@ -126,14 +126,12 @@ pub fn decompress(
 
         // 6. Copy match (sequential, byte-by-byte to handle overlapping)
         // back_offset=0 is valid: self-copy from current position (keeps existing values)
-        let mut enc_pos = dec_pos - back_offset;
-        for _ in 0..match_len {
+        for enc_pos in (dec_pos - back_offset..).take(match_len) {
             if dec_pos >= uncompressed_size {
                 break;
             }
             output[dec_pos] = output[enc_pos];
             dec_pos += 1;
-            enc_pos += 1;
         }
     }
 

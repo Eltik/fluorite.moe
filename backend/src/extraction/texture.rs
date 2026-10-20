@@ -1,4 +1,5 @@
 /// Texture2D extraction: decode compressed textures and export as PNG.
+use crate::extraction::texture_layout::{self, IndexEntry, Placement};
 use std::collections::HashMap;
 use std::path::Path;
 use unity_asset_binary::asset::SerializedFile;
@@ -201,29 +202,40 @@ fn get_int(obj: &unity_asset_binary::object::UnityObject, key: &str) -> i64 {
     obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-/// Extract all Texture2D objects from SerializedFiles as PNG files.
-/// Returns (extracted_count, failed_count, unsupported_count, no_data_count).
+/// Texture extraction counts and index entries produced for one SerializedFile.
+pub struct TextureExtractResult {
+    pub extracted: u64,
+    pub failed: u64,
+    pub unsupported: u64,
+    pub no_data: u64,
+    pub entries: Vec<IndexEntry>,
+}
+
+/// Extract all Texture2D objects from a SerializedFile as PNG files.
 pub fn extract_textures(
     sf: &SerializedFile,
     resources: &HashMap<String, Vec<u8>>,
     output_dir: &Path,
-) -> (u64, u64, u64, u64) {
+) -> TextureExtractResult {
     let mut extracted = 0u64;
     let mut failed = 0u64;
     let mut skipped_format = 0u64;
     let mut no_data = 0u64;
+    let mut entries = Vec::new();
+    let planned = texture_layout::plan_textures(sf);
+    let planned_by_id: HashMap<_, _> = planned.iter().map(|plan| (plan.path_id, plan)).collect();
 
     for obj in sf.objects_of_type(28) {
+        let Some(plan) = planned_by_id.get(&obj.path_id) else {
+            continue;
+        };
         let handle = ObjectHandle::new(sf, obj);
         let unity_obj = match handle.read() {
             Ok(o) => o,
             Err(_) => continue,
         };
 
-        let name = unity_obj.name().unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
+        let name = &plan.name;
 
         let width = get_int(&unity_obj, "m_Width") as usize;
         let height = get_int(&unity_obj, "m_Height") as usize;
@@ -269,8 +281,14 @@ pub fn extract_textures(
                     rgba_bytes[i * 4 + 3] = a;
                 }
 
-                let safe_name = crate::extraction::utils::sanitize_filename(&name);
-                let path = output_dir.join(format!("{safe_name}.png"));
+                let path = output_dir.join(&plan.relative);
+                if let Some(parent) = path.parent()
+                    && let Err(error) = std::fs::create_dir_all(parent)
+                {
+                    eprintln!("  FAIL create directory for {}: {}", name, error);
+                    failed += 1;
+                    continue;
+                }
                 match image::save_buffer(
                     &path,
                     &rgba_bytes,
@@ -280,6 +298,20 @@ pub fn extract_textures(
                 ) {
                     Ok(()) => {
                         extracted += 1;
+                        let (container, placement) = match &plan.placement {
+                            Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
+                            Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
+                            None => (None, "unsorted"),
+                        };
+                        entries.push(IndexEntry {
+                            path: plan.relative.to_string_lossy().replace('\\', "/"),
+                            name: name.clone(),
+                            container,
+                            placement,
+                            width: width as u32,
+                            height: height as u32,
+                            format: texture_format_name(format),
+                        });
                         if extracted <= 20 || extracted.is_multiple_of(100) {
                             println!(
                                 "  [{}] {} ({}x{}, {}) → {}",
@@ -312,5 +344,11 @@ pub fn extract_textures(
         }
     }
 
-    (extracted, failed, skipped_format, no_data)
+    TextureExtractResult {
+        extracted,
+        failed,
+        unsupported: skipped_format,
+        no_data,
+        entries,
+    }
 }

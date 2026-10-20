@@ -2,6 +2,8 @@ mod chacha20;
 mod fair_guard_utils;
 mod lz4_inv;
 mod sparkbuffer;
+mod texture_layout;
+mod texture_sort;
 mod unity_extract;
 mod unityfs_header;
 mod update;

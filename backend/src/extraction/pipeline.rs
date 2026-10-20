@@ -9,6 +9,7 @@ use crate::core::hypergryph::launcher::Platform;
 use crate::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 /// Known VFS directories.
 pub const VFS_DIRS: &[(&str, &str)] = &[("7064D8E2", "bundles/configs"), ("0CE8FA57", "textures")];
@@ -125,4 +126,14 @@ pub async fn download_chk(
     name: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     cd.extract(client, name).await
+}
+
+/// Download a .chk file, adding received bytes to `downloaded` as they arrive.
+pub async fn download_chk_counting(
+    client: &Client,
+    cd: &ZipCentralDirectory,
+    name: &str,
+    downloaded: &AtomicU64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    cd.extract_counting(client, name, Some(downloaded)).await
 }

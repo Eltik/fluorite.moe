@@ -76,7 +76,12 @@ output/
   gamedata/monobehaviour/
     <TypeName>/       # MonoBehaviours grouped by script type
       <ObjectName>.json
-  textures/           # Texture2D extracted as PNG
+  textures/           # Texture2D as PNG, mirroring the game's asset paths
+    beyond/...        # from assets/beyond/... (e.g. beyond/initialassets/ui/sprites/login/)
+    packages/...      # textures shipped in Unity packages
+    <owner>/          # textures only referenced by a prefab/material sit in a folder named after it
+    _unsorted/        # fallback when a bundle has no container entry (<name>__<pathid>.png)
+    index.jsonl       # one line per texture: path, name, container path, placement, size, format
 ```
 
 #### `endfield extract-file`
@@ -186,6 +191,8 @@ cargo run --release --bin endfield -- update --check
 | `--no-textures` | Skip texture extraction (those chunks are re-processed by a later run with textures) |
 
 Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`.
+
+When the texture layout changes, the next `update` sorts existing PNGs instead of re-extracting them. For each chunk that is unchanged upstream, it downloads the chunk and reads only its bundle metadata, then moves the old flat PNGs (`textures/<name>.png`) into the new folders. Nothing is decoded and no PNG is rewritten. Chunks that did change upstream are extracted normally. When a name matches several textures, the file's dimensions pick one; if they can't, it goes to `textures/_ambiguous/` with its candidate paths listed in `candidates.jsonl`. State is saved only after the sort finishes, so an interrupted run starts the sort again on the next run. Leftover top-level PNGs (textures no longer in the game) are deleted once every chunk succeeds.
 
 #### Scheduling
 

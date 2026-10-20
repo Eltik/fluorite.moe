@@ -6,6 +6,8 @@ pub mod lz4_inv;
 pub mod pipeline;
 pub mod sparkbuffer;
 pub mod texture;
+pub mod texture_layout;
+pub mod texture_sort;
 pub mod unity_extract;
 pub mod unityfs_header;
 pub mod update;
