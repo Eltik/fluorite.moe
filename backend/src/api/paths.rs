@@ -14,10 +14,11 @@ pub enum Root {
     Jsondata,
     Lua,
     Audio,
+    Models,
 }
 
 impl Root {
-    pub const ALL: [Root; 7] = [
+    pub const ALL: [Root; 8] = [
         Root::Textures,
         Root::Meshes,
         Root::Gamedata,
@@ -25,6 +26,7 @@ impl Root {
         Root::Jsondata,
         Root::Lua,
         Root::Audio,
+        Root::Models,
     ];
 
     pub fn name(self) -> &'static str {
@@ -36,6 +38,7 @@ impl Root {
             Root::Jsondata => "jsondata",
             Root::Lua => "lua",
             Root::Audio => "audio",
+            Root::Models => "models",
         }
     }
 
@@ -49,6 +52,7 @@ impl Root {
             Root::Jsondata => "decrypted/JsonData/Json",
             Root::Lua => "decrypted/Lua/LuaScripts",
             Root::Audio => "decrypted/Audio",
+            Root::Models => "models",
         }
     }
 

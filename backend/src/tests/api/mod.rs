@@ -1,7 +1,9 @@
+mod catalog;
 mod files;
 mod i18n;
 mod paths;
 mod search;
+mod text;
 mod tree;
 
 use std::path::{Path, PathBuf};

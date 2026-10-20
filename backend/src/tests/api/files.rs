@@ -199,7 +199,7 @@ async fn thumbnails_are_generated_and_cached() {
 }
 
 #[tokio::test]
-async fn status_and_catalog_stub() {
+async fn status_and_catalog_without_tables() {
     let fx = Fixture::new();
     let app = fx.app();
     let v = body_json(get(&app, "/api/status").await).await;
@@ -209,9 +209,12 @@ async fn status_and_catalog_stub() {
     assert_eq!(v["counts"]["lua"], 1);
     assert_eq!(v["index"]["ready"], true);
 
+    assert_eq!(v["counts"]["models"], 0);
+
+    // No CharacterTable in this fixture: a clean 404, not a 500.
     let res = get(&app, "/api/catalog/operators").await;
-    assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body_json(res).await["error"]["code"], "not_implemented");
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(res).await["error"]["code"], "not_found");
 
     let res = get(&app, "/api/nope").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);

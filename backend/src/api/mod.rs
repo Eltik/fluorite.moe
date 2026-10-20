@@ -2,7 +2,7 @@
 //!
 //! The router is assembled in [`router`] from one module per endpoint group; [`AppState`]
 //! holds everything handlers share (config, search index, listing/i18n caches, thumbnail
-//! limiter). `catalog` is a stub until the data-mapping step lands.
+//! limiter, catalog/story caches).
 
 pub mod catalog;
 pub mod config;
@@ -12,6 +12,7 @@ pub mod i18n;
 pub mod paths;
 pub mod search;
 pub mod status;
+pub mod story;
 pub mod tables;
 pub mod thumbs;
 pub mod tree;
@@ -39,6 +40,7 @@ pub struct AppState {
     pub listings: tree::ListingCache,
     pub i18n: i18n::I18nCache,
     pub thumbs: thumbs::ThumbLimiter,
+    pub catalog: catalog::Catalog,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -51,8 +53,10 @@ impl AppState {
             config,
             index: search::IndexHandle::new(),
             listings: tree::ListingCache::new(512, Duration::from_secs(30)),
-            i18n: i18n::I18nCache::new(4),
+            // Requested language plus the EN/CN fallbacks stay resident together.
+            i18n: i18n::I18nCache::new(5),
             thumbs: thumbs::ThumbLimiter::new(threads),
+            catalog: catalog::Catalog::new(),
         })
     }
 }
@@ -83,7 +87,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/i18n/languages", get(i18n::languages))
         .route("/i18n/{lang}/resolve", post(i18n::resolve))
         .route("/i18n/{lang}/{key}", get(i18n::text))
+        .route("/catalog", get(catalog::index))
         .nest("/catalog", catalog::router())
+        .route("/story", get(story::list))
+        .route("/story/{id}", get(story::dialog))
         .layer(compress);
 
     let cors = CorsLayer::new()

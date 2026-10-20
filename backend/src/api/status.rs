@@ -47,6 +47,7 @@ pub struct Counts {
     pub lua: usize,
     pub gamedata: usize,
     pub audio: usize,
+    pub models: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +112,7 @@ pub async fn status(State(state): State<SharedState>) -> ApiResult<Json<StatusRe
         lua: i.count(Root::Lua),
         gamedata: i.count(Root::Gamedata),
         audio: i.count(Root::Audio),
+        models: i.count(Root::Models),
     });
     let info = IndexInfo {
         ready: index.is_some(),
