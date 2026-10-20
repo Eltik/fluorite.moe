@@ -107,6 +107,7 @@ pub fn animation_survey(
     let mut acl_bytes = 0u64;
     let mut clip_tags: BTreeMap<String, usize> = BTreeMap::new();
     let mut flags: BTreeMap<String, usize> = BTreeMap::new();
+    let mut storage_kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut containers: BTreeMap<String, usize> = BTreeMap::new();
     let mut class_totals: BTreeMap<i32, usize> = BTreeMap::new();
     for rec in records {
@@ -154,10 +155,32 @@ pub fn animation_survey(
             if clip.get("m_Legacy").and_then(Value::as_bool) == Some(true) {
                 legacy += 1;
             }
+            // Endfield's ACL payload: a struct of raw ACL `compressed_tracks` buffers.
             let acl = clip
-                .get("m_AclCompressedBuffer")
-                .and_then(crate::extraction::unity::value_bytes)
-                .map_or(0, |b| b.len());
+                .pointer("/m_AclCompressedBuffer/TransformBufferData")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let dense_curves = clip
+                .pointer("/m_MuscleClip/m_Clip/data/m_DenseClip/m_CurveCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let streamed_words = clip
+                .pointer("/m_MuscleClip/m_Clip/data/m_StreamedClip/data")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let constants = clip
+                .pointer("/m_MuscleClip/m_Clip/data/m_ConstantClip/data")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let storage = match (acl > 0, dense_curves > 0 || streamed_words > 2 || constants > 0) {
+                (true, false) => "acl-only",
+                (true, true) => "acl+mecanim",
+                (false, true) => "mecanim-only",
+                (false, false) => "empty",
+            };
+            *storage_kinds
+                .entry(format!("{storage} ({})", if name.to_ascii_lowercase().starts_with("a_actor") { "actor" } else if name.to_ascii_lowercase().starts_with("a_monster") { "monster" } else { "other" }))
+                .or_default() += 1;
             if acl > 0 {
                 acl_clips += 1;
                 acl_bytes += acl as u64;
@@ -263,6 +286,7 @@ pub fn animation_survey(
         "aclCompressedBytes": acl_bytes,
         "clipTags": clip_tags,
         "flags": flags,
+        "clipStorage": storage_kinds,
         "withMuscleClipData": muscle,
         "muscleStreamedBytes": streamed_bytes,
         "muscleDenseFrames": dense_frames,
