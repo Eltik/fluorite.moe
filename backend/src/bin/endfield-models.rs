@@ -134,10 +134,12 @@ enum Commands {
         /// Don't scan chunks that the texture index associates with the filter
         #[arg(long)]
         no_auto_scan: bool,
-        /// Embed AnimationClips whose file name contains this keyword (e.g. "idle"; repeatable).
-        /// Clips are found by container path: `.../<code>/animations/**/<keyword>*.fbx`, where
-        /// <code> is the entity id's last segment (chr_0005_chen -> chen). Needs a build with
-        /// `--features acl` (Endfield clips are ACL-compressed).
+        /// Embed AnimationClips whose file name contains a keyword. Comma-separated keywords are
+        /// tried in order and the first that matches any clip wins, e.g.
+        /// `uiteam_idle,dialog_single_idle,idle`. Clips are found by container path:
+        /// `.../<code>/animations/**/*<keyword>*.fbx`, where <code> is the entity id's last
+        /// segment (chr_0005_chen -> chen). Needs a build with `--features acl` (Endfield clips
+        /// are ACL-compressed).
         #[arg(long = "anims")]
         anims: Vec<String>,
         /// At most this many clips per entity with --anims
@@ -894,36 +896,45 @@ fn animation_containers(records: &[rig::store::CabRecord], stored_root: Option<&
 }
 
 /// Clips for an entity: containers under `<code>…/animations/` whose file name contains a
-/// keyword, where `<code>` is the id's last `_` segment. At most `max` container paths.
+/// keyword, where `<code>` is the id's last `_` segment. Keywords are tried in order and the
+/// first one with any match wins, so `uiteam_idle,idle` prefers the UI idles and only falls
+/// back to every `idle` clip. At most `max` container paths are taken.
 fn select_clips(index: &[(String, String, i64)], id: &str, keywords: &[String], max: usize) -> Vec<(String, i64)> {
-    if keywords.is_empty() {
-        return Vec::new();
-    }
     let code = id.rsplit('_').next().unwrap_or(id).to_ascii_lowercase();
     let folder = format!("/{code}");
-    let mut paths: Vec<&str> = Vec::new();
-    let mut out = Vec::new();
-    for (path, cab, path_id) in index {
-        let Some(at) = path.find("/animations/") else {
-            continue;
-        };
-        let owner = &path[..at];
-        let owner_dir = owner.rsplit('/').next().unwrap_or("");
-        // `purrche` must find `purrchena/`, so the folder only has to start with the code.
-        if !owner.contains(&folder) || !owner_dir.starts_with(&code) {
+    let owned: Vec<&(String, String, i64)> = index
+        .iter()
+        .filter(|(path, _, _)| {
+            let Some(at) = path.find("/animations/") else {
+                return false;
+            };
+            let owner = &path[..at];
+            // `purrche` must find `purrchena/`, so the folder only has to start with the code.
+            owner.contains(&folder) && owner.rsplit('/').next().unwrap_or("").starts_with(&code)
+        })
+        .collect();
+    for keyword in keywords.iter().flat_map(|k| k.split(',')).map(|k| k.trim().to_ascii_lowercase()) {
+        if keyword.is_empty() {
             continue;
         }
-        let file = path.rsplit('/').next().unwrap_or(path);
-        if !keywords.iter().any(|k| file.contains(&k.to_ascii_lowercase())) {
-            continue;
-        }
-        if !paths.contains(&path.as_str()) {
-            if paths.len() >= max {
+        let mut paths: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for (path, cab, path_id) in owned.iter().copied() {
+            let file = path.rsplit('/').next().unwrap_or(path);
+            if !file.contains(&keyword) {
                 continue;
             }
-            paths.push(path);
+            if !paths.contains(&path.as_str()) {
+                if paths.len() >= max {
+                    continue;
+                }
+                paths.push(path);
+            }
+            out.push((cab.clone(), *path_id));
         }
-        out.push((cab.clone(), *path_id));
+        if !out.is_empty() {
+            return out;
+        }
     }
-    out
+    Vec::new()
 }
