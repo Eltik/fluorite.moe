@@ -7,11 +7,23 @@
 
 type Parser<T> = (value: unknown) => T | undefined;
 
-/** Any string, optionally capped in length (longer values are dropped). */
+/**
+ * Any string, optionally capped in length (longer values are dropped). The
+ * router JSON-parses values, so `?q=211120` arrives as a number; finite
+ * numbers and booleans are stringified back.
+ */
 export const str =
 	(max = Infinity): Parser<string> =>
-	(v) =>
-		typeof v === "string" && v.length <= max ? v : undefined;
+	(v) => {
+		const s =
+			typeof v === "string"
+				? v
+				: (typeof v === "number" && Number.isFinite(v)) ||
+						typeof v === "boolean"
+					? String(v)
+					: undefined;
+		return s !== undefined && s.length <= max ? s : undefined;
+	};
 
 /**
  * Optional string search param. The router JSON-parses values, so `?q=130`

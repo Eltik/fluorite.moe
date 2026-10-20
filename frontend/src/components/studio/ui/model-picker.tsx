@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTab } from "@/components/ui/tabs";
 import { thumbUrl } from "@/lib/api";
+import { formatNumber } from "@/lib/format";
 import {
 	STUDIO_KIND_LABELS,
 	STUDIO_KINDS,
@@ -415,7 +416,7 @@ export function ModelPicker({
 			</div>
 			<p className="text-muted-foreground text-xs tabular-nums">
 				{query.data
-					? `${items.length.toLocaleString()} of ${query.data.items.length.toLocaleString()} ${label.toLowerCase()}`
+					? `${formatNumber(items.length)} of ${formatNumber(query.data.items.length)} ${label.toLowerCase()}`
 					: " "}
 			</p>
 		</div>

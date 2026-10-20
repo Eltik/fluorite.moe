@@ -29,6 +29,7 @@ import {
 	type OperatorDetail as Operator,
 	titleCaseShouting,
 } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { studioLink } from "@/lib/studio";
 
 const SKILL_ORDER = [
@@ -39,7 +40,7 @@ const SKILL_ORDER = [
 ];
 
 const UNLOCK_LABELS: Record<string, (v: number) => string> = {
-	ReachFavorability: (v) => `Trust ${v.toLocaleString()}`,
+	ReachFavorability: (v) => `Trust ${formatNumber(v)}`,
 	ReachLevel: (v) => `Level ${v}`,
 	ReachBreakStage: (v) => `Promotion ${v}`,
 };

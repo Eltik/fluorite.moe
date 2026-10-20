@@ -41,6 +41,7 @@ import {
 	type ListItem,
 	loaderLanguage,
 } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { pageTitle } from "@/lib/route-meta";
 import { oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
@@ -389,8 +390,8 @@ function CatalogListPage(): React.ReactElement {
 				description={
 					all
 						? filtered
-							? `${matched.length.toLocaleString()} of ${all.length.toLocaleString()} ${lower}${collapsedCount > 0 ? ` · numbered series grouped into ${items.length.toLocaleString()} cards` : ""}`
-							: `${all.length.toLocaleString()} ${lower} · text in ${query.data?.lang ?? textLanguage}${collapsedCount > 0 ? ` · numbered series grouped into ${items.length.toLocaleString()} cards` : ""}`
+							? `${formatNumber(matched.length)} of ${formatNumber(all.length)} ${lower}${collapsedCount > 0 ? ` · numbered series grouped into ${formatNumber(items.length)} cards` : ""}`
+							: `${formatNumber(all.length)} ${lower} · text in ${query.data?.lang ?? textLanguage}${collapsedCount > 0 ? ` · numbered series grouped into ${formatNumber(items.length)} cards` : ""}`
 						: "Mapped from the game tables with resolved names."
 				}
 				title={label}

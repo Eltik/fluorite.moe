@@ -5,6 +5,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { type CatalogKind, fileUrl } from "@/lib/api";
 import type { Gender } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /** What each kind's detail body receives from the route. */
@@ -337,10 +338,8 @@ export function formatStat(value: number, code?: string): string {
 	) {
 		return `${+(value * 100).toFixed(1)}%`;
 	}
-	if (Number.isInteger(value)) return value.toLocaleString();
-	return (+value.toFixed(3)).toLocaleString(undefined, {
-		maximumFractionDigits: 3,
-	});
+	if (Number.isInteger(value)) return formatNumber(value);
+	return formatNumber(+value.toFixed(3));
 }
 
 /** Long text clamped to a few lines with a "Read more" toggle. */

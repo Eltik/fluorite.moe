@@ -100,7 +100,8 @@ export const audioEngine = {
 		}
 		if (
 			state.track?.key === track.key &&
-			el.src === url &&
+			// `el.src` is always absolute; `url` is relative when API_URL is "".
+			el.src === new URL(url, location.href).href &&
 			state.status !== "error"
 		) {
 			if (el.ended) el.currentTime = 0;

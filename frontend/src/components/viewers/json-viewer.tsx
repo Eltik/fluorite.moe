@@ -22,6 +22,7 @@ import { SearchInput } from "@/components/search-input";
 import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/ui/toggle";
 import { copyText } from "@/lib/clipboard";
+import { formatNumber } from "@/lib/format";
 import { useRowHeight } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
@@ -338,7 +339,7 @@ export default function JsonViewer({
 								<span aria-live="polite" className="px-1">
 									{matches.length === 0
 										? "No matches"
-										: `${matchIndex + 1} / ${matches.length.toLocaleString()}${
+										: `${matchIndex + 1} / ${formatNumber(matches.length)}${
 												matches.length >= MAX_MATCHES ? "+" : ""
 											}`}
 								</span>
@@ -487,7 +488,7 @@ export default function JsonViewer({
 							</>
 						)}
 						<span className="ms-auto shrink-0 tabular-nums">
-							{rows.length.toLocaleString()} rows
+							{formatNumber(rows.length)} rows
 						</span>
 					</div>
 				</>
@@ -578,7 +579,7 @@ function ValuePreview({ row, isOpen }: { row: Row; isOpen: boolean }) {
 			<span className="text-muted-foreground">
 				{isOpen ? "[" : row.size === 0 ? "[]" : "[…]"}
 				<span className="ms-2 text-muted-foreground/60 text-xs">
-					{row.size.toLocaleString()} {row.size === 1 ? "item" : "items"}
+					{formatNumber(row.size)} {row.size === 1 ? "item" : "items"}
 				</span>
 			</span>
 		);
@@ -588,7 +589,7 @@ function ValuePreview({ row, isOpen }: { row: Row; isOpen: boolean }) {
 			<span className="text-muted-foreground">
 				{isOpen ? "{" : row.size === 0 ? "{}" : "{…}"}
 				<span className="ms-2 text-muted-foreground/60 text-xs">
-					{row.size.toLocaleString()} {row.size === 1 ? "key" : "keys"}
+					{formatNumber(row.size)} {row.size === 1 ? "key" : "keys"}
 				</span>
 			</span>
 		);

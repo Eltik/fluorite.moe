@@ -17,7 +17,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { ImageViewer } from "@/components/viewers/image-viewer";
 import { fileUrl, thumbUrl } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
-import { dirname } from "@/lib/format";
+import { dirname, formatNumber } from "@/lib/format";
 import type { GridItem } from "./texture-grid";
 
 /** Full-size texture viewer with ←/→ navigation through the current results. */
@@ -118,7 +118,7 @@ export function Lightbox({
 							)}
 							<span className="shrink-0 text-muted-foreground text-xs tabular-nums">
 								{(index ?? 0) + 1} /{" "}
-								{Math.max(total ?? 0, items.length).toLocaleString()}
+								{formatNumber(Math.max(total ?? 0, items.length))}
 							</span>
 							<Button
 								render={

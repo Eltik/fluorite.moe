@@ -38,6 +38,7 @@ import {
 	type StoryCategoryId,
 	storyListQuery,
 } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { pageTitle } from "@/lib/route-meta";
 import { bool, oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
@@ -124,7 +125,7 @@ function StoryIndex(): React.ReactElement {
 			<PageHeader
 				description={
 					query.data
-						? `${query.data.total.toLocaleString()} dialogs, read as chat transcripts with choices.`
+						? `${formatNumber(query.data.total)} dialogs, read as chat transcripts with choices.`
 						: "Every dialog, read as a chat transcript with choices."
 				}
 				icon={<BookOpenIcon />}
@@ -179,7 +180,7 @@ function StoryIndex(): React.ReactElement {
 											{STORY_CATEGORY_LABELS[id]}
 											{count !== undefined && (
 												<span className="text-muted-foreground text-xs tabular-nums">
-													{count.toLocaleString()}
+													{formatNumber(count)}
 												</span>
 											)}
 										</TabsTab>
@@ -250,8 +251,8 @@ function StoryIndex(): React.ReactElement {
 						<>
 							{search.q && (
 								<p className="-mt-2 text-muted-foreground text-sm">
-									{dialogCount.toLocaleString()} dialogs in{" "}
-									{sections.length.toLocaleString()} sections
+									{formatNumber(dialogCount)} dialogs in{" "}
+									{formatNumber(sections.length)} sections
 								</p>
 							)}
 							<div className="flex flex-col gap-6">

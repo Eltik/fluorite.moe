@@ -4,6 +4,7 @@ import * as React from "react";
 import { EntityImage } from "@/components/catalog/entity-image";
 import { rarityStyle } from "@/components/catalog/rarity";
 import { type Cost, catalogListQuery, type ListItem } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { useSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
@@ -19,7 +20,7 @@ export function useItemIndex(): Map<string, ListItem> | undefined {
 
 function formatCount(n: number): string {
 	if (n >= 10_000) return `${+(n / 1000).toFixed(1)}k`;
-	return n.toLocaleString();
+	return formatNumber(n);
 }
 
 /** Material costs as item chips linking to the item pages. */

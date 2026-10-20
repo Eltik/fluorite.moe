@@ -16,6 +16,7 @@ import { PageHeader } from "@/components/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { type CatalogKind, getJson } from "@/lib/api";
 import { KIND_LABELS, KIND_ORDER } from "@/lib/catalog";
+import { formatNumber } from "@/lib/format";
 import { pageTitle } from "@/lib/route-meta";
 
 const KIND_ICONS: Record<CatalogKind, LucideIcon> = {
@@ -83,7 +84,7 @@ function CatalogIndex(): React.ReactElement {
 										{KIND_LABELS[kind]}
 										{count !== undefined ? (
 											<span className="text-muted-foreground text-xs tabular-nums">
-												{count.toLocaleString()}
+												{formatNumber(count)}
 											</span>
 										) : (
 											<Skeleton className="h-3 w-8" />

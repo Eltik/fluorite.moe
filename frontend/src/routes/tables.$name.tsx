@@ -81,14 +81,27 @@ export const Route = createFileRoute("/tables/$name")({
 
 const I18N_CHUNK = 4_000;
 
+/** FNV-1a over the ids, so the i18n key changes whenever the ids do. */
+function hashIds(ids: string[]): string {
+	let h = 0x811c9dc5;
+	for (const id of ids) {
+		for (let i = 0; i < id.length; i++) {
+			h = Math.imul(h ^ id.charCodeAt(i), 0x01000193);
+		}
+		h = Math.imul(h ^ 0x1f, 0x01000193);
+	}
+	return (h >>> 0).toString(36);
+}
+
 function useI18nMap(
 	lang: string,
 	name: string,
 	ids: string[],
 	enabled: boolean,
 ) {
+	const idsKey = React.useMemo(() => hashIds(ids), [ids]);
 	return useQuery({
-		queryKey: ["i18n", "table", lang, name, ids.length],
+		queryKey: ["i18n", "table", lang, name, ids.length, idsKey],
 		enabled: enabled && ids.length > 0,
 		staleTime: Number.POSITIVE_INFINITY,
 		gcTime: 5 * 60_000,

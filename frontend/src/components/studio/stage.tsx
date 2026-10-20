@@ -6,7 +6,6 @@
  */
 import {
 	CameraControls,
-	ContactShadows,
 	Environment,
 	Grid,
 	Lightformer,
@@ -27,6 +26,7 @@ import {
 	type WebGLRenderer,
 } from "three";
 import type { AnimationController } from "@/components/studio/animation";
+import { ContactShadows } from "@/components/studio/contact-shadows";
 import type { LoadedModel } from "@/components/studio/load-model";
 import type {
 	ShadingId,
@@ -697,11 +697,11 @@ export function Stage({
 			{shown?.rigged && prefs.skeleton && <Skeleton model={shown} />}
 			{prefs.groundShadow && shown && framing && (
 				<ContactShadows
+					bakeKey={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}`}
 					blur={2.2}
 					color={background.dark ? "#000000" : "#2a2440"}
 					far={Math.max(height * 0.4, 0.2)}
 					frames={animating ? Number.POSITIVE_INFINITY : 1}
-					key={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}`}
 					opacity={background.dark ? 0.8 : 0.55}
 					position={[0, 0, 0]}
 					resolution={1024}

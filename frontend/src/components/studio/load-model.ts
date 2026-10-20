@@ -338,7 +338,10 @@ async function loadRigged(
 		});
 		throwIfAborted(signal);
 		const gltf = await makeLoader().parseAsync(buf, "");
-		throwIfAborted(signal);
+		if (signal.aborted) {
+			disposeObject(gltf.scene);
+			throwIfAborted(signal);
+		}
 		const content = gltf.scene;
 		const parts: PartEntry[] = [];
 		const textures = new Set<Texture>();
@@ -407,6 +410,12 @@ async function loadParts(
 				throwIfAborted(signal);
 				bytes += buf.byteLength;
 				const gltf = await loader.parseAsync(buf, "");
+				// The catch below may already have run for this abort, so a
+				// late scene is disposed here rather than left in `created`.
+				if (signal.aborted) {
+					disposeObject(gltf.scene);
+					throwIfAborted(signal);
+				}
 				created.push(gltf.scene);
 				return { path, scene: gltf.scene };
 			}),

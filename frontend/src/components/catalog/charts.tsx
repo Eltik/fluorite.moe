@@ -1,4 +1,5 @@
 import * as React from "react";
+import { formatNumber } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 const W = 640;
@@ -22,7 +23,7 @@ export function compactNumber(v: number): string {
 	const abs = Math.abs(v);
 	if (abs >= 1e6) return `${+(v / 1e6).toFixed(1)}M`;
 	if (abs >= 1e4) return `${+(v / 1e3).toFixed(1)}k`;
-	if (Number.isInteger(v)) return v.toLocaleString();
+	if (Number.isInteger(v)) return formatNumber(v);
 	return String(+v.toFixed(2));
 }
 

@@ -303,7 +303,14 @@ function Studio(): React.ReactElement {
 				});
 			},
 		);
-		return () => controller.abort();
+		return () => {
+			controller.abort();
+			// Don't leave this model's card up if nothing replaces it (e.g. the
+			// next model's detail query is still pending or fails).
+			setLoad((s) =>
+				s.status === "loading" && s.name === name ? { status: "idle" } : s,
+			);
+		};
 	}, [source, retry]);
 
 	// Dispose models that are no longer on screen or pending.
@@ -438,9 +445,30 @@ function Studio(): React.ReactElement {
 		animation,
 	});
 
-	const loading = load.status === "loading" ? load : null;
+	// With no source yet, the card reflects the detail query instead.
+	const pendingName =
+		kind && id
+			? (queryClient
+					.getQueryData(studioCatalogQuery(kind, lang).queryKey)
+					?.items.find((e) => e.id === id)?.name ?? id)
+			: "";
+	const loading =
+		load.status === "loading"
+			? load
+			: kind && id && !source && detail.isPending
+				? { name: pendingName, loaded: 0, total: 0 }
+				: null;
 	const showEmpty = !kind && !loading && !shown;
-	const loadError = load.status === "error" && !loading ? load : null;
+	const loadError =
+		load.status === "error" && !loading
+			? { ...load, retry: () => setRetry((r) => r + 1) }
+			: kind && id && !source && detail.isError
+				? {
+						name: pendingName,
+						message: errorMessage(detail.error),
+						retry: () => void detail.refetch(),
+					}
+				: null;
 	const openPicker = () => {
 		setUiHidden(false);
 		setFlyout("models");
@@ -485,7 +513,7 @@ function Studio(): React.ReactElement {
 				<ErrorStage
 					message={loadError.message}
 					onBrowse={openPicker}
-					onRetry={() => setRetry((r) => r + 1)}
+					onRetry={loadError.retry}
 					title={`Couldn't load ${loadError.name}`}
 				/>
 			)}
