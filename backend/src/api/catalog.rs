@@ -105,6 +105,8 @@ pub struct Memo<K, V> {
     capacity: usize,
     ttl: Option<Duration>,
     map: std::sync::Mutex<HashMap<K, MemoEntry<V>>>,
+    /// Per-key build locks so concurrent cold misses build once.
+    flights: std::sync::Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<K: Eq + Hash + Clone, V> Memo<K, V> {
@@ -113,7 +115,40 @@ impl<K: Eq + Hash + Clone, V> Memo<K, V> {
             capacity: capacity.max(1),
             ttl,
             map: std::sync::Mutex::new(HashMap::new()),
+            flights: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The cached value if still valid, else `build()`'s result, stored. Concurrent callers
+    /// for the same key wait for one build instead of each running their own. Failed builds
+    /// are not cached.
+    pub async fn get_or_build<F, Fut>(
+        &self,
+        key: K,
+        deps: Vec<AnyArc>,
+        build: F,
+    ) -> ApiResult<Arc<V>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ApiResult<V>>,
+    {
+        if let Some(v) = self.get(&key, &deps) {
+            return Ok(v);
+        }
+        let flight = self
+            .flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let _guard = flight.lock().await;
+        if let Some(v) = self.get(&key, &deps) {
+            return Ok(v);
+        }
+        let value = Arc::new(build().await?);
+        self.put(key, deps, value.clone());
+        Ok(value)
     }
 
     pub fn get(&self, key: &K, deps: &[AnyArc]) -> Option<Arc<V>> {
@@ -353,7 +388,7 @@ impl Catalog {
     pub fn new() -> Self {
         Self {
             tables: TableCache::new(),
-            bases: Memo::new(16, Some(Duration::from_secs(300))),
+            bases: Memo::new(16, None),
             lists: Memo::new(48, None),
             markup: Memo::new(1, Some(Duration::from_secs(300))),
             meshes: std::sync::Mutex::new(None),
@@ -504,7 +539,9 @@ pub async fn texts(state: &SharedState, lang: &str, gender: Gender) -> ApiResult
 
 // ── Per-kind dispatch ────────────────────────────────────────────────────
 
-/// Language-independent list for `kind`, built once per table version.
+/// Language-independent list for `kind`. Valid while its inputs are the same `Arc`s: the
+/// tables (reloaded on file stamp change), the mesh index (update-log + meshes root mtimes)
+/// and the rig index (`models/index.json` mtime). No TTL.
 async fn base(state: &SharedState, kind: Kind) -> ApiResult<Arc<Vec<BaseItem>>> {
     let dir = tables_dir(state);
     let cat = &state.catalog;
@@ -516,19 +553,19 @@ async fn base(state: &SharedState, kind: Kind) -> ApiResult<Arc<Vec<BaseItem>>> 
             // `hasModel` reads both indexes.
             deps.push(dep(&env.meshes));
             deps.push(dep(&env.rig));
-            if let Some(b) = cat.bases.get(&kind, &deps) {
-                return Ok(b);
-            }
-            let started = Instant::now();
-            let items = Arc::new(blocking(move || $m::base(&t, &env)).await?);
-            tracing::info!(
-                "built {} base list ({} entries) in {} ms",
-                kind.name(),
-                items.len(),
-                started.elapsed().as_millis()
-            );
-            cat.bases.put(kind, deps, items.clone());
-            Ok(items)
+            cat.bases
+                .get_or_build(kind, deps, || async move {
+                    let started = Instant::now();
+                    let items = blocking(move || $m::base(&t, &env)).await?;
+                    tracing::info!(
+                        "built {} base list ({} entries) in {} ms",
+                        kind.name(),
+                        items.len(),
+                        started.elapsed().as_millis()
+                    );
+                    Ok(items)
+                })
+                .await
         }};
     }
     match kind {
@@ -776,4 +813,72 @@ pub struct ItemRef {
 
 pub fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn memo() -> Memo<Kind, Vec<u32>> {
+        Memo::new(4, None)
+    }
+
+    async fn build(
+        m: &Memo<Kind, Vec<u32>>,
+        deps: &[AnyArc],
+        n: &Arc<AtomicUsize>,
+    ) -> Arc<Vec<u32>> {
+        let n = n.clone();
+        m.get_or_build(Kind::Items, deps.to_vec(), || async move {
+            n.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(vec![1, 2, 3])
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reused_while_inputs_unchanged() {
+        let m = memo();
+        let n = Arc::new(AtomicUsize::new(0));
+        let deps = vec![dep(&Arc::new(1u8)), dep(&Arc::new(2u8))];
+        let a = build(&m, &deps, &n).await;
+        let b = build(&m, &deps, &n).await;
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn rebuilt_when_an_input_changes() {
+        let m = memo();
+        let n = Arc::new(AtomicUsize::new(0));
+        let (tables, meshes, rig) = (Arc::new(1u8), Arc::new(2u8), Arc::new(3u8));
+        let deps = vec![dep(&tables), dep(&meshes), dep(&rig)];
+        build(&m, &deps, &n).await;
+        // A new rig index (its stamp changed) is a new Arc.
+        let deps2 = vec![dep(&tables), dep(&meshes), dep(&Arc::new(3u8))];
+        build(&m, &deps2, &n).await;
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+        build(&m, &deps2, &n).await;
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_requests_build_once() {
+        let m = Arc::new(memo());
+        let n = Arc::new(AtomicUsize::new(0));
+        let deps = vec![dep(&Arc::new(1u8))];
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let (m, n, deps) = (m.clone(), n.clone(), deps.clone());
+                tokio::spawn(async move { build(&m, &deps, &n).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
 }
