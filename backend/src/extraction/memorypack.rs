@@ -834,6 +834,38 @@ pub fn decode_bytes(
     None
 }
 
+/// Decode `data` as root type `root` alone: pretty-printed JSON when it consumes every
+/// byte, `None` otherwise (or when the schema has no such root).
+pub fn decode_as(schema: &Schema, pool: &StringPool, data: &[u8], root: &str) -> Option<Vec<u8>> {
+    let &index = schema.roots.get(root)?;
+    let mut decoder = Decoder {
+        schema,
+        pool,
+        data,
+        pos: 0,
+    };
+    let value = decoder.value(index, 0).ok()?;
+    (decoder.pos == data.len()).then(|| {
+        let mut out = Vec::with_capacity(data.len() * 4);
+        write_pretty(&value, 0, &mut out);
+        out
+    })
+}
+
+/// [`decode_bytes`], also naming the root type that decoded the file.
+pub fn decode_bytes_root<'s>(
+    schema: &'s Schema,
+    pool: &StringPool,
+    data: &[u8],
+    rel_dir: &str,
+) -> Option<(&'s str, Vec<u8>)> {
+    let first = *data.first()?;
+    schema
+        .candidates(rel_dir, first)
+        .into_iter()
+        .find_map(|root| decode_as(schema, pool, data, root).map(|json| (root, json)))
+}
+
 // ── Tree conversion ─────────────────────────────────────
 
 /// Totals from [`decode_tree`].
