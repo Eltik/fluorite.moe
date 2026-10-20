@@ -35,3 +35,7 @@ unity-asset-core = "0.2.0"
 aes = "0.8"
 texture2ddecoder = "0.1"
 image = "0.25"
+
+# Vendored with a relaxed array-size cap; see vendor/unity-asset-binary/VENDORED.md.
+[patch.crates-io]
+unity-asset-binary = { path = "vendor/unity-asset-binary" }

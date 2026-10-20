@@ -1,7 +1,7 @@
 /// TextAsset and MonoBehaviour export, laid out by AssetBundle container path.
 use crate::extraction::texture_layout::{self, Placement};
 use crate::extraction::unity_extract::{get_script_type_name, parse_text_asset};
-use crate::extraction::utils::{fit_filename, sanitize_filename};
+use crate::extraction::utils::{fit_filename, remove_dir_all_retry, sanitize_filename};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -306,7 +306,7 @@ pub fn remove_legacy_gamedata(gamedata_dir: &Path) -> std::io::Result<usize> {
     }
     let mono = gamedata_dir.join("monobehaviour");
     if mono.is_dir() {
-        fs::remove_dir_all(mono)?;
+        remove_dir_all_retry(&mono)?;
         removed += 1;
     }
     Ok(removed)

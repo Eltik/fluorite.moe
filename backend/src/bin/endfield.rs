@@ -19,7 +19,7 @@ use backend::extraction::texture_layout;
 use backend::extraction::texture_sort;
 use backend::extraction::unity_extract::{ChkContents, class_name, extract_chk_contents};
 use backend::extraction::update;
-use backend::extraction::utils::{format_bytes, hex_dump, sanitize_filename};
+use backend::extraction::utils::{format_bytes, hex_dump, remove_dir_all_retry, sanitize_filename};
 use backend::extraction::vfs_decrypt;
 use backend::extraction::zip_range::ZipCentralDirectory;
 use chrono::Utc;
@@ -911,7 +911,7 @@ async fn cmd_update(
                 .all(|digest| update::textures_current(Some(digest)));
             let ambiguous = tex_dir.join("_ambiguous");
             if all_current && ambiguous.is_dir() {
-                match std::fs::remove_dir_all(&ambiguous) {
+                match remove_dir_all_retry(&ambiguous) {
                     Ok(()) => println!("removed textures/_ambiguous"),
                     Err(error) => eprintln!("  FAIL remove textures/_ambiguous: {error}"),
                 }

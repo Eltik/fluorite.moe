@@ -137,3 +137,19 @@ pub fn fit_filename(file_name: &str, path_id: i64) -> String {
     }
     format!("{}{suffix}", &stem[..end])
 }
+
+/// `fs::remove_dir_all`, retried when the tree is repopulated mid-removal.
+///
+/// On macOS a sweep over a large tree can fail with `ENOTEMPTY` when an entry appears during
+/// the walk (e.g. Finder's `.DS_Store`); a fresh pass removes the stragglers.
+pub fn remove_dir_all_retry(path: &std::path::Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 3 => {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}

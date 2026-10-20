@@ -194,12 +194,18 @@ pub fn decode_mesh(
     mesh: &UnityObject,
     resources: &HashMap<String, Vec<u8>>,
 ) -> Result<DecodedMesh, String> {
-    if mesh
-        .get("m_MeshCompression")
+    // Endfield sets m_MeshCompression to values stock Unity never writes (4, 5) on meshes whose
+    // m_CompressedMesh is empty and whose vertices are in m_VertexData as usual, so trust the
+    // payload rather than the flag.
+    let compressed_vertices = mesh
+        .get("m_CompressedMesh")
+        .and_then(UnityValue::as_object)
+        .and_then(|c| c.get("m_Vertices"))
+        .and_then(UnityValue::as_object)
+        .and_then(|v| v.get("m_NumItems"))
         .and_then(UnityValue::as_i64)
-        .unwrap_or(0)
-        != 0
-    {
+        .unwrap_or(0);
+    if compressed_vertices > 0 {
         return Err("compressed mesh unsupported".into());
     }
     let vertex = object(mesh.get("m_VertexData"), "m_VertexData")?;

@@ -9,7 +9,8 @@ use std::path::Path;
 
 /// Bump when gamedata/mesh output for a `.chk` changes and every chunk must be re-extracted.
 /// 2: container-path gamedata layout, typed TextAssets, Mesh → glTF.
-pub const EXTRACT_VERSION: u32 = 2;
+/// 3: meshes flagged compressed but stored plainly, and objects with >1M-element arrays.
+pub const EXTRACT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdateState {
