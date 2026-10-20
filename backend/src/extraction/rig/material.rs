@@ -15,6 +15,7 @@ const CLASS_TEXTURE2D: i32 = 28;
 /// Largest texture side decoded from bundle data.
 pub const MAX_TEXTURE_SIDE: usize = 16384;
 const CLASS_SHADER: i32 = 48;
+pub const CLASS_MATERIAL: i32 = 21;
 
 /// What a texture is used for, which decides how it is processed before embedding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -186,6 +187,141 @@ impl TextureLibrary {
             }
         }
         lib
+    }
+}
+
+/// Material assets of the store by name, for models shipped without renderers (named NPC
+/// `sk_*.fbx` imports): their parts' materials are separate `.mat` assets next to the model
+/// (`<entity>/materials/m_<part>.mat`), or loose Materials inside the part mesh bundles.
+#[derive(Debug, Default, Clone)]
+pub struct MaterialAssets {
+    /// Material name (lowercase `.mat` stem) → `(cab, path_id, container)`.
+    pub by_name: HashMap<String, Vec<(String, i64, String)>>,
+    /// `(container, cab)` of stored bundles holding Material objects, for scans by directory.
+    pub bundles: Vec<(String, String)>,
+}
+
+impl MaterialAssets {
+    /// Index the `.mat` containers and Material-holding bundles of stored records.
+    #[must_use]
+    pub fn from_records(
+        records: &[super::store::CabRecord],
+        stored: &dyn Fn(&str) -> bool,
+    ) -> Self {
+        let mut out = Self::default();
+        for rec in records {
+            if !rec.classes.contains_key(&CLASS_MATERIAL) || !stored(&rec.cab) {
+                continue;
+            }
+            for (path, _, path_id) in &rec.containers {
+                let lower = path.to_ascii_lowercase();
+                if let Some(stem) = lower
+                    .strip_suffix(".mat")
+                    .and_then(|p| p.rsplit('/').next())
+                {
+                    out.by_name.entry(stem.to_string()).or_default().push((
+                        rec.cab.clone(),
+                        *path_id,
+                        lower.clone(),
+                    ));
+                }
+                out.bundles.push((lower, rec.cab.clone()));
+            }
+        }
+        out
+    }
+
+    /// The `.mat` asset named `name`, preferring one whose container starts with `near`.
+    #[must_use]
+    pub fn lookup(&self, name: &str, near: &str) -> Option<(&str, i64)> {
+        let found = self.by_name.get(&name.to_ascii_lowercase())?;
+        found
+            .iter()
+            .find(|(_, _, c)| c.starts_with(near))
+            .or_else(|| found.first())
+            .map(|(cab, id, _)| (cab.as_str(), *id))
+    }
+
+    /// Stored Material bundles whose container starts with `near`, deduplicated.
+    #[must_use]
+    pub fn bundles_near(&self, near: &str) -> Vec<&str> {
+        let mut cabs: Vec<&str> = self
+            .bundles
+            .iter()
+            .filter(|(c, _)| c.starts_with(near))
+            .map(|(_, cab)| cab.as_str())
+            .collect();
+        cabs.sort_unstable();
+        cabs.dedup();
+        cabs
+    }
+}
+
+/// Material name of a model part: `S_npc_major_x_face_02_lod0` → `m_npc_major_x_face_02`.
+#[must_use]
+pub fn material_name_for_mesh(mesh: &str) -> String {
+    let (base, _) = super::export::split_lod(mesh);
+    match base.strip_prefix("s_") {
+        Some(rest) => format!("m_{rest}"),
+        None => format!("m_{base}"),
+    }
+}
+
+/// Pick the material of a model part among an entity's material names (lowercase): the
+/// exact `m_<part>` name, else the only non-LOD material ending in the part's `<kind>_<nn>`
+/// (`S_actor_death_cloth_02` → `M_npc_major_death_cloth_02`; `brow`/`eyebrow` and
+/// `iris`/`eye` are interchangeable).
+#[must_use]
+pub fn choose_part_material(mesh: &str, names: &[String]) -> Option<usize> {
+    let want = material_name_for_mesh(mesh);
+    if let Some(i) = names.iter().position(|n| *n == want) {
+        return Some(i);
+    }
+    let (base, _) = super::export::split_lod(mesh);
+    let mut segs = base.rsplitn(3, '_');
+    let (num, kind) = (segs.next()?, segs.next()?);
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Part kinds named differently by meshes and materials of one model.
+    let alias = match kind {
+        "brow" => Some("eyebrow"),
+        "eyebrow" => Some("brow"),
+        "iris" => Some("eye"),
+        "eye" => Some("iris"),
+        _ => None,
+    };
+    let suffixes: Vec<String> = std::iter::once(kind)
+        .chain(alias)
+        .map(|k| format!("_{k}_{num}"))
+        .collect();
+    let hits: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !n.contains("_lod_") && suffixes.iter().any(|s| n.ends_with(s.as_str())))
+        .map(|(i, _)| i)
+        .collect();
+    (hits.len() == 1).then(|| hits[0])
+}
+
+/// Shared overlay-shadow material of a shadow part: `S_x_hairshadow_01` → `m_hairshadow_common_01`.
+#[must_use]
+pub fn common_shadow_material(mesh: &str) -> Option<String> {
+    let (base, _) = super::export::split_lod(mesh);
+    let kind = base.rsplit('_').nth(1)?;
+    kind.ends_with("shadow")
+        .then(|| format!("m_{kind}_common_01"))
+}
+
+/// Entity directory of a model container: `.../george/models/sk_x.fbx` → `.../george/`.
+#[must_use]
+pub fn entity_dir(container: &str) -> String {
+    let lower = container.to_ascii_lowercase();
+    match lower.rfind("/models/") {
+        Some(i) => lower[..=i].to_string(),
+        None => lower
+            .rfind('/')
+            .map_or(String::new(), |i| lower[..=i].to_string()),
     }
 }
 
@@ -711,4 +847,121 @@ fn embed(
     } else {
         exp.builder.texture(&bytes, mime, name)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extraction::rig::store::CabRecord;
+    use std::collections::BTreeMap;
+
+    fn record(cab: &str, container: &str, path_id: i64) -> CabRecord {
+        CabRecord {
+            cab: cab.into(),
+            chunk: "c".into(),
+            sf_size: 0,
+            resources: Vec::new(),
+            resource_sizes: BTreeMap::new(),
+            classes: BTreeMap::from([(CLASS_MATERIAL, 1)]),
+            containers: vec![(container.to_string(), 0, path_id)],
+            externals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn part_material_names() {
+        assert_eq!(
+            material_name_for_mesh("S_npc_major_andrew_face_02_lod0"),
+            "m_npc_major_andrew_face_02"
+        );
+        assert_eq!(material_name_for_mesh("Body"), "m_body");
+        assert_eq!(
+            entity_dir("assets/npc/major/gentleman/george/models/sk_npc_major_george_01.fbx"),
+            "assets/npc/major/gentleman/george/"
+        );
+    }
+
+    #[test]
+    fn part_materials_match_by_name_then_part_suffix() {
+        let names: Vec<String> = [
+            "m_npc_major_death_cloth_02",
+            "m_npc_major_lod_death_cloth_03",
+            "m_npc_major_death_cloth_03",
+            "m_npc_major_death_eyebrow_01",
+            "m_npc_major_andrew_face_02",
+            "m_npc_major_x_face_01",
+            "m_npc_major_y_face_01",
+        ]
+        .map(String::from)
+        .to_vec();
+        let pick = |mesh: &str| choose_part_material(mesh, &names).map(|i| names[i].as_str());
+        assert_eq!(
+            pick("S_npc_major_andrew_face_02_lod0"),
+            Some("m_npc_major_andrew_face_02")
+        );
+        assert_eq!(
+            pick("S_actor_death_cloth_03_lod0"),
+            Some("m_npc_major_death_cloth_03")
+        );
+        assert_eq!(
+            pick("S_actor_death_brow_01_lod0"),
+            Some("m_npc_major_death_eyebrow_01")
+        );
+        let qinjc = vec![
+            "m_npc_major_qinjc_brow_01".to_string(),
+            "m_npc_major_qinjc_eye_01".into(),
+        ];
+        assert_eq!(
+            choose_part_material("S_npc_major_qinjc_eyebrow_01_lod0", &qinjc),
+            Some(0)
+        );
+        assert_eq!(
+            choose_part_material("S_npc_major_qinjc_iris_01_lod0", &qinjc),
+            Some(1)
+        );
+        // Ambiguous or absent parts are left to the caller.
+        assert_eq!(pick("S_actor_z_face_01_lod0"), None);
+        assert_eq!(pick("S_actor_death_cloth_04_lod0"), None);
+        assert_eq!(
+            common_shadow_material("S_npc_major_x_hairshadow_01_lod0").as_deref(),
+            Some("m_hairshadow_common_01")
+        );
+        assert_eq!(common_shadow_material("S_npc_major_x_hair_01_lod0"), None);
+    }
+
+    #[test]
+    fn material_assets_prefer_the_entity_directory() {
+        let records = vec![
+            record(
+                "CAB-a",
+                "a/andrew/materials/m_npc_major_andrew_face_01.mat",
+                1,
+            ),
+            record(
+                "CAB-b",
+                "a/andrewhq/materials/M_npc_major_andrew_face_01.mat",
+                2,
+            ),
+            record(
+                "CAB-c",
+                "a/andrewhq/models/s_npc_major_andrew_body_01_lod0.asset",
+                3,
+            ),
+            record(
+                "CAB-gone",
+                "a/andrew/materials/m_npc_major_andrew_iris_01.mat",
+                4,
+            ),
+        ];
+        let assets = MaterialAssets::from_records(&records, &|cab: &str| cab != "CAB-gone");
+        let face = "m_npc_major_andrew_face_01";
+        assert_eq!(assets.lookup(face, "a/andrewhq/"), Some(("CAB-b", 2)));
+        assert_eq!(assets.lookup(face, "a/andrew/"), Some(("CAB-a", 1)));
+        assert_eq!(assets.lookup(face, "a/other/"), Some(("CAB-a", 1)));
+        assert_eq!(
+            assets.lookup("m_npc_major_andrew_iris_01", "a/andrew/"),
+            None
+        );
+        assert_eq!(assets.bundles_near("a/andrewhq/"), vec!["CAB-b", "CAB-c"]);
+    }
 }

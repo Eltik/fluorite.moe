@@ -6,12 +6,14 @@
 //!   scan     — download chunks once and keep what rig export needs in a small store
 //!   export   — write one self-contained GLB per entity prefab matching a filter
 //!   clips    — write one animation-only GLB per clip of every exported model
+//!   charinfo — write each operator's character-screen data (menu state machine, weapon
+//!              mounts, deco props, lights and camera)
 use backend::extraction::pipeline::{self, VFS_DIRS};
 use backend::extraction::rig::{self, ChunkFiles};
 use backend::extraction::zip_range::ZipCentralDirectory;
 use clap::{Parser, Subcommand};
 use reqwest::Client;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -184,6 +186,25 @@ enum Commands {
         #[arg(long, default_value_t = rig::clips::TOLERANCE.position)]
         position_tolerance: f32,
     },
+    /// Write the character-screen data of every exported operator: the UI Animator state
+    /// machine (<models>/clips/<kind>/<id>/menu.json), default weapon mounting
+    /// (<models>/charinfo/weapons/<id>.json), deco props (<models>/charinfo/deco/<id>/) and
+    /// menu lights with the default camera (<models>/lights/<id>.json). Run after `clips`.
+    /// Needs `--features acl` (weapon visibility is read from clip curves).
+    Charinfo {
+        /// Store of scanned chunks
+        #[arg(long)]
+        store: PathBuf,
+        /// Models directory holding index.json, <kind>/<id>.glb and clips/
+        #[arg(long, default_value = "output/models")]
+        models: PathBuf,
+        /// Extraction output root holding decrypted/Table, gamedata/ and textures/
+        #[arg(long, default_value = "output")]
+        data_root: PathBuf,
+        /// Only operators whose id contains one of these (repeatable)
+        #[arg(long = "id")]
+        ids: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -317,6 +338,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..rig::clips::TOLERANCE
                 },
             })
+        }
+        Commands::Charinfo {
+            store,
+            models,
+            data_root,
+            ids,
+        } => {
+            if !rig::acl::available() {
+                return Err("charinfo needs a build with `--features acl`".into());
+            }
+            cmd_charinfo(&store, &models, &data_root, &ids)
         }
         Commands::Export {
             filter,
@@ -805,6 +837,12 @@ async fn cmd_export(
     }
     eprintln!("{} prefab(s) match {:?}", candidates.len(), args.filter);
     let clip_index = animation_containers(&records, stored_root.as_deref());
+    // Part materials of renderer-less (Avatar-only) imports, found by name.
+    let material_assets = rig::material::MaterialAssets::from_records(&records, &|cab: &str| {
+        stored_root
+            .as_ref()
+            .is_none_or(|r| r.join("sf").join(cab).is_file())
+    });
     let library = std::sync::Arc::new(rig::material::TextureLibrary::load(&textures));
     eprintln!(
         "texture library: {} named textures under {}",
@@ -823,7 +861,7 @@ async fn cmd_export(
         let mut result = None;
         if cand.avatar {
             let clips = select_clips(&clip_index, &cand.id, &args.anims, args.max_anims);
-            match export_avatar_candidate(&mut source, cand, &args, clips) {
+            match export_avatar_candidate(&mut source, cand, &args, clips, &material_assets) {
                 Ok(r) => result = Some(r),
                 Err(e) => last_error = Some(e),
             }
@@ -1323,12 +1361,156 @@ fn cmd_clips(args: &ClipsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Character-screen data of every exported operator (see `Commands::Charinfo`).
+fn cmd_charinfo(
+    store: &Path,
+    models: &Path,
+    data_root: &Path,
+    ids: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rig::charinfo;
+    let started = Instant::now();
+    let records = rig::store::read_index(store)?;
+    let stored = |cab: &str| store.join("sf").join(cab).is_file();
+    let containers = charinfo::uimodel_containers(&records, &stored);
+    let tables = charinfo::Tables::load(data_root);
+    let library = std::sync::Arc::new(rig::material::TextureLibrary::load(
+        &data_root.join("textures"),
+    ));
+    let opts = rig::ExportOptions {
+        material: rig::material::MaterialOptions {
+            library: Some(library),
+            all_textures: true,
+            encoding: rig::material::ImageEncoding::Auto,
+            max_texture_size: None,
+        },
+        all_lods: false,
+    };
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(models.join("index.json"))?)?;
+    let operators: Vec<(String, String)> = index
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.get("kind").and_then(serde_json::Value::as_str) == Some("operator"))
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?;
+            let glb = e.get("glb")?.as_str()?;
+            Some((id.to_string(), glb.strip_suffix(".glb")?.to_string()))
+        })
+        .filter(|(id, _)| ids.is_empty() || ids.iter().any(|f| id.contains(f.as_str())))
+        .collect();
+    eprintln!(
+        "{} operator(s), {} UI-model container(s)",
+        operators.len(),
+        containers.len()
+    );
+    let ctx = charinfo::Context {
+        records: &records,
+        containers: &containers,
+        tables: &tables,
+        opts: &opts,
+        models,
+    };
+    let mut source = rig::store::CabSource::new(Some(store.to_path_buf()), ChunkFiles::default());
+    let write_json = |path: PathBuf, value: &serde_json::Value| -> std::io::Result<()> {
+        rig::store::write_atomic(&path, &serde_json::to_vec_pretty(value)?)
+    };
+    let mut written = 0usize;
+    for (n, (id, stem)) in operators.iter().enumerate() {
+        let clip_index = std::fs::read(models.join("clips").join(stem).join("index.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok())
+            .unwrap_or_default();
+        let clips = charinfo::ClipIndex::from_entries(&clip_index);
+        let nodes: HashSet<String> = rig::clips::read_glb_json(&models.join(format!("{stem}.glb")))
+            .ok()
+            .and_then(|doc| {
+                Some(
+                    doc.get("nodes")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|n| n.get("name")?.as_str().map(str::to_string))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        let data = charinfo::character(&mut source, &ctx, id, &clips, &nodes);
+        let mut parts = Vec::new();
+        if let Some(menu) = &data.menu {
+            write_json(models.join("clips").join(stem).join("menu.json"), menu)?;
+            parts.push(format!(
+                "menu {} states",
+                menu.get("states")
+                    .and_then(serde_json::Value::as_object)
+                    .map_or(0, serde_json::Map::len)
+            ));
+        }
+        if let Some(weapon) = &data.weapon {
+            write_json(
+                models.join("charinfo/weapons").join(format!("{id}.json")),
+                weapon,
+            )?;
+            parts.push(format!(
+                "weapon {}",
+                weapon
+                    .get("weapon")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+            ));
+        }
+        if let Some((deco, glbs)) = &data.deco {
+            let dir = models.join("charinfo/deco").join(id);
+            for (name, glb) in glbs {
+                rig::store::write_atomic(&dir.join(name), glb)?;
+            }
+            write_json(dir.join("index.json"), deco)?;
+            parts.push(format!("deco {} prop GLB(s)", glbs.len()));
+        }
+        if let Some(lights) = rig::lights::character_lights(&mut source, &records, id, &stored) {
+            write_json(models.join("lights").join(format!("{id}.json")), &lights)?;
+            if lights.get("camera").is_some_and(|c| !c.is_null()) {
+                parts.push("camera".into());
+            }
+        }
+        if !parts.is_empty() {
+            written += 1;
+        }
+        eprintln!(
+            "[{}/{}] {id}: {}{}",
+            n + 1,
+            operators.len(),
+            if parts.is_empty() {
+                "nothing".into()
+            } else {
+                parts.join(", ")
+            },
+            if data.warnings.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", data.warnings.join("; "))
+            }
+        );
+        if (n + 1) % 4 == 0 {
+            source.clear();
+        }
+    }
+    eprintln!(
+        "charinfo: {written}/{} operator(s) in {:.0}s",
+        operators.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Export an Avatar-only model import: its bundle's Avatar plus every Mesh of the container.
 fn export_avatar_candidate(
     source: &mut rig::store::CabSource,
     cand: &rig::entity::Candidate,
     args: &ExportArgs,
     clips: Vec<(String, i64)>,
+    materials: &rig::material::MaterialAssets,
 ) -> Result<(String, rig::EntityExport), String> {
     let cab = cand
         .sources
@@ -1362,7 +1544,8 @@ fn export_avatar_candidate(
     let mut exporter = rig::Exporter::new(source, args.opts.clone());
     exporter.clip_sources = clips;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exporter.export_avatar(avatar, &meshes, &cand.id, extras)
+        let near = rig::material::entity_dir(&cand.container);
+        exporter.export_avatar(avatar, &meshes, &cand.id, extras, materials, &near)
     }))
     .unwrap_or_else(|_| Err("exporter panicked".into()))
     .map(|r| (cab, r))

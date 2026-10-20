@@ -320,7 +320,19 @@ pub fn catalog_fixture() -> Fixture {
     );
     write(
         "models/lights/chr_0005_chen.json",
-        br#"{"id":"chr_0005_chen","volume":{"multiplier":1.0},"lights":[{"name":"RimLight_1","npr":"rim"}]}"#,
+        br#"{"id":"chr_0005_chen","volume":{"multiplier":1.0},"lights":[{"name":"RimLight_1","npr":"rim"}],"camera":{"position":[0.0,0.998,3.5],"target":[0.0,1.225,0.0],"fov":20.0}}"#,
+    );
+    write(
+        "models/clips/operators/chr_0005_chen/menu.json",
+        br#"{"format":1,"default":"Overview.OverviewIdle","states":{"Overview.OverviewIdle":{"clip":"a_actor_chen_idle.glb","length":2.0,"loop":true,"exit":null}},"any":[],"moments":[]}"#,
+    );
+    write(
+        "models/charinfo/weapons/chr_0005_chen.json",
+        br#"{"format":1,"id":"chr_0005_chen","weapon":"wpn_sword_0015","rule":"signature","mounts":[{"node":"wep_R","scale":1.0}],"clips":{}}"#,
+    );
+    write(
+        "models/charinfo/deco/chr_0005_chen/index.json",
+        br#"{"format":1,"id":"chr_0005_chen","items":[{"n":1,"file":"1.glb","mount":"inner","kind":"deco"}],"clips":{}}"#,
     );
 
     // Dialog: line -> (spliced ExActor) -> option(2) -> line / finish. Contains a bare
@@ -625,6 +637,26 @@ async fn operator_detail() {
     assert_eq!(v["model"]["lights"], "lights/chr_0005_chen.json");
     let lights = body_json(get(&app, "/files/models/lights/chr_0005_chen.json").await).await;
     assert_eq!(lights["lights"][0]["npr"], "rim");
+    // Character-screen data written by `endfield-models charinfo`.
+    assert_eq!(
+        v["model"]["menu"],
+        "clips/operators/chr_0005_chen/menu.json"
+    );
+    assert_eq!(v["model"]["weapon"], "charinfo/weapons/chr_0005_chen.json");
+    assert_eq!(v["model"]["deco"], "charinfo/deco/chr_0005_chen/index.json");
+    assert_eq!(
+        v["model"]["camera"],
+        json!({"position": [0.0, 0.998, 3.5], "target": [0.0, 1.225, 0.0], "fov": 20.0})
+    );
+    let menu = body_json(
+        get(
+            &app,
+            "/files/models/clips/operators/chr_0005_chen/menu.json",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(menu["default"], "Overview.OverviewIdle");
 
     // CN: localized description, profession from CN, name from CN.
     let v = body_json(get(&app, "/api/catalog/operators/chr_0005_chen?lang=CN").await).await;
@@ -801,7 +833,10 @@ async fn models_root_is_browsable() {
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["clips", "lights", "operators", "index.json"]);
+    assert_eq!(
+        names,
+        vec!["charinfo", "clips", "lights", "operators", "index.json"]
+    );
 }
 
 /// Catalog ids resolve to rigged variant prefabs when no exact GLB exists.

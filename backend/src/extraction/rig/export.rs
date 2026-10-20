@@ -979,13 +979,16 @@ impl<'a> Exporter<'a> {
     /// Build a model shipped without GameObjects (named NPC `sk_*.fbx` imports): the node
     /// hierarchy comes from the Avatar's skeleton (TOS paths, parents, skeleton pose) and every
     /// mesh is skinned through its `m_BoneNameHashes` (path hashes, resolved via the TOS).
-    /// Materials are not shipped either, so each part gets the name-matched fallback.
+    /// Renderers are not shipped either: each part's material is the `.mat` asset named after
+    /// it (see [`Self::part_material`]), else the name-matched fallback.
     pub fn export_avatar(
         mut self,
         avatar: ObjRef,
         meshes: &[ObjRef],
         name: &str,
         asset_extras: Value,
+        materials: &material::MaterialAssets,
+        near: &str,
     ) -> Result<EntityExport, String> {
         let (_, value) = self.read(avatar).ok_or("avatar could not be read")?;
         let skeleton = avatar::Skeleton::from_avatar(&value)?;
@@ -1039,6 +1042,7 @@ impl<'a> Exporter<'a> {
                 .flatten()
                 .map(|h| h.as_u64().map(|h| avatar::bone_ref(h as u32)))
                 .collect();
+            let part_material = self.part_material(materials, &mesh_name, near);
             self.renderers.push(Renderer {
                 skinned: !bones.is_empty(),
                 renderer: mesh,
@@ -1046,12 +1050,57 @@ impl<'a> Exporter<'a> {
                 name: mesh_name,
                 active: true,
                 mesh: Some(mesh),
-                materials: vec![None],
+                materials: vec![part_material],
                 bones,
                 lod: None,
             });
         }
         self.finish(root_node, asset_extras)
+    }
+
+    /// The Material of a renderer-less model part, by name ([`material::choose_part_material`]):
+    /// among the Materials of bundles under the entity directory `near` (`.mat` assets and
+    /// loose Materials of part mesh bundles), else the `.mat` asset of the exact name anywhere
+    /// (`hq` variants reuse the base model's parts), else the shared overlay-shadow material.
+    pub fn part_material(
+        &mut self,
+        materials: &material::MaterialAssets,
+        mesh_name: &str,
+        near: &str,
+    ) -> Option<ObjRef> {
+        let mut found: Vec<(String, ObjRef)> = Vec::new();
+        for cab in materials.bundles_near(near) {
+            let Some(file) = self.src.get(cab) else {
+                continue;
+            };
+            let ids: Vec<i64> = self.src.files.files[file]
+                .sf
+                .objects
+                .iter()
+                .filter(|o| o.class_id == material::CLASS_MATERIAL)
+                .map(|o| o.path_id)
+                .collect();
+            for path_id in ids {
+                let r = ObjRef { file, path_id };
+                if let Some(name) = self.peek_name(r) {
+                    found.push((name.to_ascii_lowercase(), r));
+                }
+            }
+        }
+        let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
+        if let Some(i) = material::choose_part_material(mesh_name, &names) {
+            return Some(found[i].1);
+        }
+        let exact = material::material_name_for_mesh(mesh_name);
+        [Some(exact), material::common_shadow_material(mesh_name)]
+            .into_iter()
+            .flatten()
+            .find_map(|want| {
+                let (cab, path_id) = materials.lookup(&want, near)?;
+                let file = self.src.get(cab)?;
+                let r = ObjRef { file, path_id };
+                (self.class_of(r) == Some(material::CLASS_MATERIAL)).then_some(r)
+            })
     }
 
     /// Shared tail of both exports: LOD choice, meshes, skins, clips, document.

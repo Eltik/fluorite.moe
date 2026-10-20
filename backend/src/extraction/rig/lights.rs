@@ -10,6 +10,9 @@
 //!   to a light group (`m_LightList` of Light components, `m_LightInfoList` intensities). Each
 //!   light's GameObject carries HG light data (`m_lightNPRType`…) and optionally a follower
 //!   (`followType`, `followableNodeType`, offsets) that pins it to `Bip001` or `Head_Local`.
+//! - The camera track's `vcam_overview` (a Cinemachine virtual camera under `DollyCart`):
+//!   its Transform, `m_LookAt` target and `m_Lens` give the default framing (warfarin's
+//!   `cameras.json`).
 //!
 //! Output (`<models>/lights/<id>.json`), coordinates converted to glTF handedness (x negated,
 //! quaternions `(x, -y, -z, w)`):
@@ -28,6 +31,8 @@
 //!              "follower": null | {"on", "self", "type": "fixedOffset|parent",
 //!                                  "node": "Bip001|Head_Local", "positionOffset": [x,y,z],
 //!                                  "localPosition": [x,y,z], "localRotation": [x,y,z,w]}}],
+//!  "camera": null | {"position": [x,y,z], "target": [x,y,z], "fov", "near", "far",
+//!                     "screenOffset"?: [x,y], "referenceAspect"?},
 //!  "source": {"lights": container, "track": container}}
 //! ```
 //!
@@ -458,6 +463,77 @@ fn default_volume(src: &mut CabSource, records: &[CabRecord]) -> Option<Value> {
         .map(|(_, mb)| mb.clone())
 }
 
+/// Default framing of the character screen: the `vcam_overview` virtual camera of the camera
+/// track (the `cameraGroup` → `DollyCart` refDict), its look-at target and lens.
+///
+/// ```json
+/// {"position": [x,y,z], "target": [x,y,z], "fov": 20, "near": 0.1, "far": 50,
+///  "screenOffset": [x, y], "referenceAspect": 1.7778}
+/// ```
+///
+/// Positions are world space of the track prefab, converted to glTF (x negated); the model
+/// stands at the origin. `fov` is Cinemachine's vertical field of view in degrees.
+/// `screenOffset` is the track's framing offset of the target in viewport units, when set.
+fn camera(objs: &Objects) -> Option<Value> {
+    let (vcam_go, cinemachine) = objs.of_class(CLASS_MONO_BEHAVIOUR).find_map(|(_, mb)| {
+        let go = game_object(mb)?;
+        let name = objs.get(go)?.get("m_Name")?.as_str()?;
+        (name == "vcam_overview" && mb.get("m_Lens").is_some()).then_some((go, mb))
+    })?;
+    let transform_of = |go: i64| {
+        objs.of_class(CLASS_TRANSFORM)
+            .find(|(_, t)| game_object(t) == Some(go))
+            .map(|(id, _)| id)
+    };
+    let (position, _) = world(objs, transform_of(vcam_go)?);
+    let target = objs.deref(cinemachine.get("m_LookAt")).and_then(|(id, t)| {
+        // `m_LookAt` is a Transform; tolerate a GameObject.
+        let tid = if t.get("m_LocalPosition").is_some() {
+            Some(id)
+        } else {
+            transform_of(id)
+        };
+        tid.map(|tid| world(objs, tid).0)
+    });
+    let lens = cinemachine.get("m_Lens");
+    let lensf = |k: &str| f(lens.and_then(|l| l.get(k)));
+    let mut out = Map::new();
+    out.insert("position".into(), round_all(flip(position), 4));
+    out.insert(
+        "target".into(),
+        target.map_or(Value::Null, |t| round_all(flip(t), 4)),
+    );
+    out.insert(
+        "fov".into(),
+        json!(round(lensf("FieldOfView").unwrap_or(20.0), 4)),
+    );
+    out.insert(
+        "near".into(),
+        json!(round(lensf("NearClipPlane").unwrap_or(0.1), 4)),
+    );
+    out.insert(
+        "far".into(),
+        json!(round(lensf("FarClipPlane").unwrap_or(50.0), 4)),
+    );
+    let behaviours: Vec<&Value> = objs.behaviours_of(vcam_go).collect();
+    if let Some(offset) = behaviours.iter().find(|mb| mb.get("offsetX").is_some()) {
+        out.insert(
+            "screenOffset".into(),
+            json!([
+                round(f(offset.get("offsetX")).unwrap_or(0.0), 4),
+                round(f(offset.get("offsetY")).unwrap_or(0.0), 4)
+            ]),
+        );
+    }
+    if let Some(aspect) = behaviours
+        .iter()
+        .find_map(|mb| f(mb.get("referenceAspect")))
+    {
+        out.insert("referenceAspect".into(), json!(round(aspect, 4)));
+    }
+    Some(Value::Object(out))
+}
+
 /// Light data of character `id`, or `None` when the store has neither its light rig nor its
 /// camera track.
 pub fn character_lights(
@@ -472,12 +548,18 @@ pub fn character_lights(
     if track.is_none() && rig.is_none() {
         return None;
     }
-    let vol = track
-        .and_then(|(cab, _)| Objects::load(src, cab, &[CLASS_MONO_BEHAVIOUR]))
-        .and_then(|objs| {
-            let (_, v) = objs.ref_dict("volume_overview")?;
-            v.get("charLightVolumeData").cloned()
-        });
+    let track_objs = track.and_then(|(cab, _)| {
+        Objects::load(
+            src,
+            cab,
+            &[CLASS_GAME_OBJECT, CLASS_TRANSFORM, CLASS_MONO_BEHAVIOUR],
+        )
+    });
+    let vol = track_objs.as_ref().and_then(|objs| {
+        let (_, v) = objs.ref_dict("volume_overview")?;
+        v.get("charLightVolumeData").cloned()
+    });
+    let camera = track_objs.as_ref().and_then(camera);
     let volume = match (&vol, &defaults) {
         (Some(v), d) => volume(v, d.as_ref()),
         (None, Some(d)) => volume(d, None),
@@ -505,6 +587,7 @@ pub fn character_lights(
         "id": id,
         "volume": volume,
         "lights": lights,
+        "camera": camera,
         "source": source,
     }))
 }

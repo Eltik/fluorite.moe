@@ -428,6 +428,21 @@ pub struct ModelInfo {
     /// `endfield-models export` for operators): key-light volume and additional NPR lights.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lights: Option<String>,
+    /// Character-screen state machine next to the clip index (`clips/<kind>/<id>/menu.json`,
+    /// written by `endfield-models charinfo`): states with clip files, exits and moments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub menu: Option<String>,
+    /// Default weapon and how it mounts per clip (`charinfo/weapons/<id>.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weapon: Option<String>,
+    /// Deco props with per-clip visibility (`charinfo/deco/<id>/index.json`; prop GLBs beside
+    /// it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deco: Option<String>,
+    /// Default character-screen framing from the lights file:
+    /// `{position, target, fov, near, far, screenOffset?, referenceAspect?}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera: Option<serde_json::Value>,
 }
 
 /// Clip index (models-root relative) of a rigged GLB, when `endfield-models clips` wrote a
@@ -449,6 +464,46 @@ pub fn lights_file(output: &Path, rigged: Option<&str>) -> Option<String> {
     Root::Models.dir(output).join(&rel).is_file().then_some(rel)
 }
 
+/// Id of a rigged GLB path: `operator/chr_0004_pelica.glb` → `chr_0004_pelica`.
+fn rigged_id(rigged: Option<&str>) -> Option<&str> {
+    rigged?.strip_suffix(".glb")?.rsplit('/').next()
+}
+
+/// A models-root relative file, when it exists.
+fn models_file(output: &Path, rel: String) -> Option<String> {
+    Root::Models.dir(output).join(&rel).is_file().then_some(rel)
+}
+
+/// Character-screen state machine of a rigged GLB, when `endfield-models charinfo` wrote one:
+/// `operator/chr_0004_pelica.glb` → `clips/operator/chr_0004_pelica/menu.json`.
+pub fn menu_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+    let stem = rigged?.strip_suffix(".glb")?;
+    models_file(output, format!("clips/{stem}/menu.json"))
+}
+
+/// Default weapon mounting of a rigged GLB: `charinfo/weapons/<id>.json`.
+pub fn weapon_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+    models_file(
+        output,
+        format!("charinfo/weapons/{}.json", rigged_id(rigged)?),
+    )
+}
+
+/// Deco props of a rigged GLB: `charinfo/deco/<id>/index.json`.
+pub fn deco_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+    models_file(
+        output,
+        format!("charinfo/deco/{}/index.json", rigged_id(rigged)?),
+    )
+}
+
+/// The `camera` block of a lights file (models-root relative), when set.
+pub fn camera_of(output: &Path, lights: Option<&str>) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(Root::Models.dir(output).join(lights?)).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("camera").filter(|c| c.is_object()).cloned()
+}
+
 pub fn model_info(
     output: &Path,
     rig: &RigIndex,
@@ -462,11 +517,17 @@ pub fn model_info(
         None => (None, Vec::new()),
     };
     let rigged = rig.find(output, kind, id);
+    let r = rigged.as_deref();
+    let lights = lights_file(output, r);
     ModelInfo {
         dir,
         parts,
-        clips: clips_index(output, rigged.as_deref()),
-        lights: lights_file(output, rigged.as_deref()),
+        clips: clips_index(output, r),
+        camera: camera_of(output, lights.as_deref()),
+        lights,
+        menu: menu_file(output, r),
+        weapon: weapon_file(output, r),
+        deco: deco_file(output, r),
         rigged,
     }
 }

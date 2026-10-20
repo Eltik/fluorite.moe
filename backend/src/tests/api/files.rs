@@ -2,7 +2,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 
 use super::{Fixture, body_bytes, body_json, get, send};
-use crate::api::files::{RangeSpec, content_type, parse_range};
+use crate::api::files::{RangeSpec, cache_control, content_type, parse_range};
+use crate::api::paths::Root;
 
 #[test]
 fn range_parsing() {
@@ -281,4 +282,40 @@ async fn cors_allows_conditional_headers() {
     for h in ["range", "if-range", "if-modified-since", "if-none-match"] {
         assert!(allowed.contains(h), "{h} missing from {allowed}");
     }
+}
+
+/// Models are re-exported in place: they must revalidate, and a rewrite must change the ETag
+/// so the revalidation returns the new file instead of a 304.
+#[tokio::test]
+async fn re_exported_models_revalidate() {
+    assert_eq!(cache_control(Root::Models), "no-cache");
+    assert_eq!(cache_control(Root::Meshes), "public, max-age=3600");
+    let fx = Fixture::new();
+    let path = fx.dir.join("output/models/operator/chr_x.glb");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"glTF-old").unwrap();
+    let app = fx.app();
+    let res = get(&app, "/files/models/operator/chr_x.glb").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
+    let etag = res.headers()[header::ETAG].to_str().unwrap().to_string();
+    let conditional = || {
+        Request::get("/files/models/operator/chr_x.glb")
+            .header(header::IF_NONE_MATCH, &etag)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = send(&app, conditional()).await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+
+    // Re-export through a temp file and rename, as the exporter does (same size on purpose:
+    // the mtime alone must change the validator).
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let tmp = path.with_extension("glb.tmp");
+    std::fs::write(&tmp, b"glTF-new").unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let res = send(&app, conditional()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_ne!(res.headers()[header::ETAG].to_str().unwrap(), etag);
+    assert_eq!(body_bytes(res).await, b"glTF-new");
 }

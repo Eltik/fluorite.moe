@@ -995,4 +995,16 @@ mod npr {
         )];
         assert!(!is_rig_relevant(&classes, &other));
     }
+
+    #[test]
+    fn uimodel_deco_props_are_stored() {
+        // A MeshRenderer-only prop: no asset class keeps it.
+        let classes: BTreeMap<i32, usize> = [(1, 10), (4, 10), (23, 4), (33, 4), (95, 1)].into();
+        let deco = vec![(
+            "assets/beyond/dynamicassets/gameplay/prefabs/uimodels/decoitems/chr_0005_chen_deco_1.prefab".to_string(),
+            0,
+            1,
+        )];
+        assert!(is_rig_relevant(&classes, &deco));
+    }
 }

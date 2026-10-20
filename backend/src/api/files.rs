@@ -16,6 +16,18 @@ use super::error::{ApiError, ApiResult};
 use super::paths::{Root, extension, resolve_async, sanitize};
 
 pub const DEFAULT_CACHE: &str = "public, max-age=3600";
+/// Exported models (GLBs, clip and charinfo JSON) are rewritten in place under the same URL
+/// by re-exports: browsers must revalidate them every time (the ETag makes that a 304).
+pub const REVALIDATE_CACHE: &str = "no-cache";
+
+/// `Cache-Control` of a file under `root`.
+#[must_use]
+pub fn cache_control(root: Root) -> &'static str {
+    match root {
+        Root::Models => REVALIDATE_CACHE,
+        _ => DEFAULT_CACHE,
+    }
+}
 const STREAM_CHUNK: usize = 64 * 1024;
 
 /// `GET /files/{root}/{*path}`
@@ -30,7 +42,7 @@ pub async fn file(
         return Err(ApiError::bad_request("missing file path"));
     }
     let abs = resolve_async(root.dir(&state.config.output), rel).await?;
-    serve_file(&abs, &headers, DEFAULT_CACHE).await
+    serve_file(&abs, &headers, cache_control(root)).await
 }
 
 /// Content type for a file name, by extension.
@@ -57,7 +69,8 @@ pub fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// Strong validator derived from size and mtime.
+/// Strong validator derived from size and mtime (nanoseconds): a re-export, written through a
+/// temp file and rename, always gets a new one.
 pub fn etag_for(size: u64, mtime: SystemTime) -> String {
     let nanos = mtime.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("\"{size:x}-{nanos:x}\"")

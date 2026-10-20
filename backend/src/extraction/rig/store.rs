@@ -39,19 +39,24 @@ pub const SKIPPED_PREFIXES: &[&str] = &[
 ];
 
 /// Container prefixes of character-screen light rigs (additional lights, camera tracks with
-/// their light volumes, the default volume), kept for per-character light data.
+/// their light volumes, the default volume), kept for per-character light data. UI models
+/// ([`UIMODELS_PREFIX`]) are kept by the same rule.
 pub const CHARINFO_LIGHT_PREFIXES: &[&str] = &[
     "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/additionallights/",
     "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/cameratracks/",
     "assets/beyond/dynamicassets/gameplay/prefabs/charinfo/charinfo_volume",
 ];
 
+/// Container prefix of the character-screen UI models: their AnimatorControllers and deco
+/// props, some of which are MeshRenderer-only bundles no asset class rule keeps.
+pub const UIMODELS_PREFIX: &str = "assets/beyond/dynamicassets/gameplay/prefabs/uimodels/";
+
 /// Whether a bundle holds a character-screen light rig (see [`CHARINFO_LIGHT_PREFIXES`]).
 #[must_use]
 pub fn is_charinfo_light_bundle(containers: &[(String, i64, i64)]) -> bool {
     containers.iter().any(|(p, _, _)| {
         let p = p.to_ascii_lowercase();
-        CHARINFO_LIGHT_PREFIXES.iter().any(|s| p.starts_with(s))
+        CHARINFO_LIGHT_PREFIXES.iter().any(|s| p.starts_with(s)) || p.starts_with(UIMODELS_PREFIX)
     })
 }
 
@@ -65,7 +70,7 @@ fn is_entity_bundle(containers: &[(String, i64, i64)]) -> bool {
 
 /// Whether a SerializedFile is worth keeping: an entity bundle, or one holding shared assets
 /// (shaders, materials, textures, meshes) that is not purely a scene/UI/dialog bundle, or a
-/// character-screen light rig.
+/// character-screen bundle (light rig, UI model, controller or deco prop).
 ///
 /// Everything else (MonoBehaviour-only data, cutscenes, level sequences — gigabytes per run) is
 /// indexed but not stored.
