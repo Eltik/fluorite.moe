@@ -306,6 +306,7 @@ dependencies = [
  "aes",
  "axum",
  "base64",
+ "cc",
  "chrono",
  "clap",
  "comfy-table",

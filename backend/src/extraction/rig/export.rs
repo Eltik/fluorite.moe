@@ -1,4 +1,5 @@
 //! Prefab → glTF: Transform hierarchy, skinned/static meshes, skins and materials.
+use super::anim;
 use super::convert;
 use super::gltf::{self, ARRAY_BUFFER, Builder};
 use super::material::{self, MaterialOptions};
@@ -99,6 +100,10 @@ pub struct Exporter<'a> {
     pub stats: ExportStats,
     opts: ExportOptions,
     animators: Vec<Value>,
+    /// Node of the first Animator found: clip binding paths are relative to it.
+    animator_node: Option<usize>,
+    /// AnimationClips (`(cab, path_id)`) to embed as glTF animations.
+    pub clip_sources: Vec<(String, i64)>,
 }
 
 fn pptr(value: Option<&Value>) -> Option<(i64, i64)> {
@@ -161,6 +166,8 @@ impl<'a> Exporter<'a> {
             stats: ExportStats::default(),
             opts,
             animators: Vec::new(),
+            animator_node: None,
+            clip_sources: Vec::new(),
         }
     }
 
@@ -436,6 +443,7 @@ impl<'a> Exporter<'a> {
                     }
                 }
                 Some(CLASS_ANIMATOR) => {
+                    self.animator_node.get_or_insert(node);
                     if let Some((_, an)) = self.read(cref) {
                         let avatar = self.resolve(cref.file, an.get("m_Avatar"));
                         let controller = self.resolve(cref.file, an.get("m_Controller"));
@@ -746,6 +754,45 @@ impl<'a> Exporter<'a> {
         self.builder.skins.len() - 1
     }
 
+    /// Decode `clip_sources` and add them as glTF animations, bound by path hash below the
+    /// Animator's node (or the prefab root).
+    fn embed_clips(&mut self, root_node: usize) -> Vec<anim::AnimStats> {
+        let sources = std::mem::take(&mut self.clip_sources);
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let hashes = anim::node_path_hashes(&self.builder.nodes, self.animator_node.unwrap_or(root_node));
+        let mut out = Vec::new();
+        for (cab, path_id) in sources {
+            let Some(file) = self.src.get(&cab) else {
+                self.warn(format!("clip {cab}:{path_id}: bundle not in store"));
+                continue;
+            };
+            let Some((class, clip)) = self.read(ObjRef { file, path_id }) else {
+                continue;
+            };
+            if class != CLASS_ANIMATION_CLIP {
+                continue;
+            }
+            match anim::decode_clip(&clip) {
+                Ok(decoded) => {
+                    let mut animations = std::mem::take(&mut self.builder.animations);
+                    let stats = anim::add_animation(&mut self.builder, &mut animations, &decoded, &hashes);
+                    self.builder.animations = animations;
+                    if stats.unmatched_tracks > 0 {
+                        self.warn(format!("clip {}: {} of {} tracks match no node", stats.name, stats.unmatched_tracks, stats.unmatched_tracks + stats.matched_tracks));
+                    }
+                    out.push(stats);
+                }
+                Err(e) => {
+                    let name = clip.get("m_Name").and_then(Value::as_str).unwrap_or("");
+                    self.warn(format!("clip {name}: {e}"));
+                }
+            }
+        }
+        out
+    }
+
     /// Build the document for the prefab whose root GameObject (or Transform) is `root`.
     pub fn export(mut self, root: ObjRef, asset_extras: Value) -> Result<EntityExport, String> {
         let root_t = self
@@ -836,7 +883,11 @@ impl<'a> Exporter<'a> {
                 sample.join(", ")
             ));
         }
+        let animations = self.embed_clips(root_node);
         let mut extras = asset_extras;
+        if !animations.is_empty() {
+            extras["animations"] = serde_json::to_value(&animations).unwrap_or_default();
+        }
         extras["counts"] = serde_json::to_value(&self.stats).unwrap_or_default();
         extras["animators"] = json!(self.animators);
         extras["coordinateSystem"] =

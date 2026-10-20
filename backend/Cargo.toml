@@ -2,6 +2,8 @@
 name = "backend"
 version = "0.1.0"
 edition = "2024"
+# Compiles the vendored ACL animation decompressor only with `--features acl`.
+build = "vendor/acl/build.rs"
 
 # ── Unified CLI ──────────────────────────────────────────
 
@@ -48,3 +50,10 @@ httpdate = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+# Animation export in `endfield-models` (C++ shim over vendor/acl; needs a C++17 compiler).
+acl = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }

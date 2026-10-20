@@ -414,3 +414,138 @@ fn rig_fixture_exports_valid_skinned_glbs() {
     }
     eprintln!("checked {skinned} skinned primitives");
 }
+
+mod anim {
+    use crate::extraction::rig::anim::{self, DecodedClip, TrackBinding};
+    use crate::extraction::rig::gltf::{self, Builder};
+    use serde_json::{Value, json};
+
+    fn binding(path: u32, attribute: i64, type_id: i64) -> Value {
+        json!({"path": path, "attribute": attribute, "typeID": type_id, "customType": 0, "isPPtrCurve": 0})
+    }
+
+    #[test]
+    fn crc32_matches_ieee_check_value() {
+        assert_eq!(anim::crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(anim::crc32(b""), 0);
+    }
+
+    /// ACL transform track `i` is the `i`-th distinct Transform path, in binding order;
+    /// non-Transform bindings (Animator floats) are not tracks.
+    #[test]
+    fn bindings_group_into_tracks_in_first_seen_order() {
+        let bindings = vec![
+            binding(10, 1, 4),
+            binding(20, 1, 4),
+            binding(10, 2, 4),
+            binding(20, 2, 4),
+            binding(20, 3, 4),
+            binding(99, 0, 95),
+        ];
+        let tracks = anim::transform_bindings(&bindings);
+        assert_eq!(
+            tracks,
+            vec![
+                TrackBinding { path_hash: 10, position: true, rotation: true, scale: false },
+                TrackBinding { path_hash: 20, position: true, rotation: true, scale: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn quaternion_keys_stay_in_one_hemisphere() {
+        let mut keys = [[0.0, 0.0, 0.1, 0.995], [0.0, 0.0, -0.2, -0.98], [0.0, 0.0, 0.3, 0.954]];
+        anim::make_continuous(&mut keys);
+        assert!(keys[1][3] > 0.0 && keys[2][3] > 0.0);
+        assert!(anim::is_constant(&[[1.0f32, 2.0], [1.0, 2.0 + 1e-7]], 1e-6));
+        assert!(!anim::is_constant(&[[1.0f32, 2.0], [1.0, 2.1]], 1e-6));
+    }
+
+    /// Node paths below the animator root hash like Unity binding paths ("" is the root).
+    #[test]
+    fn node_paths_hash_like_unity() {
+        let nodes = vec![
+            json!({"name": "root", "children": [1]}),
+            json!({"name": "Bip001", "children": [2]}),
+            json!({"name": "Bip001 Pelvis"}),
+        ];
+        let map = anim::node_path_hashes(&nodes, 0);
+        assert_eq!(map[&anim::crc32(b"")], 0);
+        assert_eq!(map[&anim::crc32(b"Bip001")], 1);
+        assert_eq!(map[&anim::crc32(b"Bip001/Bip001 Pelvis")], 2);
+    }
+
+    /// Channels are converted to glTF space, constant curves collapse to one key, and the
+    /// document stays structurally valid.
+    #[test]
+    fn decoded_clip_becomes_valid_gltf_animation() {
+        let tracks = vec![
+            TrackBinding { path_hash: anim::crc32(b"a"), position: true, rotation: true, scale: false },
+            TrackBinding { path_hash: anim::crc32(b"missing"), position: true, rotation: false, scale: false },
+        ];
+        let samples_per_track = |s: usize, moving: bool| {
+            let angle = if moving { s as f32 * 0.1 } else { 0.0 };
+            // rotation xyzw (about Y), translation xyz, scale xyz
+            vec![0.0, (angle / 2.0).sin(), 0.0, (angle / 2.0).cos(), 1.0, 2.0, 3.0, 1.0, 1.0, 1.0]
+        };
+        let mut samples = Vec::new();
+        for s in 0..3 {
+            samples.extend(samples_per_track(s, true));
+            samples.extend(samples_per_track(s, false));
+        }
+        let clip = DecodedClip { name: "test".into(), sample_rate: 30.0, num_samples: 3, tracks, samples };
+        let mut b = Builder::default();
+        b.nodes.push(json!({"name": "root", "children": [1]}));
+        b.nodes.push(json!({"name": "a"}));
+        let nodes = anim::node_path_hashes(&b.nodes, 0);
+        let mut animations = Vec::new();
+        let stats = anim::add_animation(&mut b, &mut animations, &clip, &nodes);
+        assert_eq!((stats.matched_tracks, stats.unmatched_tracks, stats.channels), (1, 1, 2));
+        assert!((stats.duration - 2.0 / 30.0).abs() < 1e-6);
+        b.animations = animations;
+        let (doc, glb) = b.finish(vec![0], json!({}));
+        let (_, bin) = gltf::parse_glb(&glb).unwrap();
+        assert!(gltf::check_document(&doc, bin.len()).is_empty());
+        let anim = &doc["animations"][0];
+        let accessor = |i: &Value| doc["accessors"][i.as_u64().unwrap() as usize].clone();
+        let rotation = anim["channels"].as_array().unwrap().iter().find(|c| c["target"]["path"] == "rotation").unwrap();
+        let translation = anim["channels"].as_array().unwrap().iter().find(|c| c["target"]["path"] == "translation").unwrap();
+        let sampler = |c: &Value| anim["samplers"][c["sampler"].as_u64().unwrap() as usize].clone();
+        assert_eq!(accessor(&sampler(rotation)["output"])["count"], 3);
+        // Constant translation keeps a single key; X is mirrored.
+        let t_out = accessor(&sampler(translation)["output"]);
+        assert_eq!(t_out["count"], 1);
+        let view = &doc["bufferViews"][t_out["bufferView"].as_u64().unwrap() as usize];
+        let off = view["byteOffset"].as_u64().unwrap() as usize;
+        let x = f32::from_le_bytes(bin[off..off + 4].try_into().unwrap());
+        assert_eq!(x, -1.0);
+    }
+
+    #[cfg(feature = "acl")]
+    #[test]
+    fn acl_rejects_garbage_buffers() {
+        use crate::extraction::rig::acl;
+        assert!(acl::transforms(&[0u8; 64]).is_err());
+        assert!(acl::info(&[]).is_err());
+    }
+
+    /// Decodes a real clip's `TransformBufferData` (dumped to a file) with the vendored ACL.
+    /// `RIG_ACL_FIXTURE=<file> cargo test --features acl -- --ignored acl_fixture`
+    #[cfg(feature = "acl")]
+    #[test]
+    #[ignore = "needs RIG_ACL_FIXTURE pointing at a dumped TransformBufferData"]
+    fn acl_fixture_decodes_unit_quaternions() {
+        use crate::extraction::rig::acl;
+        let Ok(path) = std::env::var("RIG_ACL_FIXTURE") else {
+            return;
+        };
+        let data = std::fs::read(path).unwrap();
+        let (info, out) = acl::transforms(&data).unwrap();
+        assert_eq!(info.track_type, 12);
+        assert_eq!(out.len(), info.num_tracks as usize * info.num_samples as usize * acl::TRANSFORM_STRIDE);
+        for q in out.as_chunks::<{ acl::TRANSFORM_STRIDE }>().0 {
+            let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!((len - 1.0).abs() < 1e-3, "non-unit quaternion {len}");
+        }
+    }
+}

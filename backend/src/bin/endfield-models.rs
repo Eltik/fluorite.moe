@@ -134,6 +134,15 @@ enum Commands {
         /// Don't scan chunks that the texture index associates with the filter
         #[arg(long)]
         no_auto_scan: bool,
+        /// Embed AnimationClips whose file name contains this keyword (e.g. "idle"; repeatable).
+        /// Clips are found by container path: `.../<code>/animations/**/<keyword>*.fbx`, where
+        /// <code> is the entity id's last segment (chr_0005_chen -> chen). Needs a build with
+        /// `--features acl` (Endfield clips are ACL-compressed).
+        #[arg(long = "anims")]
+        anims: Vec<String>,
+        /// At most this many clips per entity with --anims
+        #[arg(long, default_value_t = 4)]
+        max_anims: usize,
     },
 }
 
@@ -243,11 +252,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_texture_size,
             all_lods,
             no_auto_scan,
+            anims,
+            max_anims,
         } => {
+            if !anims.is_empty() && !rig::acl::available() {
+                return Err("--anims needs a build with `--features acl`".into());
+            }
             let store = store.unwrap_or_else(|| output.join(".store"));
             let args = ExportArgs {
                 filter,
                 ids,
+                anims,
+                max_anims,
                 output,
                 data_root,
                 opts: rig::ExportOptions {
@@ -548,6 +564,8 @@ fn truncate_arrays(value: &mut serde_json::Value, max: usize) {
 struct ExportArgs {
     filter: String,
     ids: Vec<String>,
+    anims: Vec<String>,
+    max_anims: usize,
     output: PathBuf,
     data_root: PathBuf,
     opts: rig::ExportOptions,
@@ -685,6 +703,7 @@ async fn cmd_export(
         candidates.retain(|c| args.ids.iter().any(|id| c.id.contains(id.as_str())));
     }
     eprintln!("{} prefab(s) match {:?}", candidates.len(), args.filter);
+    let clip_index = animation_containers(&records, stored_root.as_deref());
     let library = std::sync::Arc::new(rig::material::TextureLibrary::load(&textures));
     eprintln!(
         "texture library: {} named textures under {}",
@@ -713,7 +732,8 @@ async fn cmd_export(
                 },
                 "entity": {"id": cand.id, "kind": cand.kind},
             });
-            let exporter = rig::Exporter::new(&mut source, args.opts.clone());
+            let mut exporter = rig::Exporter::new(&mut source, args.opts.clone());
+            exporter.clip_sources = select_clips(&clip_index, &cand.id, &args.anims, args.max_anims);
             match exporter.export(
                 rig::ObjRef {
                     file,
@@ -848,4 +868,62 @@ async fn cmd_export(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// `(container path lowercased, cab, path_id)` of every stored animation container.
+fn animation_containers(records: &[rig::store::CabRecord], stored_root: Option<&Path>) -> Vec<(String, String, i64)> {
+    let mut out = Vec::new();
+    for rec in records {
+        if !rec.classes.contains_key(&74) {
+            continue;
+        }
+        if let Some(root) = stored_root
+            && !root.join("sf").join(&rec.cab).is_file()
+        {
+            continue;
+        }
+        for (path, file_id, path_id) in &rec.containers {
+            let lower = path.to_ascii_lowercase();
+            if *file_id == 0 && lower.contains("/animations/") && (lower.ends_with(".fbx") || lower.ends_with(".anim")) {
+                out.push((lower, rec.cab.clone(), *path_id));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Clips for an entity: containers under `<code>…/animations/` whose file name contains a
+/// keyword, where `<code>` is the id's last `_` segment. At most `max` container paths.
+fn select_clips(index: &[(String, String, i64)], id: &str, keywords: &[String], max: usize) -> Vec<(String, i64)> {
+    if keywords.is_empty() {
+        return Vec::new();
+    }
+    let code = id.rsplit('_').next().unwrap_or(id).to_ascii_lowercase();
+    let folder = format!("/{code}");
+    let mut paths: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for (path, cab, path_id) in index {
+        let Some(at) = path.find("/animations/") else {
+            continue;
+        };
+        let owner = &path[..at];
+        let owner_dir = owner.rsplit('/').next().unwrap_or("");
+        // `purrche` must find `purrchena/`, so the folder only has to start with the code.
+        if !owner.contains(&folder) || !owner_dir.starts_with(&code) {
+            continue;
+        }
+        let file = path.rsplit('/').next().unwrap_or(path);
+        if !keywords.iter().any(|k| file.contains(&k.to_ascii_lowercase())) {
+            continue;
+        }
+        if !paths.contains(&path.as_str()) {
+            if paths.len() >= max {
+                continue;
+            }
+            paths.push(path);
+        }
+        out.push((cab.clone(), *path_id));
+    }
+    out
 }

@@ -24,6 +24,7 @@ pub struct Builder {
     pub textures: Vec<Value>,
     pub images: Vec<Value>,
     pub samplers: Vec<Value>,
+    pub animations: Vec<Value>,
     pub extensions_used: Vec<String>,
 }
 
@@ -175,6 +176,7 @@ impl Builder {
             ("textures", self.textures),
             ("images", self.images),
             ("samplers", self.samplers),
+            ("animations", self.animations),
             ("accessors", self.accessors),
             ("bufferViews", self.buffer_views),
         ];

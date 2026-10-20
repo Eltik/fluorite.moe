@@ -1,0 +1,3 @@
+ACL v2.1.0 (https://github.com/nfrechette/acl, MIT) commit 414689d5cff4286a7898487a46dc5e48005d38da
+RTM submodule (https://github.com/nfrechette/rtm, MIT) commit d7982f2b2524feeb322f424b29cf43df30b5d5b7
+Only include/acl/{core,decompression,math} and include/rtm are vendored; shim/ is ours.
