@@ -1,19 +1,21 @@
 //! MemoryPack decoding for the `JsonData` BLC group.
 //!
 //! Most of the group's `.json` files are binary MemoryPack payloads. Their layouts come from
-//! a schema compiled from the game's IL2CPP metadata (`backend/scripts/memorypack-schema/`),
-//! and every string is an index into a global pool stored under `Json/StringPool/`.
+//! a schema compiled from the game's IL2CPP metadata ([`super::memorypack_schema`]), and every
+//! string is an index into a global pool stored under `Json/StringPool/`. A [`SchemaSet`]
+//! tries generated schemas newest first and the embedded one last.
 //!
 //! A file carries no type tag, so each candidate root type is tried in turn; a decode only
 //! counts when it consumes every byte. Decoded files keep their original bytes beside them
 //! as `<stem>.mpk`, which later runs decode from so a schema update can re-decode in place.
 use super::utils::write_file;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// BLC group holding the MemoryPack files.
 pub const JSON_DATA_GROUP: &str = "JsonData";
@@ -208,11 +210,13 @@ enum Node {
     /// `i32` pool index; `-1` is null and `-2` the empty string.
     Str,
     List(usize),
-    /// `hdr`: a leading `255` byte means null.
+    /// `hdr`: a leading `255` byte means null. `kv`: entries are raw `KeyValuePair`s with
+    /// padding, `(value offset, entry size)`; otherwise key and value are back to back.
     Dict {
         hdr: bool,
         key: usize,
         val: usize,
+        kv: Option<(usize, usize)>,
     },
     /// Unmanaged struct: fields at fixed offsets within `size` bytes.
     Raw {
@@ -235,11 +239,16 @@ enum Node {
     Unsupported,
 }
 
-/// A compiled MemoryPack schema (`{format, game_version, nodes, roots, dir_roots}`).
+/// A compiled MemoryPack schema (`{format, game_version, nodes, roots, dir_roots}`, plus the
+/// optional `generated_at` and `client_crc32`).
 #[derive(Debug)]
 pub struct Schema {
     /// Game version the schema was compiled from, when recorded.
     game_version: Option<String>,
+    /// When the schema was generated (RFC 3339), when recorded.
+    generated_at: Option<String>,
+    /// CRC-32 (8 hex digits) of the `GameAssembly.dll` it was generated from, when recorded.
+    client_crc32: Option<String>,
     nodes: Vec<Node>,
     roots: HashMap<String, usize>,
     dir_roots: HashMap<String, Vec<String>>,
@@ -266,6 +275,17 @@ fn parse_node(node: &serde_json::Value) -> Option<Node> {
             hdr: node.get("hdr")?.as_bool()?,
             key: field("key")?,
             val: field("val")?,
+            kv: match node.get("kv") {
+                None => None,
+                Some(kv) => {
+                    let (offset, size) = (index_of(kv.get(0)?)?, index_of(kv.get(1)?)?);
+                    // The value must start after the key's first byte and end inside the entry.
+                    if kv.as_array()?.len() != 2 || offset == 0 || offset >= size {
+                        return None;
+                    }
+                    Some((offset, size))
+                }
+            },
         },
         "raw" => Node::Raw {
             size: field("size")?,
@@ -383,12 +403,16 @@ impl Schema {
         // Byte-wise `String` order is code point order, which is how the reference sorts.
         obj_roots.values_mut().for_each(|names| names.sort());
         union_roots.sort();
-        let game_version = value
-            .get("game_version")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
         Ok(Self {
-            game_version,
+            game_version: text("game_version"),
+            generated_at: text("generated_at"),
+            client_crc32: text("client_crc32"),
             nodes,
             roots,
             dir_roots,
@@ -408,9 +432,13 @@ impl Schema {
 
     /// The schema bundled with this build, parsed on first use.
     pub fn embedded() -> io::Result<&'static Schema> {
-        static SCHEMA: OnceLock<Result<Schema, String>> = OnceLock::new();
+        Self::embedded_arc().map(|schema| &**schema)
+    }
+
+    fn embedded_arc() -> io::Result<&'static Arc<Schema>> {
+        static SCHEMA: OnceLock<Result<Arc<Schema>, String>> = OnceLock::new();
         SCHEMA
-            .get_or_init(|| Schema::from_gzip(EMBEDDED_SCHEMA))
+            .get_or_init(|| Schema::from_gzip(EMBEDDED_SCHEMA).map(Arc::new))
             .as_ref()
             .map_err(|e| invalid(format!("embedded MemoryPack schema: {e}")))
     }
@@ -418,6 +446,21 @@ impl Schema {
     /// Game version the schema was compiled from (`"1.6.4"`), if it records one.
     pub fn game_version(&self) -> Option<&str> {
         self.game_version.as_deref()
+    }
+
+    /// When the schema was generated (RFC 3339), if it records it.
+    pub fn generated_at(&self) -> Option<&str> {
+        self.generated_at.as_deref()
+    }
+
+    /// CRC-32 of the `GameAssembly.dll` the schema was generated from, if it records it.
+    pub fn client_crc32(&self) -> Option<&str> {
+        self.client_crc32.as_deref()
+    }
+
+    /// Number of root types.
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
     }
 
     /// Root types to try for a file in `rel_dir` whose first byte is `first`, in order: the
@@ -439,6 +482,109 @@ impl Schema {
             .map(String::as_str)
             .filter(|name| !seen.contains(name));
         known.iter().copied().chain(rest).collect()
+    }
+}
+
+// ── Schema sets ─────────────────────────────────────────
+
+/// Numeric components of a version string (`"1.6.4"` -> `[1, 6, 4]`); non-numeric parts
+/// count as 0.
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-', '_'])
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
+/// Order schemas newest first: higher game version, then later `generated_at`. A schema that
+/// records neither sorts after one that does.
+pub fn newest_first(a: &Schema, b: &Schema) -> Ordering {
+    let version = |s: &Schema| s.game_version().map(version_key);
+    let generated = |s: &Schema| {
+        s.generated_at()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    };
+    version(b)
+        .cmp(&version(a))
+        .then_with(|| generated(b).cmp(&generated(a)))
+}
+
+/// A schema with the label its decodes are counted under.
+pub type LabelledSchema = (String, Arc<Schema>);
+
+/// Several schemas tried in order: generated ones newest first, then a fallback (normally the
+/// embedded schema). A file is decoded by the first schema that consumes it exactly, so a new
+/// schema never loses a file an older one could decode.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaSet {
+    /// Newest first.
+    generated: Vec<LabelledSchema>,
+    fallback: Option<LabelledSchema>,
+}
+
+impl SchemaSet {
+    /// `generated` ordered by [`newest_first`] (ties by label, descending), then `fallback`.
+    pub fn new(generated: Vec<LabelledSchema>, fallback: Option<LabelledSchema>) -> Self {
+        let mut set = Self {
+            generated,
+            fallback,
+        };
+        set.sort();
+        set
+    }
+
+    fn sort(&mut self) {
+        self.generated
+            .sort_by(|a, b| newest_first(&a.1, &b.1).then_with(|| b.0.cmp(&a.0)));
+    }
+
+    /// Only the schema bundled with this build.
+    pub fn embedded() -> io::Result<Self> {
+        Ok(Self::new(Vec::new(), Some(Self::embedded_entry()?)))
+    }
+
+    /// The bundled schema as a fallback entry, labelled `embedded-<game version>`.
+    pub fn embedded_entry() -> io::Result<LabelledSchema> {
+        let schema = Schema::embedded_arc()?;
+        let label = format!("embedded-{}", schema.game_version().unwrap_or("unknown"));
+        Ok((label, Arc::clone(schema)))
+    }
+
+    /// This set with `schema` added under `label` (replacing a generated schema of that label).
+    pub fn with(&self, label: &str, schema: Arc<Schema>) -> Self {
+        let mut set = self.clone();
+        set.generated.retain(|(l, _)| l != label);
+        set.generated.push((label.to_owned(), schema));
+        set.sort();
+        set
+    }
+
+    /// Every schema in the order files are tried.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Schema)> {
+        self.generated
+            .iter()
+            .chain(&self.fallback)
+            .map(|(label, schema)| (label.as_str(), &**schema))
+    }
+
+    /// The first schema tried: the newest generated one, else the fallback.
+    pub fn newest(&self) -> Option<(&str, &Schema)> {
+        self.entries().next()
+    }
+
+    pub fn len(&self) -> usize {
+        self.generated.len() + usize::from(self.fallback.is_some())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Decode one file with the first schema that consumes it, naming that schema.
+    pub fn decode(&self, pool: &StringPool, data: &[u8], rel_dir: &str) -> Option<(&str, Vec<u8>)> {
+        self.entries().find_map(|(label, schema)| {
+            decode_bytes(schema, pool, data, rel_dir).map(|j| (label, j))
+        })
     }
 }
 
@@ -640,7 +786,7 @@ impl<'a> Decoder<'a> {
                     .collect::<Result<_, _>>()
                     .map(Value::List)
             }
-            Node::Dict { hdr, key, val } => {
+            Node::Dict { hdr, key, val, kv } => {
                 if *hdr && self.u8()? == 255 {
                     return Ok(Value::Null);
                 }
@@ -649,9 +795,25 @@ impl<'a> Decoder<'a> {
                 };
                 let mut pairs = Vec::with_capacity(count);
                 for _ in 0..count {
+                    let start = self.pos;
                     let k = self.value(*key, depth + 1)?;
-                    let v = self.value(*val, depth + 1)?;
-                    pairs.push((k, v));
+                    if let Some((offset, size)) = *kv {
+                        // A padded raw pair: the key must fit before the value.
+                        let end = start.checked_add(size).ok_or(Fail)?;
+                        if end > self.data.len() || self.pos > start + offset {
+                            return Err(Fail);
+                        }
+                        self.pos = start + offset;
+                        let v = self.value(*val, depth + 1)?;
+                        if self.pos > end {
+                            return Err(Fail);
+                        }
+                        self.pos = end;
+                        pairs.push((k, v));
+                    } else {
+                        let v = self.value(*val, depth + 1)?;
+                        pairs.push((k, v));
+                    }
                 }
                 Ok(dict_value(pairs))
             }
@@ -869,13 +1031,27 @@ pub fn decode_bytes_root<'s>(
 // ── Tree conversion ─────────────────────────────────────
 
 /// Totals from [`decode_tree`].
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TreeDecodeResult {
     /// Files written (or already current) as decoded JSON.
     pub decoded: u64,
     /// MemoryPack files no root type decodes; left untouched.
     pub failed: u64,
     pub write_errors: u64,
+    /// Decoded files per schema label (the set entry that decoded them).
+    pub by_schema: BTreeMap<String, u64>,
+}
+
+impl TreeDecodeResult {
+    /// Add another tree's totals to these.
+    pub fn add(&mut self, other: &TreeDecodeResult) {
+        self.decoded += other.decoded;
+        self.failed += other.failed;
+        self.write_errors += other.write_errors;
+        for (label, n) in &other.by_schema {
+            *self.by_schema.entry(label.clone()).or_default() += n;
+        }
+    }
 }
 
 /// `.json` files under `root`, each paired with its directory relative to `root`
@@ -913,7 +1089,7 @@ pub fn decode_tree(group_dir: &Path) -> io::Result<TreeDecodeResult> {
     if !has_string_pool(group_dir) {
         return Ok(TreeDecodeResult::default());
     }
-    decode_tree_with(Schema::embedded()?, group_dir)
+    decode_tree_set(&SchemaSet::embedded()?, group_dir)
 }
 
 fn has_string_pool(group_dir: &Path) -> bool {
@@ -921,8 +1097,19 @@ fn has_string_pool(group_dir: &Path) -> bool {
     json_root.is_dir() && json_root.join("StringPool/StringPool0.byte").is_file()
 }
 
-/// [`decode_tree`] with an explicit schema.
+/// [`decode_tree`] with an explicit schema, counted under its game version.
 pub fn decode_tree_with(schema: &Schema, group_dir: &Path) -> io::Result<TreeDecodeResult> {
+    let label = schema.game_version().unwrap_or("schema");
+    decode_tree_refs(&[(label, schema)], group_dir)
+}
+
+/// [`decode_tree`] with a schema set: each file is decoded by the first schema that fits.
+pub fn decode_tree_set(set: &SchemaSet, group_dir: &Path) -> io::Result<TreeDecodeResult> {
+    let schemas: Vec<(&str, &Schema)> = set.entries().collect();
+    decode_tree_refs(&schemas, group_dir)
+}
+
+fn decode_tree_refs(schemas: &[(&str, &Schema)], group_dir: &Path) -> io::Result<TreeDecodeResult> {
     if !has_string_pool(group_dir) {
         return Ok(TreeDecodeResult::default());
     }
@@ -941,9 +1128,12 @@ pub fn decode_tree_with(schema: &Schema, group_dir: &Path) -> io::Result<TreeDec
                 scope.spawn(move || -> io::Result<TreeDecodeResult> {
                     let mut totals = TreeDecodeResult::default();
                     for (path, rel_dir) in batch {
-                        match decode_file(schema, pool, path, rel_dir)? {
+                        match decode_file(schemas, pool, path, rel_dir)? {
                             FileOutcome::Skipped => {}
-                            FileOutcome::Decoded => totals.decoded += 1,
+                            FileOutcome::Decoded(k) => {
+                                totals.decoded += 1;
+                                *totals.by_schema.entry(schemas[k].0.to_owned()).or_default() += 1;
+                            }
                             FileOutcome::Failed => totals.failed += 1,
                             FileOutcome::WriteError => totals.write_errors += 1,
                         }
@@ -957,9 +1147,7 @@ pub fn decode_tree_with(schema: &Schema, group_dir: &Path) -> io::Result<TreeDec
             let part = handle
                 .join()
                 .map_err(|_| io::Error::other("MemoryPack decode worker panicked"))??;
-            totals.decoded += part.decoded;
-            totals.failed += part.failed;
-            totals.write_errors += part.write_errors;
+            totals.add(&part);
         }
         Ok(totals)
     })
@@ -968,13 +1156,14 @@ pub fn decode_tree_with(schema: &Schema, group_dir: &Path) -> io::Result<TreeDec
 enum FileOutcome {
     /// Not MemoryPack (plain JSON or empty).
     Skipped,
-    Decoded,
+    /// Decoded by the schema at this index.
+    Decoded(usize),
     Failed,
     WriteError,
 }
 
 fn decode_file(
-    schema: &Schema,
+    schemas: &[(&str, &Schema)],
     pool: &StringPool,
     path: &Path,
     rel_dir: &str,
@@ -988,7 +1177,11 @@ fn decode_file(
     if data.first().is_none_or(|&b| b == b'{') {
         return Ok(FileOutcome::Skipped);
     }
-    let Some(json) = decode_bytes(schema, pool, &data, rel_dir) else {
+    let Some((index, json)) = schemas
+        .iter()
+        .enumerate()
+        .find_map(|(k, (_, schema))| decode_bytes(schema, pool, &data, rel_dir).map(|j| (k, j)))
+    else {
         return Ok(FileOutcome::Failed);
     };
     // Save the source before replacing it, so a crash in between loses nothing.
@@ -999,5 +1192,5 @@ fn decode_file(
     if current.as_deref() != Some(json.as_slice()) && !write_file(path, &json) {
         return Ok(FileOutcome::WriteError);
     }
-    Ok(FileOutcome::Decoded)
+    Ok(FileOutcome::Decoded(index))
 }

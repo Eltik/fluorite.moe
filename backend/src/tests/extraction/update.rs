@@ -100,3 +100,15 @@ fn stale_textures_are_neither_kept_nor_flipped() {
     assert!(update::mark_textures_flipped(&stale).is_none());
     assert_eq!(update::mark_textures_stale("ab-1+x2+tex2"), "ab-1+texstale");
 }
+
+#[test]
+fn old_state_files_load_without_a_schema_client() {
+    let old = r#"{"fingerprint": "f", "version": "1.6.4", "res_version": "r"}"#;
+    let state: UpdateState = serde_json::from_str(old).unwrap();
+    assert_eq!(state.memorypack_client, "");
+    let mut state = state;
+    state.memorypack_client = update::zip_digest(0xabc, 42);
+    let text = serde_json::to_string(&state).unwrap();
+    let back: UpdateState = serde_json::from_str(&text).unwrap();
+    assert_eq!(back.memorypack_client, "00000abc-42");
+}

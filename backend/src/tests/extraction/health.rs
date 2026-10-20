@@ -204,3 +204,57 @@ fn asset_regression_skips_entries_without_counts() {
     let findings = evaluate(&[run(2), asset_run(1, 500, 500)]);
     assert_eq!(health::worst(&findings), Level::Ok, "{findings:?}");
 }
+
+#[test]
+fn failed_schema_regeneration_warns() {
+    let mut failed = memorypack_run(1, 19_000, 400, "1.6.4");
+    failed.schema_regenerated = Some(false);
+    failed.schema_error = Some("download: timed out".into());
+    let findings = evaluate(&[memorypack_run(30, 19_400, 0, "1.6.4"), failed.clone()]);
+    let check = finding(&findings, "regeneration failed");
+    assert_eq!(check.level, Level::Warn);
+    assert!(check.message.contains("download: timed out"));
+    assert!(check.message.contains("schema 1.6.4"));
+    assert!(check.message.contains("endfield schema-gen"));
+
+    // A later successful regeneration clears it, and its re-decode totals are the ones checked.
+    let mut fixed = memorypack_run(0, 19_000, 400, "1.7.0");
+    fixed.version = Some("1.7.0".into());
+    fixed.schema_regenerated = Some(true);
+    fixed.schema_decoded = Some(19_390);
+    fixed.schema_failed = Some(10);
+    let findings = evaluate(&[failed, fixed]);
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.message.contains("regeneration failed"))
+    );
+    assert_eq!(finding(&findings, "19390 decoded").level, Level::Ok);
+    assert_eq!(finding(&findings, "schema 1.7.0 matches").level, Level::Ok);
+    assert_eq!(health::worst(&findings), Level::Ok);
+}
+
+#[test]
+fn schema_runs_without_regeneration_do_not_warn() {
+    // Not attempted (client unchanged, or --no-schema): no error key, no warning.
+    let mut skipped = memorypack_run(1, 19_400, 0, "1.6.4");
+    skipped.schema_regenerated = Some(false);
+    let findings = evaluate(&[skipped]);
+    assert!(!findings.iter().any(|f| f.message.contains("regeneration")));
+    assert_eq!(health::worst(&findings), Level::Ok);
+}
+
+#[test]
+fn schema_version_check_uses_the_schema_in_use() {
+    // The game moved to 1.7 but regeneration was refused: the schema in use is still 1.6.
+    let mut refused = memorypack_run(1, 19_400, 0, "1.6.4");
+    refused.version = Some("1.7.0".into());
+    refused.schema_regenerated = Some(false);
+    refused.schema_error = Some("regression: the new schema decodes 10 of 20 files".into());
+    let findings = evaluate(&[refused]);
+    assert_eq!(
+        finding(&findings, "different game version").level,
+        Level::Warn
+    );
+    assert_eq!(finding(&findings, "regeneration failed").level, Level::Warn);
+}

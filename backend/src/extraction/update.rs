@@ -24,6 +24,14 @@ pub struct UpdateState {
     pub chk: BTreeMap<String, String>,
     #[serde(default)]
     pub blc_dirs: BTreeMap<String, String>,
+    /// ZIP digest of the `GameAssembly.dll` the newest MemoryPack schema was generated from;
+    /// empty until a schema has been generated, so the first run generates one.
+    #[serde(default)]
+    pub memorypack_client: String,
+    /// Digest of a `GameAssembly.dll` whose schema regeneration was refused or failed, so
+    /// later runs do not download the same client again; cleared by a successful run.
+    #[serde(default)]
+    pub memorypack_attempted: String,
 }
 
 /// Produce a stable launcher-only identity for a game configuration.

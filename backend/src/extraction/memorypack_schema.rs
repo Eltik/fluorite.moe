@@ -90,6 +90,8 @@ enum Node {
         hdr: bool,
         key: usize,
         val: usize,
+        /// Raw padded `KeyValuePair` entries: `(value offset, entry size)`.
+        kv: Option<(u32, u32)>,
     },
     Raw {
         size: u32,
@@ -133,7 +135,18 @@ impl Node {
         match self {
             Self::Prim(t) => json!({"k": k, "t": t}),
             Self::List(e) => json!({"k": k, "e": e}),
-            Self::Dict { hdr, key, val } => json!({"k": k, "hdr": hdr, "key": key, "val": val}),
+            Self::Dict {
+                hdr,
+                key,
+                val,
+                kv: None,
+            } => json!({"k": k, "hdr": hdr, "key": key, "val": val}),
+            Self::Dict {
+                hdr,
+                key,
+                val,
+                kv: Some((offset, size)),
+            } => json!({"k": k, "hdr": hdr, "key": key, "val": val, "kv": [offset, size]}),
             Self::Raw { size, fields } => json!({
                 "k": k,
                 "size": size,
@@ -396,34 +409,29 @@ impl<'il, 'a> Compiler<'il, 'a> {
                     hdr: true,
                     key: self.value(key, false),
                     val: self.value(val, false),
+                    kv: None,
                 };
             }
             (Some(b), [key, val]) if DICTS.contains(&b) => {
                 // MemoryPack's KeyValuePairFormatter copies an unmanaged pair raw, so blittable
-                // keys and values are raw even when their type has a wrapper.
-                let raw = match self.natural_layout(&[key, val]) {
+                // keys and values are raw even when their type has a wrapper. A pair with
+                // padding (`Dictionary<ulong, int>`: value at 8, 16-byte entries, as in
+                // `RunePuzzleData.anchorPointToIndexMap`) is copied padding and all.
+                let (raw, kv) = match self.natural_layout(&[key, val]) {
                     Some((offsets, size))
                         if offsets[1] == offsets[0] + self.size_of(key)
                             && size == offsets[1] + self.size_of(val) =>
                     {
-                        true
+                        (true, None)
                     }
-                    Some(_) => {
-                        // The pair has padding, which format 1 cannot express: read the key and
-                        // value back to back, which only fits empty dictionaries.
-                        self.notes.push(format!(
-                            "{} is an unmanaged pair with padding; its entries are read unpadded \
-                             (needs a decoder extension)",
-                            il.csharp_name(t)
-                        ));
-                        false
-                    }
-                    None => false,
+                    Some((offsets, size)) => (true, Some((offsets[1], size))),
+                    None => (false, None),
                 };
                 return Node::Dict {
                     hdr: false,
                     key: self.value(key, raw),
                     val: self.value(val, raw),
+                    kv,
                 };
             }
             // ValueTuple's formatter writes the items back to back; for blittable items without
@@ -793,19 +801,28 @@ impl CompiledSchema {
     }
 
     /// The format-1 schema document with the given `dir_roots`.
-    pub fn to_json(&self, game_version: &str, dir_roots: &BTreeMap<String, Vec<String>>) -> Value {
+    pub fn to_json(&self, meta: &SchemaMeta, dir_roots: &BTreeMap<String, Vec<String>>) -> Value {
         let roots: serde_json::Map<String, Value> = self
             .roots
             .iter()
             .map(|(name, r)| (name.clone(), json!(r.node)))
             .collect();
-        json!({
+        let mut doc = json!({
             "format": SCHEMA_FORMAT,
-            "game_version": game_version,
+            "game_version": meta.game_version,
             "nodes": self.nodes.iter().map(Node::to_json).collect::<Vec<_>>(),
             "roots": roots,
             "dir_roots": dir_roots,
-        })
+        });
+        for (key, value) in [
+            ("generated_at", &meta.generated_at),
+            ("client_crc32", &meta.client_crc32),
+        ] {
+            if let Some(value) = value {
+                doc[key] = json!(value);
+            }
+        }
+        doc
     }
 }
 
@@ -1118,6 +1135,59 @@ pub struct SchemaReport {
     pub learn: Option<LearnReport>,
 }
 
+/// The top-level fields of a generated schema besides its layouts.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaMeta {
+    pub game_version: String,
+    /// RFC 3339 generation time; orders schemas of one game version.
+    pub generated_at: Option<String>,
+    /// CRC-32 of the `GameAssembly.dll` the schema came from, as 8 lowercase hex digits.
+    pub client_crc32: Option<String>,
+}
+
+/// Why [`generate`] failed.
+#[derive(Debug)]
+pub enum GenerateError {
+    /// The client files could not be read as IL2CPP.
+    Il2Cpp(super::il2cpp::Error),
+    /// Anything else (reading the `Json/` tree, serializing).
+    Io(io::Error),
+}
+
+impl GenerateError {
+    /// The client changed shape (metadata version, type stride, registration): the reader
+    /// needs updating, so retrying with the same files cannot help.
+    pub fn is_structural(&self) -> bool {
+        matches!(self, Self::Il2Cpp(e) if e.is_structural())
+    }
+}
+
+impl std::fmt::Display for GenerateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Il2Cpp(e) => write!(f, "{e}"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for GenerateError {}
+
+impl From<io::Error> for GenerateError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<GenerateError> for io::Error {
+    fn from(error: GenerateError) -> Self {
+        match error {
+            GenerateError::Il2Cpp(e) => e.into(),
+            GenerateError::Io(e) => e,
+        }
+    }
+}
+
 /// Build the format-1 MemoryPack schema JSON from the client's `GameAssembly.dll` and
 /// `global-metadata.dat`, learning `dir_roots` from `json_dir` (a `JsonData/Json` tree,
 /// only read) when given. Without it `dir_roots` is empty and the decoder falls back to
@@ -1128,20 +1198,35 @@ pub fn generate_schema(
     game_version: &str,
     json_dir: Option<&Path>,
 ) -> io::Result<(Vec<u8>, SchemaReport)> {
+    let meta = SchemaMeta {
+        game_version: game_version.to_owned(),
+        ..SchemaMeta::default()
+    };
+    Ok(generate(dll, metadata, &meta, json_dir)?)
+}
+
+/// [`generate_schema`] recording `meta`, telling unreadable client files apart.
+pub fn generate(
+    dll: &[u8],
+    metadata: &[u8],
+    meta: &SchemaMeta,
+    json_dir: Option<&Path>,
+) -> Result<(Vec<u8>, SchemaReport), GenerateError> {
     let started = Instant::now();
-    let il = Il2Cpp::new(dll, metadata)?;
+    let il = Il2Cpp::new(dll, metadata).map_err(GenerateError::Il2Cpp)?;
     let compiled = compile(&il);
     let compile_time = started.elapsed();
     let mut dir_roots = BTreeMap::new();
     let mut learn = None;
     if let Some(dir) = json_dir {
-        let bare = serde_json::to_vec(&compiled.to_json(game_version, &dir_roots))?;
+        let bare =
+            serde_json::to_vec(&compiled.to_json(meta, &dir_roots)).map_err(io::Error::from)?;
         let schema = Schema::from_json(&bare).map_err(io::Error::other)?;
         let (learned, report) = learn_dir_roots(&compiled, &schema, dir)?;
         dir_roots = learned;
         learn = Some(report);
     }
-    let json = serde_json::to_vec(&compiled.to_json(game_version, &dir_roots))?;
+    let json = serde_json::to_vec(&compiled.to_json(meta, &dir_roots)).map_err(io::Error::from)?;
     let report = SchemaReport {
         typedefs: compiled.typedefs,
         registration_va: compiled.registration_va,
@@ -1156,6 +1241,13 @@ pub fn generate_schema(
         learn,
     };
     Ok((json, report))
+}
+
+/// CRC-32 (IEEE, as in ZIP) of `data`.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = flate2::Crc::new();
+    crc.update(data);
+    crc.sum()
 }
 
 /// Gzip a schema the way `backend/schema/memorypack/*.json.gz` is stored.

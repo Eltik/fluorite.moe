@@ -9,6 +9,9 @@ use serde::Deserialize;
 /// Where to look when MemoryPack decoding degrades after a game update.
 pub const SCHEMA_README: &str = "backend/scripts/memorypack-schema/README.md";
 
+/// What to run when the schema needs regenerating by hand.
+const SCHEMA_FIX: &str = "run `endfield schema-gen`";
+
 /// Failure rate above which MemoryPack decoding counts as degraded.
 const MEMORYPACK_FAIL_RATE: f64 = 0.01;
 
@@ -28,7 +31,15 @@ pub struct LogEntry {
     pub mesh_failed: Option<u64>,
     pub memorypack_decoded: Option<u64>,
     pub memorypack_failed: Option<u64>,
+    /// Game version of the newest MemoryPack schema in use.
     pub schema_version: Option<String>,
+    /// Whether the run regenerated the schema (absent before automatic regeneration).
+    pub schema_regenerated: Option<bool>,
+    /// Why a needed regeneration did not happen (download, structural, regression).
+    pub schema_error: Option<String>,
+    /// JsonData totals after re-decoding with a regenerated schema.
+    pub schema_decoded: Option<u64>,
+    pub schema_failed: Option<u64>,
 }
 
 impl LogEntry {
@@ -168,9 +179,12 @@ fn major_minor(version: &str) -> &str {
 fn check_memorypack(entries: &[LogEntry]) -> Vec<Finding> {
     let mut findings = Vec::new();
     // A run that left JsonData untouched records 0/0, which says nothing about the decoder.
+    // A regeneration re-decodes every file after extraction, so its totals win.
     let counted = entries.iter().rev().find_map(|e| {
-        let decoded = e.memorypack_decoded?;
-        let failed = e.memorypack_failed?;
+        let (decoded, failed) = match (e.schema_decoded, e.schema_failed) {
+            (Some(decoded), Some(failed)) => (decoded, failed),
+            _ => (e.memorypack_decoded?, e.memorypack_failed?),
+        };
         (decoded + failed > 0).then_some((e, decoded, failed))
     });
     match counted {
@@ -182,7 +196,7 @@ fn check_memorypack(entries: &[LogEntry]) -> Vec<Finding> {
                 findings.push(Finding::new(
                     Level::Warn,
                     format!(
-                        "MemoryPack: {failed} of {} files failed to decode ({:.1}%) on game {game} with schema {schema}; regenerate the schema (see {SCHEMA_README})",
+                        "MemoryPack: {failed} of {} files failed to decode ({:.1}%) on game {game} with schema {schema}; {SCHEMA_FIX} (see {SCHEMA_README})",
                         decoded + failed,
                         rate * 100.0
                     ),
@@ -212,7 +226,7 @@ fn check_memorypack(entries: &[LogEntry]) -> Vec<Finding> {
             findings.push(Finding::new(
                 Level::Warn,
                 format!(
-                    "MemoryPack schema {schema} was compiled for a different game version than {game}; regenerate it (see {SCHEMA_README})"
+                    "MemoryPack schema {schema} was compiled for a different game version than {game}; {SCHEMA_FIX} (see {SCHEMA_README})"
                 ),
             ));
         } else {
@@ -221,6 +235,24 @@ fn check_memorypack(entries: &[LogEntry]) -> Vec<Finding> {
                 format!("MemoryPack schema {schema} matches game {game}"),
             ));
         }
+    }
+
+    // Failed regenerations are retried every run, so the newest run that tried decides.
+    let attempt = entries
+        .iter()
+        .rev()
+        .find(|e| e.schema_regenerated.is_some());
+    if let Some(entry) = attempt
+        && entry.schema_regenerated == Some(false)
+        && let Some(error) = &entry.schema_error
+    {
+        let schema = entry.schema_version.as_deref().unwrap_or("unknown");
+        findings.push(Finding::new(
+            Level::Warn,
+            format!(
+                "MemoryPack schema regeneration failed ({error}); still decoding with schema {schema}; {SCHEMA_FIX} (see {SCHEMA_README})"
+            ),
+        ));
     }
     findings
 }

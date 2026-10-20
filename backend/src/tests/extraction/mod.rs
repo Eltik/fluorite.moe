@@ -8,6 +8,7 @@ mod lua;
 mod lz4_inv;
 mod memorypack;
 mod memorypack_schema;
+mod memorypack_store;
 mod mesh;
 mod sparkbuffer;
 mod texture;

@@ -4,11 +4,18 @@ Most `.json` files in the `JsonData` BLC group are not JSON. They are
 [MemoryPack](https://github.com/Cysharp/MemoryPack) binaries written from generated
 `Beyond.MemoryPack.*ForMemoryPack` wrapper types, with every string replaced by an index into
 the global pool in `Json/StringPool/`. MemoryPack stores no field names, so decoding needs the
-game's type definitions. These scripts derive them from the IL2CPP build and compile them into
-`backend/schema/memorypack/<version>.json.gz`, which `src/extraction/memorypack.rs` embeds.
+game's type definitions, compiled from the IL2CPP build into a schema.
 
-Regenerate the schema after a client update changes the data types (more files will fail to
-decode). Everything here runs offline against files from the game package.
+**The Rust `endfield schema-gen` command is the primary path, and it runs automatically.**
+`endfield update` regenerates the schema whenever the archive's `GameAssembly.dll` changes. It
+reads the client files directly (`src/extraction/il2cpp/`), compiles and learns the schema
+(`src/extraction/memorypack_schema.rs`), validates it against the schemas in use, and installs
+it into `data/memorypack-schema/` (`src/extraction/memorypack_store.rs`). See the root README's
+`schema-gen` section. `backend/schema/memorypack/<version>.json.gz` is the fallback schema
+embedded in the binary. Refresh it occasionally by copying a store file over it.
+
+The Python scripts in this folder are the original pipeline. They're kept only as a reference for
+the wire rules and as an independent oracle (`refdecode.py`). Nothing runs them anymore.
 
 ## Wire format (as observed in 1.6.4)
 
@@ -20,7 +27,7 @@ decode). Everything here runs offline against files from the game package.
 | `StringPathHash` | `i64` path hash only |
 | `T[]` | `i32` count (-1 = null), elements; a blittable `T` is copied raw |
 | `List<T>`, `HashSet<T>`, ... | `i32` count, each element through its formatter (wrapped types as objects) |
-| `Dictionary<K,V>` | `i32` count, then key/value pairs |
+| `Dictionary<K,V>` | `i32` count, then key/value pairs; when `KeyValuePair<K,V>` is unmanaged, each entry is the raw struct, padding included (`Dictionary<ulong,int>`: 16-byte entries, value at 8; schema `"kv": [8, 16]`) |
 | `SerializeFieldDictionary<K,V>` | object header byte, then as `Dictionary` |
 | blittable struct | raw bytes at the IL2CPP field offsets, IL2CPP instance size, when the member is `[MemoryPackAllowSerialize]` or the type has no wrapper |
 | `Nullable<T>` (blittable `T`) | raw: `hasValue`, padding to `T`'s alignment, `T` |
@@ -31,7 +38,21 @@ A file's root type is not recorded. The decoder tries the types that decoded oth
 same directory, then every type whose member count matches the first byte, and accepts the first
 that consumes the file exactly.
 
-## Regenerating
+## Schema file
+
+Format 1 is gzip JSON: `{format, game_version, nodes, roots, dir_roots}`, plus the optional
+`generated_at` (RFC 3339) and `client_crc32` (the dll's CRC32 as 8 hex digits). Stored schemas
+are ordered by `game_version`, then `generated_at`. Nodes are `{"k": kind, ...}` with child
+types as node indexes. A `dict` node may carry `"kv": [value_offset, entry_size]` for padded raw
+pairs. Decoders that predate it read such entries unpadded, which only works for empty
+dictionaries.
+
+`endfield schema-gen` exits `2` when the new schema would decode fewer files than the newest
+one in use, and `3` when the IL2CPP reader can't parse the client (metadata version, typedef
+stride, registration search). In that case the reader in `src/extraction/il2cpp/` needs
+updating, and the steps below are the manual fallback for investigating.
+
+## Regenerating with the reference pipeline (manual)
 
 1. Download `GameAssembly.dll` and `Endfield_Data/il2cpp_data/Metadata/global-metadata.dat`
    from the game package (both are plain entries in the CDN ZIP).
@@ -60,7 +81,8 @@ that consumes the file exactly.
    python3 compile.py types.json winners.json <game version> schema.json
    gzip -9 -c schema.json > ../../schema/memorypack/<game version>.json.gz
    ```
-   and point `memorypack.rs` at the new file.
+   and point `memorypack.rs` at the new file. (On 1.6.4 this output decodes 14 fewer files than the
+   Rust schema. Eight of those need `kv`.)
 8. Check: `python3 refdecode.py schema.json <Json dir> <out dir>` is the reference decoder; the
    Rust decoder's ignored oracle test compares against its output.
 

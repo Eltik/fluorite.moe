@@ -9,6 +9,7 @@ pub mod lua;
 pub mod lz4_inv;
 pub mod memorypack;
 pub mod memorypack_schema;
+pub mod memorypack_store;
 pub mod mesh;
 pub mod pipeline;
 pub mod sparkbuffer;

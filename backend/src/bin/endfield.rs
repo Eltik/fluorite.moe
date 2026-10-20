@@ -8,6 +8,7 @@
 //!   update        — incremental extraction of everything that changed upstream
 //!   repair        — flip textures extracted before the orientation fix, in place
 //!   health        — check the update run log for staleness and regressions
+//!   schema-gen    — regenerate the MemoryPack schema from the client's IL2CPP files
 //!   list          — list all VFS directories and files
 //!   scan          — scan for asset names/paths
 //!   survey        — survey all Unity objects, types, counts
@@ -17,6 +18,7 @@ use backend::extraction::gamedata::{self, GamedataStats};
 use backend::extraction::health;
 use backend::extraction::lua;
 use backend::extraction::memorypack;
+use backend::extraction::memorypack_store::{self, SyncInput, SyncOutcome};
 use backend::extraction::mesh;
 use backend::extraction::pipeline::{self, ResolvedPipeline, VFS_DIRS};
 use backend::extraction::texture;
@@ -99,6 +101,9 @@ enum Commands {
         /// Output directory
         #[arg(long, default_value = "./output/decrypted")]
         output: String,
+        /// Update state file; MemoryPack schemas are read from `memorypack-schema/` beside it
+        #[arg(long, default_value = "./data/update-state.json")]
+        state: String,
     },
     /// Incrementally extract assets and decrypted data changed upstream
     Update {
@@ -126,6 +131,34 @@ enum Commands {
         /// Emit `@progress` lines for scripts/auto-update.sh to render
         #[arg(long)]
         progress: bool,
+        /// Do not regenerate the MemoryPack schema when the client binary changed
+        #[arg(long)]
+        no_schema: bool,
+    },
+    /// Generate, validate and install the MemoryPack schema for the current client, then
+    /// re-decode JsonData; exit 2 if it would decode fewer files, 3 if the client is unreadable
+    SchemaGen {
+        /// Persistent update state file; schemas go to `memorypack-schema/` beside it
+        #[arg(long, default_value = "./data/update-state.json")]
+        state: String,
+        /// Output directory (JsonData is found under `<output>/decrypted`)
+        #[arg(long, default_value = "./output")]
+        output: String,
+        /// Local GameAssembly.dll instead of downloading it (needs --metadata, --game-version)
+        #[arg(long, requires_all = ["metadata", "game_version"])]
+        dll: Option<String>,
+        /// Local global-metadata.dat instead of downloading it
+        #[arg(long, requires = "dll")]
+        metadata: Option<String>,
+        /// Game version of the local client files (downloads use the live version)
+        #[arg(long, requires = "dll")]
+        game_version: Option<String>,
+        /// JsonData `Json/` tree to learn and validate against (default: the JsonData group's)
+        #[arg(long)]
+        json_dir: Option<String>,
+        /// Install even if the new schema decodes fewer files than the current one
+        #[arg(long)]
+        force: bool,
     },
     /// Flip PNGs extracted before the orientation fix in place (no download)
     Repair {
@@ -192,7 +225,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir,
             output,
         } => cmd_extract_file(&client, &chk_name, dir, &output).await,
-        Commands::Decrypt { dir, output } => cmd_decrypt(&client, dir, &output).await,
+        Commands::Decrypt { dir, output, state } => {
+            cmd_decrypt(&client, dir, &output, Path::new(&state)).await
+        }
         Commands::Update {
             output,
             state,
@@ -202,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_meshes,
             skip_dir,
             progress,
+            no_schema,
         } => {
             cmd_update(
                 &client,
@@ -214,9 +250,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     no_meshes,
                     skip_dirs: skip_dir,
                     progress,
+                    no_schema,
                 },
             )
             .await
+        }
+        Commands::SchemaGen {
+            state,
+            output,
+            dll,
+            metadata,
+            game_version,
+            json_dir,
+            force,
+        } => {
+            let local = dll.zip(metadata).map(|(dll, metadata)| LocalClient {
+                dll: PathBuf::from(dll),
+                metadata: PathBuf::from(metadata),
+                game_version: game_version.unwrap_or_default(),
+            });
+            let options = SchemaGenOptions {
+                state: PathBuf::from(state),
+                output: PathBuf::from(output),
+                local,
+                json_dir: json_dir.map(PathBuf::from),
+                force,
+            };
+            let code = cmd_schema_gen(&client, options).await?;
+            std::process::exit(code);
         }
         Commands::Repair { output, state } => cmd_repair(Path::new(&output), Path::new(&state)),
         Commands::Health {
@@ -718,6 +779,8 @@ struct UpdateOptions {
     /// BLC directory hashes to leave untouched (not extracted, state unchanged).
     skip_dirs: Vec<String>,
     progress: bool,
+    /// Skip regenerating the MemoryPack schema.
+    no_schema: bool,
 }
 
 /// Inputs shared by every phase of one `update` run.
@@ -727,6 +790,8 @@ struct UpdateContext<'a> {
     state_path: &'a Path,
     force: bool,
     progress: bool,
+    /// MemoryPack schemas JsonData is decoded with.
+    schemas: &'a memorypack::SchemaSet,
 }
 
 /// Lock the update state so concurrent `update`/`repair` runs bail out instead of racing.
@@ -758,6 +823,7 @@ async fn cmd_update(
         no_meshes,
         skip_dirs,
         progress,
+        no_schema,
     } = options;
     let started = Instant::now();
     let Some(_lock) = lock_state(state_path)? else {
@@ -788,12 +854,14 @@ async fn cmd_update(
 
     emit_progress(progress, "resolve", 0, 0, "reading archive index");
     let resolved = pipeline::resolve_pipeline_from_config(client, config, true).await?;
+    let schemas = load_schema_set(state_path)?;
     let ctx = UpdateContext {
         client,
         resolved: &resolved,
         state_path,
         force,
         progress,
+        schemas: &schemas,
     };
     let out_dirs = OutputDirs::new(output);
     fs::create_dir_all(&out_dirs.gamedata)?;
@@ -820,6 +888,17 @@ async fn cmd_update(
         clean_legacy_gamedata(&out_dirs.gamedata, &state);
     }
     let blc = extract_blc_directories(&ctx, &mut state, output, &skip_dirs).await?;
+    let schema = if no_schema {
+        SchemaRun::default()
+    } else {
+        regenerate_schema(&ctx, &mut state, output).await
+    };
+    let schema_version = schema.version.clone().or_else(|| {
+        schemas
+            .newest()
+            .and_then(|(_, s)| s.game_version())
+            .map(str::to_owned)
+    });
 
     let failures = chk.failed + sort.failed + blc.failed;
     if !skip_dirs.is_empty() {
@@ -833,12 +912,22 @@ async fn cmd_update(
         update::save_state(state_path, &state)?;
     }
     fs::create_dir_all(output)?;
-    let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
+    let mut line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
         "chk_dirty": chk.dirty, "chk_ok": chk.ok, "chk_failed": chk.failed, "sort_chks": sort.chks, "sort_moved": sort.moved, "sort_failed": sort.failed, "blc_dirty": blc.dirty, "blc_ok": blc.ok, "blc_failed": blc.failed,
         "tex_extracted": chk.tex_extracted, "tex_failed": chk.tex_failed, "mesh_exported": chk.mesh_exported, "mesh_failed": chk.mesh_failed,
         "lua_decrypted": blc.lua_decrypted, "memorypack_decoded": blc.memorypack_decoded, "memorypack_failed": blc.memorypack_failed,
-        "schema_version": memorypack::Schema::embedded().ok().and_then(memorypack::Schema::game_version),
+        "schema_version": schema_version, "schema_regenerated": schema.regenerated,
         "duration_secs": started.elapsed().as_secs_f64()});
+    if !blc.memorypack_by_schema.is_empty() {
+        line["memorypack_schemas"] = serde_json::json!(blc.memorypack_by_schema);
+    }
+    if let Some((decoded, failed)) = schema.decoded {
+        line["schema_decoded"] = decoded.into();
+        line["schema_failed"] = failed.into();
+    }
+    if let Some(error) = &schema.error {
+        line["schema_error"] = error.as_str().into();
+    }
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1143,6 +1232,7 @@ struct BlcCounts {
     lua_decrypted: u64,
     memorypack_decoded: u64,
     memorypack_failed: u64,
+    memorypack_by_schema: BTreeMap<String, u64>,
 }
 
 impl BlcCounts {
@@ -1151,6 +1241,9 @@ impl BlcCounts {
         self.lua_decrypted += result.lua_decrypted as u64;
         self.memorypack_decoded += result.memorypack_decoded as u64;
         self.memorypack_failed += result.memorypack_failed as u64;
+        for (label, n) in &result.memorypack_by_schema {
+            *self.memorypack_by_schema.entry(label.clone()).or_default() += n;
+        }
     }
 }
 
@@ -1210,7 +1303,7 @@ async fn extract_blc_directories(
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
-        match blc::extract_directory(ctx.client, resolved, dir, &staging).await {
+        match blc::extract_directory_with(ctx.client, resolved, dir, &staging, ctx.schemas).await {
             Ok(result) if !result.errors.is_empty() => {
                 counts.add_decodes(&result);
                 // Keep the previous complete copy; the directory stays dirty and is retried.
@@ -1285,6 +1378,307 @@ fn install_blc_group(
 }
 
 // ═══════════════════════════════════════════════════════════
+// schema-gen — regenerate the MemoryPack schema
+// ═══════════════════════════════════════════════════════════
+
+/// Exit code of `schema-gen` when the new schema would decode fewer files than the current.
+const EXIT_SCHEMA_REGRESSION: i32 = 2;
+/// Exit code of `schema-gen` when the client files have a layout the IL2CPP reader does not
+/// know (metadata version, type stride, registration).
+const EXIT_SCHEMA_STRUCTURAL: i32 = 3;
+
+/// The stored MemoryPack schemas beside `state_path`, newest first, then the embedded one.
+fn load_schema_set(state_path: &Path) -> std::io::Result<memorypack::SchemaSet> {
+    let store = memorypack_store::store_dir(state_path);
+    let (set, warnings) = memorypack_store::load_set(&store)?;
+    for warning in warnings {
+        eprintln!("MemoryPack: {warning}");
+    }
+    Ok(set)
+}
+
+/// Client files given on the command line instead of downloaded.
+struct LocalClient {
+    dll: PathBuf,
+    metadata: PathBuf,
+    game_version: String,
+}
+
+struct SchemaGenOptions {
+    state: PathBuf,
+    output: PathBuf,
+    local: Option<LocalClient>,
+    json_dir: Option<PathBuf>,
+    force: bool,
+}
+
+/// The client's IL2CPP files.
+struct ClientFiles {
+    dll: Vec<u8>,
+    metadata: Vec<u8>,
+    dll_crc32: u32,
+}
+
+/// Archive name of a client file: `path` itself, else the shortest name with its file name.
+fn client_entry_name(cd: &ZipCentralDirectory, path: &str) -> Option<String> {
+    if cd.get(path).is_some() {
+        return Some(path.to_owned());
+    }
+    let file = path.rsplit('/').next()?;
+    cd.filenames()
+        .filter(|name| name.rsplit('/').next() == Some(file))
+        .min_by_key(|name| name.len())
+        .map(str::to_owned)
+}
+
+/// `UpdateState::memorypack_client` digest of the archive's `GameAssembly.dll`, with its name.
+fn client_digest(cd: &ZipCentralDirectory) -> Result<(String, String), String> {
+    let name = client_entry_name(cd, memorypack_store::CLIENT_DLL)
+        .ok_or_else(|| format!("no {} in the archive", memorypack_store::CLIENT_DLL))?;
+    let entry = cd.get(&name).ok_or("archive entry vanished")?;
+    Ok((
+        update::zip_digest(entry.crc32, entry.uncompressed_size),
+        name,
+    ))
+}
+
+/// Download `GameAssembly.dll` and `global-metadata.dat`, checking the binary's CRC-32.
+async fn download_client(client: &Client, cd: &ZipCentralDirectory) -> Result<ClientFiles, String> {
+    let (_, dll_name) = client_digest(cd)?;
+    let meta_name = client_entry_name(cd, memorypack_store::CLIENT_METADATA)
+        .ok_or_else(|| format!("no {} in the archive", memorypack_store::CLIENT_METADATA))?;
+    let entry = cd.get(&dll_name).ok_or("archive entry vanished")?;
+    println!(
+        "downloading {dll_name} ({}) and {meta_name}",
+        format_bytes(entry.uncompressed_size)
+    );
+    let (dll, metadata) = futures::join!(
+        pipeline::download_chk(client, cd, &dll_name),
+        pipeline::download_chk(client, cd, &meta_name)
+    );
+    let dll = dll.map_err(|e| format!("{dll_name}: {e}"))?;
+    let metadata = metadata.map_err(|e| format!("{meta_name}: {e}"))?;
+    let dll_crc32 = backend::extraction::memorypack_schema::crc32(&dll);
+    if dll_crc32 != entry.crc32 || dll.len() as u64 != entry.uncompressed_size {
+        return Err(format!(
+            "{dll_name} arrived corrupted (crc {dll_crc32:08x}, {} bytes; expected {:08x}, {})",
+            dll.len(),
+            entry.crc32,
+            entry.uncompressed_size
+        ));
+    }
+    Ok(ClientFiles {
+        dll,
+        metadata,
+        dll_crc32,
+    })
+}
+
+/// JsonData groups under `<output>/decrypted`, and the `Json/` tree to learn from: `json_dir`
+/// when given, else the first group's.
+fn json_data_inputs(
+    output: &Path,
+    json_dir: Option<PathBuf>,
+) -> std::io::Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    let groups = blc_group_dirs(&output.join("decrypted"), memorypack::JSON_DATA_GROUP)?;
+    let json_dir = json_dir.or_else(|| groups.iter().map(|g| g.join("Json")).find(|j| j.is_dir()));
+    Ok((groups, json_dir))
+}
+
+/// Run [`memorypack_store::sync`] (CPU and disk bound) without stalling the async runtime.
+fn run_schema_sync(
+    files: &ClientFiles,
+    game_version: &str,
+    state_path: &Path,
+    json_dir: Option<&Path>,
+    groups: &[PathBuf],
+    force: bool,
+) -> Result<memorypack_store::SyncReport, backend::extraction::memorypack_schema::GenerateError> {
+    let store = memorypack_store::store_dir(state_path);
+    let input = SyncInput {
+        dll: &files.dll,
+        metadata: &files.metadata,
+        game_version,
+        client_crc32: files.dll_crc32,
+        store_dir: &store,
+        json_dir,
+        groups,
+        force,
+    };
+    tokio::task::block_in_place(|| memorypack_store::sync(&input))
+}
+
+/// `schema-gen`: returns the process exit code.
+async fn cmd_schema_gen(
+    client: &Client,
+    options: SchemaGenOptions,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let Some(_lock) = lock_state(&options.state)? else {
+        return Err("another update is running".into());
+    };
+    let (files, game_version, digest) = match &options.local {
+        Some(local) => {
+            let dll = fs::read(&local.dll)?;
+            let metadata = fs::read(&local.metadata)?;
+            let dll_crc32 = backend::extraction::memorypack_schema::crc32(&dll);
+            let files = ClientFiles {
+                dll,
+                metadata,
+                dll_crc32,
+            };
+            // Local files may not be the live client, so the update state is left alone.
+            (files, local.game_version.clone(), None)
+        }
+        None => {
+            let resolved = pipeline::resolve_pipeline(client, false).await?;
+            let (digest, _) = client_digest(&resolved.cd)?;
+            let files = download_client(client, &resolved.cd).await?;
+            (files, resolved.config.version.clone(), Some(digest))
+        }
+    };
+    let (groups, json_dir) = json_data_inputs(&options.output, options.json_dir.clone())?;
+    match &json_dir {
+        Some(dir) => println!("learning and validating against {}", dir.display()),
+        None => println!(
+            "no JsonData tree under {}; generating without dir_roots",
+            options.output.join("decrypted").display()
+        ),
+    }
+    let report = match run_schema_sync(
+        &files,
+        &game_version,
+        &options.state,
+        json_dir.as_deref(),
+        &groups,
+        options.force,
+    ) {
+        Ok(report) => report,
+        Err(error) if error.is_structural() => {
+            eprintln!("schema-gen: {error}");
+            eprintln!("the IL2CPP reader needs updating for this client");
+            return Ok(EXIT_SCHEMA_STRUCTURAL);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    drop(files);
+    for line in report.lines() {
+        println!("{line}");
+    }
+    if !report.installed() {
+        return Ok(EXIT_SCHEMA_REGRESSION);
+    }
+    if let Some(digest) = digest {
+        let mut state = update::load_state(&options.state)?;
+        state.memorypack_client = digest;
+        update::save_state(&options.state, &state)?;
+    }
+    if report.redecode.as_ref().is_some_and(|r| r.write_errors > 0) {
+        return Err("could not write some JsonData files; rerun to retry".into());
+    }
+    Ok(0)
+}
+
+/// What the schema step of `update` did.
+#[derive(Default)]
+struct SchemaRun {
+    /// A schema for the current client was generated, validated and is installed.
+    regenerated: bool,
+    /// JsonData totals after re-decoding with the new set: `(decoded, failed)`.
+    decoded: Option<(u64, u64)>,
+    /// Why the schema was not regenerated, when it should have been.
+    error: Option<String>,
+    /// Game version of the newest schema in use afterwards.
+    version: Option<String>,
+}
+
+/// Regenerate the MemoryPack schema when the archive's `GameAssembly.dll` differs from the
+/// one the newest schema came from. Never fails the update: a problem is printed and
+/// returned in [`SchemaRun::error`], and the schemas in use stay as they are.
+async fn regenerate_schema(
+    ctx: &UpdateContext<'_>,
+    state: &mut UpdateState,
+    output: &Path,
+) -> SchemaRun {
+    let mut run = SchemaRun::default();
+    let fail = |run: &mut SchemaRun, error: String| {
+        println!("MemoryPack schema not regenerated: {error}; keeping the current schemas");
+        run.error = Some(error);
+    };
+    let cd = &ctx.resolved.cd;
+    let digest = match client_digest(cd) {
+        Ok((digest, _)) => digest,
+        Err(error) => {
+            fail(&mut run, error);
+            return run;
+        }
+    };
+    if !ctx.force && (state.memorypack_client == digest || state.memorypack_attempted == digest) {
+        return run;
+    }
+    println!("MemoryPack: client binary changed ({digest}); regenerating the schema");
+    emit_progress(ctx.progress, "schema", 0, 0, "downloading client");
+    let files = match download_client(ctx.client, cd).await {
+        Ok(files) => files,
+        Err(error) => {
+            fail(&mut run, format!("download: {error}"));
+            return run;
+        }
+    };
+    let (groups, json_dir) = match json_data_inputs(output, None) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            fail(&mut run, format!("finding JsonData: {error}"));
+            return run;
+        }
+    };
+    emit_progress(ctx.progress, "schema", 0, 0, "generating");
+    let version = &ctx.resolved.config.version;
+    // A refused or broken client is not worth another ~400 MB download on every run.
+    let give_up = |run: &mut SchemaRun, state: &mut UpdateState, error: String| {
+        fail(run, error);
+        state.memorypack_attempted = digest.clone();
+        if let Err(error) = update::save_state(ctx.state_path, state) {
+            eprintln!("  saving state: {error}");
+        }
+    };
+    match run_schema_sync(
+        &files,
+        version,
+        ctx.state_path,
+        json_dir.as_deref(),
+        &groups,
+        false,
+    ) {
+        Ok(report) => {
+            for line in report.lines() {
+                println!("  {line}");
+            }
+            if let Some(r) = &report.redecode {
+                run.decoded = Some((r.decoded, r.failed));
+            }
+            match &report.outcome {
+                SyncOutcome::Refused(reason) => give_up(&mut run, state, reason.clone()),
+                SyncOutcome::Installed(_) | SyncOutcome::Unchanged(_) => {
+                    run.regenerated = true;
+                    run.version = report.schema_version.clone();
+                    state.memorypack_client = digest.clone();
+                    state.memorypack_attempted.clear();
+                    if let Err(error) = update::save_state(ctx.state_path, state) {
+                        run.error = Some(format!("saving state: {error}"));
+                    }
+                }
+            }
+        }
+        Err(error) if error.is_structural() => {
+            give_up(&mut run, state, format!("structural: {error}"))
+        }
+        Err(error) => give_up(&mut run, state, error.to_string()),
+    }
+    emit_progress(ctx.progress, "schema", 1, 1, "");
+    run
+}
+
+// ═══════════════════════════════════════════════════════════
 // health — check the update run log
 // ═══════════════════════════════════════════════════════════
 
@@ -1322,7 +1716,7 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
         return Ok(());
     };
     repair_lua(&output.join("decrypted"))?;
-    repair_json_data(&output.join("decrypted"))?;
+    repair_json_data(&output.join("decrypted"), &load_schema_set(state_path)?)?;
     let mut state = update::load_state(state_path)?;
     let tex_dir = output.join("textures");
     let stale: Vec<String> = state
@@ -1417,10 +1811,13 @@ fn repair_lua(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Decode MemoryPack files in every JsonData group under `decrypted` that an older extractor
 /// left binary, or re-decode them from their `.mpk` sources after a schema update.
-fn repair_json_data(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn repair_json_data(
+    decrypted: &Path,
+    schemas: &memorypack::SchemaSet,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut totals = memorypack::TreeDecodeResult::default();
     for group in blc_group_dirs(decrypted, memorypack::JSON_DATA_GROUP)? {
-        let result = match memorypack::decode_tree(&group) {
+        let result = match memorypack::decode_tree_set(schemas, &group) {
             Ok(result) => result,
             // An unreadable string pool means the files stay as stored, as in extraction.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
@@ -1432,9 +1829,7 @@ fn repair_json_data(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> 
             }
             Err(error) => return Err(error.into()),
         };
-        totals.decoded += result.decoded;
-        totals.failed += result.failed;
-        totals.write_errors += result.write_errors;
+        totals.add(&result);
     }
     if totals != memorypack::TreeDecodeResult::default() {
         println!(
@@ -1462,6 +1857,7 @@ fn blc_group_dirs(decrypted: &Path, name: &str) -> std::io::Result<Vec<PathBuf>>
             dirs.push(group);
         }
     }
+    dirs.sort();
     Ok(dirs)
 }
 
@@ -1689,8 +2085,10 @@ async fn cmd_decrypt(
     client: &Client,
     dir_filter: Option<String>,
     output: &str,
+    state_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== ChaCha20 VFS Decryption ===\n");
+    let schemas = load_schema_set(state_path)?;
 
     let resolved = pipeline::resolve_pipeline(client, true).await?;
     print_pipeline_summary(&resolved);
@@ -1724,7 +2122,8 @@ async fn cmd_decrypt(
         println!("{}", "=".repeat(60));
         println!("=== {} ===", dir_hash);
 
-        match blc::extract_directory(client, &resolved, dir_hash, output_path).await {
+        match blc::extract_directory_with(client, &resolved, dir_hash, output_path, &schemas).await
+        {
             Ok(result) => {
                 println!(
                     "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON, {} Lua decrypted, {} MemoryPack→JSON ({} not decodable)",

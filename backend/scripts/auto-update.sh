@@ -44,6 +44,7 @@ phase_title() {
     chk) echo "Assets  " ;;
     sort) echo "Sorting " ;;
     blc) echo "Tables  " ;;
+    schema) echo "Schema  " ;;
     *) echo "$1" ;;
   esac
 }

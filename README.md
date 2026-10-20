@@ -116,6 +116,7 @@ cargo run --release --bin endfield -- decrypt --dir 42A8FCA6
 |------|-------------|
 | `--dir <HASH>` | Extract a specific directory (default: all BLC directories) |
 | `--output <PATH>` | Output directory (default: `./output/decrypted`) |
+| `--state <PATH>` | Update state file; only used to find the MemoryPack schema store beside it (default: `./data/update-state.json`) |
 
 BLC directories (game 1.6):
 
@@ -193,8 +194,36 @@ cargo run --release --bin endfield -- update --check
 | `--no-textures` | Skip texture extraction (those chunks are re-processed by a later run with textures) |
 | `--no-meshes` | Skip mesh export |
 | `--skip-dir <HASH,...>` | Leave these BLC directories alone; the version fingerprint is not recorded, so a later run without it fetches them |
+| `--no-schema` | Don't regenerate the MemoryPack schema even if the client binary changed |
 
-Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`: version and `res_version`, chunk/sort/BLC counts (`chk_dirty`, `chk_ok`, `chk_failed`, `sort_*`, `blc_*`), asset counts from the chunk phase (`tex_extracted`, `tex_failed`, `mesh_exported`, `mesh_failed`), decode counts summed over the BLC directories it extracted (`lua_decrypted`, `memorypack_decoded`, `memorypack_failed`), the embedded MemoryPack schema's game version (`schema_version`), and `duration_secs`.
+Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`: version and `res_version`, chunk/sort/BLC counts (`chk_dirty`, `chk_ok`, `chk_failed`, `sort_*`, `blc_*`), asset counts from the chunk phase (`tex_extracted`, `tex_failed`, `mesh_exported`, `mesh_failed`), decode counts summed over the BLC directories it extracted (`lua_decrypted`, `memorypack_decoded`, `memorypack_failed`, and `memorypack_schemas`, which counts decoded files per schema), the game version of the newest MemoryPack schema in use (`schema_version`), `schema_regenerated` plus `schema_decoded`/`schema_failed` (JsonData totals after re-decoding) or `schema_error` when a regeneration was attempted, and `duration_secs`.
+
+After the BLC phase, if the archive's `GameAssembly.dll` (CRC32 and size) differs from the one recorded in the state (`memorypack_client`), `update` runs the `schema-gen` flow below. A failed or refused regeneration doesn't fail the update. It logs `schema_error` and keeps the current schemas, `health` warns, and the next run tries again.
+
+#### `endfield schema-gen`
+
+Regenerates the MemoryPack schema that decodes JsonData, straight from the client's IL2CPP files. It downloads `GameAssembly.dll` (~320 MB) and `global-metadata.dat` (~74 MB) from the game archive into memory, compiles the schema, and learns each directory's root types from the extracted `JsonData/Json` tree. Then it decodes every file with the new schema and with the schemas in use. It refuses to install a schema that decodes fewer files than the newest one in use. Otherwise it installs the schema and re-decodes JsonData from the `.mpk` sources. It takes about 5 seconds plus the download, and peaks around 0.75 GB of memory.
+
+```bash
+# For the live client (downloads the two files)
+cargo run --release --bin endfield -- schema-gen
+
+# From local client files
+cargo run --release --bin endfield -- schema-gen --dll GameAssembly.dll \
+  --metadata global-metadata.dat --game-version 1.6.4
+```
+
+| Flag | Description |
+|------|-------------|
+| `--state <PATH>` | State file; schemas go to `memorypack-schema/` beside it (default: `./data/update-state.json`) |
+| `--output <PATH>` | Output directory holding `decrypted/JsonData` (default: `./output`) |
+| `--dll <PATH>` / `--metadata <PATH>` / `--game-version <V>` | Use local client files instead of downloading (all three together; the state is not touched) |
+| `--json-dir <PATH>` | `Json/` tree to learn from and validate against (default: the JsonData group's) |
+| `--force` | Install even if the new schema decodes fewer files |
+
+Exit codes: `0` installed or already current, `2` refused because it would decode fewer files, `3` the client files have a layout the IL2CPP reader doesn't know (it needs updating), `1` other errors.
+
+Schemas are stored as `data/memorypack-schema/<game version>-<GameAssembly.dll crc32>.json.gz`. Every command that decodes JsonData (`update`, `decrypt`, `repair`, `schema-gen`) loads all stored schemas, newest first by game version and then generation time, followed by the schema embedded in the binary. Each file is decoded by the first schema that consumes it exactly, so a new schema never loses a file an older one could decode.
 
 #### `endfield health`
 
@@ -208,7 +237,7 @@ cargo run --release --bin endfield -- health --output ./output --max-age-hours 2
 |-------|------|------|
 | Freshness | | Log missing or empty, or the newest run is older than `--max-age-hours` (default 26) |
 | Run failures | Newest run had `chk_failed + sort_failed + blc_failed > 0` | The last 3 runs all had failures |
-| MemoryPack | Newest run that decoded any JsonData files had more than 1% fail; or the game version's major.minor differs from `schema_version`'s. Regenerate the schema per `backend/scripts/memorypack-schema/README.md` | |
+| MemoryPack | Newest run that decoded any JsonData files had more than 1% fail (after any regeneration); the game version's major.minor differs from that of the schema in use (`schema_version`); or the newest regeneration attempt failed (`schema_error`). Run `endfield schema-gen` and see `backend/scripts/memorypack-schema/README.md` | |
 | Textures / meshes | `tex_failed` or `mesh_failed` exceeds the previous run that logged it by more than max(50, 10%) | |
 
 When the texture layout changes, the next `update` sorts existing PNGs instead of re-extracting them. For each chunk that is unchanged upstream, it downloads the chunk and reads only its bundle metadata, then moves the old flat PNGs (`textures/<name>.png`) into the new folders. Nothing is decoded and no PNG is rewritten. Chunks that did change upstream are extracted normally. When a name matches several textures, the file's dimensions pick one; if they can't, it goes to `textures/_ambiguous/` with its candidate paths listed in `candidates.jsonl`. State is saved only after the sort finishes, so an interrupted run starts the sort again on the next run. Leftover top-level PNGs (textures no longer in the game) are deleted once every chunk succeeds.
@@ -217,7 +246,7 @@ When the extraction output format changes (`EXTRACT_VERSION` in `update.rs`), ev
 
 #### `endfield repair`
 
-Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonData MemoryPack files left binary (re-decoding from `.mpk` sources, e.g. after a schema update), then flips PNGs extracted before the orientation fix in place, using each chunk's texture index, and marks those chunks as current in the state file. It needs no network access, and a per-chunk journal makes it safe to interrupt and rerun.
+Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonData MemoryPack files left binary (re-decoding from `.mpk` sources with the stored schemas), then flips PNGs extracted before the orientation fix in place, using each chunk's texture index, and marks those chunks as current in the state file. It needs no network access, and a per-chunk journal makes it safe to interrupt and rerun.
 
 #### Fixing an existing output
 
@@ -313,7 +342,8 @@ backend/
 - **pipeline** is the shared download pipeline that resolves game config to ZIP central directory to chunk download, used by all extraction commands.
 - **zip_range** handles HTTP range-request based extraction from the game's split ZIP archive (multiple `.zip` parts on CDN).
 - **lua** decrypts the `Lua` group's scripts: each is base64 text wrapping an XXTEA payload whose last word is the plaintext length.
-- **memorypack** decodes the `JsonData` group's MemoryPack files to JSON. Layouts come from a compiled schema embedded at build time (`backend/schema/memorypack/<version>.json.gz`, generated by the tools in `backend/scripts/memorypack-schema/`), and strings are indexes into the group's `Json/StringPool/` pool. Each file is tried against its directory's known root types, then every plausible root, and only a decode that consumes every byte counts. Decoded files keep their raw bytes beside them as `.mpk`; files no type decodes are left as stored.
+- **memorypack** decodes the `JsonData` group's MemoryPack files to JSON. Layouts come from compiled schemas: the ones in the runtime store (`data/memorypack-schema/`, see `schema-gen`), newest first, then the one embedded at build time (`backend/schema/memorypack/<version>.json.gz`). Strings are indexes into the group's `Json/StringPool/` pool. Each file is tried against its directory's known root types, then every plausible root, and only a decode that consumes every byte counts. Decoded files keep their raw bytes beside them as `.mpk`; files no type decodes are left as stored.
+- **il2cpp**, **memorypack_schema** and **memorypack_store** generate those schemas: an IL2CPP reader for `GameAssembly.dll` + `global-metadata.dat`, the schema compiler and root learner, and the store plus the generate/validate/install flow behind `schema-gen`.
 - **lz4_inv** is a custom LZ4 decompression variant used by some game assets.
 - **fair_guard_utils** provides helpers for handling FairGuard anti-cheat obfuscated data.
 - **utils** contains shared utilities: `format_bytes()`, `hex_dump()`, `sanitize_filename()`.

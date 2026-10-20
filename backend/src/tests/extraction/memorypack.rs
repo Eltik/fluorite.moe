@@ -1,8 +1,12 @@
 use crate::extraction::memorypack::{
-    Schema, StringPool, TreeDecodeResult, decode_bytes, decode_tree_with, json_files,
+    Schema, SchemaSet, StringPool, TreeDecodeResult, decode_bytes, decode_tree_set,
+    decode_tree_with, json_files, newest_first,
 };
+use crate::extraction::memorypack_schema::memorypack_source;
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn temp_dir(label: &str) -> PathBuf {
     let nonce = std::time::SystemTime::now()
@@ -373,6 +377,7 @@ fn decode_tree_is_idempotent() {
         decoded: 1,
         failed: 1,
         write_errors: 0,
+        by_schema: [("test".to_owned(), 1)].into(),
     };
     assert_eq!(decode_tree_with(&schema, &group).unwrap(), expected);
     let decoded = fs::read(json.join("dirB/Foo.json")).unwrap();
@@ -428,11 +433,12 @@ fn matches_reference_decoder() {
     let pool = StringPool::load(&input.join("StringPool")).unwrap();
     let started = std::time::Instant::now();
     let (mut ok, mut failed, mut mismatched) = (0, 0, Vec::new());
+    let mut gained = 0;
     for (path, rel_dir) in json_files(input).unwrap() {
-        let data = fs::read(&path).unwrap();
-        if data.first().is_none_or(|&b| b == b'{') {
+        // `.mpk` sources first, so an already decoded tree works too.
+        let Some(data) = memorypack_source(&path).unwrap() else {
             continue;
-        }
+        };
         let expected_path = oracle.join(path.strip_prefix(input).unwrap());
         let expected: Option<serde_json::Value> = fs::read(&expected_path)
             .ok()
@@ -443,12 +449,15 @@ fn matches_reference_decoder() {
             Some(_) => ok += 1,
             None => failed += 1,
         }
-        if actual != expected {
-            mismatched.push(path.display().to_string());
+        match (&actual, &expected) {
+            // Files the reference could not decode (padded pairs, among others).
+            (Some(_), None) => gained += 1,
+            (a, e) if a != e => mismatched.push(path.display().to_string()),
+            _ => {}
         }
     }
     println!(
-        "decoded {ok}, failed {failed}, mismatched {} in {:?}",
+        "decoded {ok} ({gained} beyond the reference), failed {failed}, mismatched {} in {:?}",
         mismatched.len(),
         started.elapsed()
     );
@@ -457,8 +466,15 @@ fn matches_reference_decoder() {
         "first mismatches: {:?}",
         &mismatched[..mismatched.len().min(10)]
     );
-    assert_eq!((ok, failed), (19471, 31));
+    assert_eq!(
+        (ok - gained, ok, failed),
+        (19471, EMBEDDED_DECODED, EMBEDDED_FAILED)
+    );
 }
+
+/// Files of the 1.6.4 JsonData group the embedded schema decodes and fails on.
+const EMBEDDED_DECODED: u64 = 19485;
+const EMBEDDED_FAILED: u64 = 17;
 
 /// Decode a copy of a real JsonData group in place twice; the second run must change nothing.
 ///
@@ -490,15 +506,154 @@ fn decodes_real_group_idempotently() {
         let result = decode_tree_with(schema, group).unwrap();
         println!("run {run}: {result:?} in {:?}", started.elapsed());
         assert_eq!(
-            result,
-            TreeDecodeResult {
-                decoded: 19471,
-                failed: 31,
-                write_errors: 0
-            }
+            (result.decoded, result.failed, result.write_errors),
+            (EMBEDDED_DECODED, EMBEDDED_FAILED, 0)
         );
         if let Some(before) = before {
             assert!(before == snapshot(), "second run changed the tree");
         }
     }
+}
+
+#[test]
+fn decodes_padded_key_value_pairs() {
+    // `Dictionary<ulong, int>`: raw 16-byte entries, the value at 8, then 4 padding bytes.
+    let schema = Schema::from_json(
+        br#"{"format": 1, "nodes": [{"k": "p", "t": "u64"}, {"k": "p", "t": "i32"},
+            {"k": "dict", "hdr": false, "key": 0, "val": 1, "kv": [8, 16]},
+            {"k": "obj", "m": [["d", 2]]}],
+            "roots": {"D": 3}, "dir_roots": {}}"#,
+    )
+    .unwrap();
+    let pool = StringPool::default();
+    let mut payload = Bytes::default().u8(1).i32(2).0;
+    for (key, value) in [(5u64, 7i32), (u64::MAX, -1)] {
+        payload.extend_from_slice(&key.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&[0xAA; 4]);
+    }
+    assert_eq!(
+        String::from_utf8(decode_bytes(&schema, &pool, &payload, ".").unwrap()).unwrap(),
+        "{\n  \"d\": {\n    \"5\": 7,\n    \"18446744073709551615\": -1\n  }\n}"
+    );
+    // The last entry's padding is part of the data.
+    payload.truncate(payload.len() - 1);
+    assert_eq!(decode_bytes(&schema, &pool, &payload, "."), None);
+
+    // A value offset of 0 or past the entry cannot be a padded pair.
+    for kv in ["[0, 16]", "[16, 16]", "[8]", "\"x\""] {
+        let json = format!(
+            r#"{{"format": 1, "nodes": [{{"k": "p", "t": "u64"}},
+                {{"k": "dict", "hdr": false, "key": 0, "val": 0, "kv": {kv}}}],
+                "roots": {{}}, "dir_roots": {{}}}}"#
+        );
+        assert!(Schema::from_json(json.as_bytes()).is_err(), "kv {kv}");
+    }
+}
+
+/// A one-root schema whose root object has a single member `name` of node `kind`.
+fn versioned(version: Option<&str>, generated_at: Option<&str>, name: &str, kind: &str) -> Schema {
+    let kind: serde_json::Value = serde_json::from_str(kind).unwrap();
+    let mut doc = serde_json::json!({
+        "format": 1,
+        "nodes": [{"k": "obj", "m": [[name, 1]]}, kind],
+        "roots": {"R": 0},
+        "dir_roots": {},
+    });
+    if let Some(version) = version {
+        doc["game_version"] = version.into();
+    }
+    if let Some(at) = generated_at {
+        doc["generated_at"] = at.into();
+    }
+    Schema::from_json(&serde_json::to_vec(&doc).unwrap()).unwrap()
+}
+
+#[test]
+fn orders_schemas_newest_first() {
+    let schema = |v, at| versioned(v, at, "x", r#"{"k": "str"}"#);
+    let old = schema(Some("1.6.4"), Some("2026-10-01T00:00:00+00:00"));
+    let rebuilt = schema(Some("1.6.4"), Some("2026-10-02T00:00:00+09:00"));
+    let newer = schema(Some("1.10.0"), Some("2026-01-01T00:00:00Z"));
+    let unknown = schema(None, None);
+    // Versions compare numerically (1.10 > 1.6), then generation time.
+    assert_eq!(newest_first(&newer, &old), Ordering::Less);
+    assert_eq!(newest_first(&rebuilt, &old), Ordering::Less);
+    assert_eq!(newest_first(&unknown, &old), Ordering::Greater);
+
+    let set = SchemaSet::new(
+        vec![
+            ("old".into(), Arc::new(old)),
+            ("unknown".into(), Arc::new(unknown)),
+            ("newer".into(), Arc::new(newer)),
+            ("rebuilt".into(), Arc::new(rebuilt)),
+        ],
+        Some(("fallback".into(), Arc::new(schema(Some("9.9.9"), None)))),
+    );
+    let labels: Vec<&str> = set.entries().map(|(label, _)| label).collect();
+    // The fallback stays last whatever its version.
+    assert_eq!(labels, ["newer", "rebuilt", "old", "unknown", "fallback"]);
+    assert_eq!(set.newest().unwrap().0, "newer");
+    assert_eq!(set.len(), 5);
+
+    let replaced = set.with("old", Arc::new(schema(Some("2.0.0"), None)));
+    let labels: Vec<&str> = replaced.entries().map(|(label, _)| label).collect();
+    assert_eq!(labels, ["old", "newer", "rebuilt", "unknown", "fallback"]);
+}
+
+#[test]
+fn schema_set_falls_back_to_older_schemas() {
+    // The new schema reads the member as a string, the old one as an int.
+    let new = versioned(Some("1.7.0"), None, "name", r#"{"k": "str"}"#);
+    let old = versioned(Some("1.6.4"), None, "id", r#"{"k": "p", "t": "i32"}"#);
+    let set = SchemaSet::new(
+        vec![("old".into(), Arc::new(old)), ("new".into(), Arc::new(new))],
+        None,
+    );
+    let pool = pool();
+    let both = Bytes::default().u8(1).i32(1).0;
+    let (label, json) = set.decode(&pool, &both, ".").unwrap();
+    assert_eq!(
+        (label, json.as_slice()),
+        ("new", &b"{\n  \"name\": \"beta\"\n}"[..])
+    );
+    // Index 7 is outside the pool: only the old schema decodes it.
+    let old_only = Bytes::default().u8(1).i32(7).0;
+    let (label, json) = set.decode(&pool, &old_only, ".").unwrap();
+    assert_eq!((label, json.as_slice()), ("old", &b"{\n  \"id\": 7\n}"[..]));
+    assert_eq!(set.decode(&pool, &[2, 0], "."), None);
+
+    // A tree counts each file under the schema that decoded it.
+    let group = temp_dir("set");
+    let json = group.join("Json");
+    fs::create_dir_all(json.join("StringPool")).unwrap();
+    fs::write(
+        json.join("StringPool/StringPool0.byte"),
+        pool_file(&["alpha", "beta"], true, false),
+    )
+    .unwrap();
+    fs::write(json.join("Both.json"), &both).unwrap();
+    fs::write(json.join("OldOnly.json"), &old_only).unwrap();
+    fs::write(json.join("Neither.json"), [2u8, 0]).unwrap();
+    let expected = TreeDecodeResult {
+        decoded: 2,
+        failed: 1,
+        write_errors: 0,
+        by_schema: [("new".to_owned(), 1), ("old".to_owned(), 1)].into(),
+    };
+    assert_eq!(decode_tree_set(&set, &group).unwrap(), expected);
+    assert_eq!(decode_tree_set(&set, &group).unwrap(), expected);
+    assert_eq!(fs::read(json.join("OldOnly.mpk")).unwrap(), old_only);
+    fs::remove_dir_all(group).unwrap();
+}
+
+#[test]
+fn embedded_set_holds_only_the_embedded_schema() {
+    let set = SchemaSet::embedded().unwrap();
+    let (label, schema) = set.newest().unwrap();
+    assert_eq!(
+        label,
+        format!("embedded-{}", schema.game_version().unwrap())
+    );
+    assert_eq!(set.len(), 1);
 }

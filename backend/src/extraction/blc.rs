@@ -216,6 +216,8 @@ pub struct DirExtractResult {
     pub memorypack_decoded: usize,
     /// MemoryPack files no schema type decodes; kept as stored, and not an error.
     pub memorypack_failed: usize,
+    /// Decoded MemoryPack files per schema label.
+    pub memorypack_by_schema: BTreeMap<String, u64>,
     pub errors: Vec<String>,
 }
 
@@ -274,12 +276,25 @@ async fn download_patch_chunk(
     }
 }
 
-/// Extract all files from a single BLC-catalogued VFS directory into `<output_dir>/<group>`.
+/// Extract all files from a single BLC-catalogued VFS directory into `<output_dir>/<group>`,
+/// decoding MemoryPack files with the embedded schema.
 pub async fn extract_directory(
     client: &Client,
     resolved: &ResolvedPipeline,
     dir_hash: &str,
     output_dir: &Path,
+) -> Result<DirExtractResult, Box<dyn std::error::Error>> {
+    let schemas = memorypack::SchemaSet::embedded()?;
+    extract_directory_with(client, resolved, dir_hash, output_dir, &schemas).await
+}
+
+/// [`extract_directory`], decoding MemoryPack files with `schemas`.
+pub async fn extract_directory_with(
+    client: &Client,
+    resolved: &ResolvedPipeline,
+    dir_hash: &str,
+    output_dir: &Path,
+    schemas: &memorypack::SchemaSet,
 ) -> Result<DirExtractResult, Box<dyn std::error::Error>> {
     let blc_data =
         pipeline::download_chk(client, &resolved.cd, &pipeline::blc_path(dir_hash)).await?;
@@ -313,6 +328,7 @@ pub async fn extract_directory(
         lua_decrypted: 0,
         memorypack_decoded: 0,
         memorypack_failed: 0,
+        memorypack_by_schema: BTreeMap::new(),
         errors: Vec::new(),
     };
 
@@ -398,10 +414,11 @@ pub async fn extract_directory(
     }
 
     if memorypack {
-        match memorypack::decode_tree(&dir_output) {
+        match memorypack::decode_tree_set(schemas, &dir_output) {
             Ok(decoded) => {
                 result.memorypack_decoded = decoded.decoded as usize;
                 result.memorypack_failed = decoded.failed as usize;
+                result.memorypack_by_schema = decoded.by_schema.clone();
                 if decoded.write_errors > 0 {
                     result.errors.push(format!(
                         "MemoryPack: could not write {} decoded files",
