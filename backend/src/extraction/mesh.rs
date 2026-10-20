@@ -1,9 +1,8 @@
 //! Unity Mesh decoding and glTF binary export.
-use crate::extraction::gamedata::{claim_path, write_file};
 use crate::extraction::texture::resolve_stream_data;
 use crate::extraction::texture_layout::{self, Placement};
 use crate::extraction::unity::{SerializedFile, value_bytes};
-use crate::extraction::utils::sanitize_filename;
+use crate::extraction::utils::{flat_filename, write_file};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -37,6 +36,10 @@ fn integer(map: &Map<String, Value>, name: &str) -> Result<i64, String> {
     map.get(name)
         .and_then(Value::as_i64)
         .ok_or_else(|| format!("missing or invalid {name}"))
+}
+/// A non-negative integer field, rejected as `invalid <name>` when negative.
+fn index_field(map: &Map<String, Value>, name: &str) -> Result<usize, String> {
+    usize::try_from(integer(map, name)?).map_err(|_| format!("invalid {name}"))
 }
 fn bytes(value: Option<&Value>) -> Result<Vec<u8>, String> {
     let value = value.ok_or("missing or invalid byte data")?;
@@ -188,11 +191,7 @@ pub fn decode_mesh(
     // m_CompressedMesh is empty and whose vertices are in m_VertexData as usual, so trust the
     // payload rather than the flag.
     let compressed_vertices = mesh
-        .get("m_CompressedMesh")
-        .and_then(Value::as_object)
-        .and_then(|c| c.get("m_Vertices"))
-        .and_then(Value::as_object)
-        .and_then(|v| v.get("m_NumItems"))
+        .pointer("/m_CompressedMesh/m_Vertices/m_NumItems")
         .and_then(Value::as_i64)
         .unwrap_or(0);
     if compressed_vertices > 0 {
@@ -216,12 +215,11 @@ pub fn decode_mesh(
         .iter()
         .map(|v| {
             let o = v.as_object().ok_or_else(|| "invalid channel".to_string())?;
-            let raw_dimension =
-                usize::try_from(integer(o, "dimension")?).map_err(|_| "invalid dimension")?;
+            let raw_dimension = index_field(o, "dimension")?;
             Ok(Channel {
-                stream: usize::try_from(integer(o, "stream")?).map_err(|_| "invalid stream")?,
-                offset: usize::try_from(integer(o, "offset")?).map_err(|_| "invalid offset")?,
-                format: usize::try_from(integer(o, "format")?).map_err(|_| "invalid format")?,
+                stream: index_field(o, "stream")?,
+                offset: index_field(o, "offset")?,
+                format: index_field(o, "format")?,
                 dimension: raw_dimension & 0x0f,
                 packed: raw_dimension >> 4 == PACKED_10_10_10,
             })
@@ -317,9 +315,8 @@ pub fn decode_mesh(
         .filter_map(|v| v.as_object())
         .filter(|o| integer(o, "topology").ok() == Some(0))
         .map(|o| {
-            let first =
-                usize::try_from(integer(o, "firstByte")?).map_err(|_| "invalid firstByte")?;
-            let n = usize::try_from(integer(o, "indexCount")?).map_err(|_| "invalid indexCount")?;
+            let first = index_field(o, "firstByte")?;
+            let n = index_field(o, "indexCount")?;
             let base = integer(o, "baseVertex")?;
             if n % 3 != 0 {
                 return Err("triangle index count is not divisible by three".into());
@@ -370,94 +367,107 @@ pub fn decode_mesh(
     })
 }
 
-fn append_f32(bin: &mut Vec<u8>, values: impl IntoIterator<Item = f32>) {
-    for value in values {
-        bin.extend_from_slice(&value.to_le_bytes());
-    }
+const COMPONENT_FLOAT: u32 = 5126;
+const COMPONENT_UNSIGNED_SHORT: u32 = 5123;
+const COMPONENT_UNSIGNED_INT: u32 = 5125;
+
+/// Binary chunk, buffer views, and accessors of a glTF document under construction.
+#[derive(Default)]
+struct GlbBuffers {
+    bin: Vec<u8>,
+    views: Vec<Value>,
+    accessors: Vec<Value>,
 }
-fn pad(bin: &mut Vec<u8>) {
-    while !bin.len().is_multiple_of(4) {
-        bin.push(0);
+
+impl GlbBuffers {
+    fn pad(&mut self) {
+        while !self.bin.len().is_multiple_of(4) {
+            self.bin.push(0);
+        }
     }
-}
-/// Start a buffer view at the next aligned offset and return its index.
-fn view(bin: &mut Vec<u8>, views: &mut Vec<Value>, byte_length: usize) -> usize {
-    pad(bin);
-    views.push(json!({"buffer":0,"byteOffset":bin.len(),"byteLength":byte_length}));
-    views.len() - 1
-}
-fn accessor(
-    accessors: &mut Vec<Value>,
-    view: usize,
-    component: u32,
-    count: usize,
-    kind: &str,
-    min: Option<[f32; 3]>,
-    max: Option<[f32; 3]>,
-) -> usize {
-    let mut a = json!({"bufferView":view,"componentType":component,"count":count,"type":kind});
-    if let Some(x) = min {
-        a["min"] = json!(x);
+
+    /// Start a buffer view at the next aligned offset and return its index.
+    fn view(&mut self, byte_length: usize) -> usize {
+        self.pad();
+        self.views
+            .push(json!({"buffer":0,"byteOffset":self.bin.len(),"byteLength":byte_length}));
+        self.views.len() - 1
     }
-    if let Some(x) = max {
-        a["max"] = json!(x);
+
+    fn accessor(
+        &mut self,
+        view: usize,
+        component: u32,
+        count: usize,
+        kind: &str,
+        bounds: Option<([f32; 3], [f32; 3])>,
+    ) -> usize {
+        let mut a = json!({"bufferView":view,"componentType":component,"count":count,"type":kind});
+        if let Some((min, max)) = bounds {
+            a["min"] = json!(min);
+            a["max"] = json!(max);
+        }
+        self.accessors.push(a);
+        self.accessors.len() - 1
     }
-    accessors.push(a);
-    accessors.len() - 1
+
+    /// Append `count` float vectors of `components` each as a new view and return its accessor.
+    fn float_accessor(
+        &mut self,
+        count: usize,
+        components: usize,
+        kind: &str,
+        values: impl IntoIterator<Item = f32>,
+        bounds: Option<([f32; 3], [f32; 3])>,
+    ) -> usize {
+        let view = self.view(count * components * 4);
+        for value in values {
+            self.bin.extend_from_slice(&value.to_le_bytes());
+        }
+        self.accessor(view, COMPONENT_FLOAT, count, kind, bounds)
+    }
 }
 
 /// Write decoded mesh data as a self-contained glTF 2.0 binary document.
+///
+/// Unity is left-handed: X is mirrored and triangle winding reversed to convert to glTF.
 pub fn write_glb(mesh: &DecodedMesh) -> Vec<u8> {
-    let mut bin = Vec::new();
-    let mut views = Vec::new();
-    let mut accessors = Vec::new();
+    let mut buffers = GlbBuffers::default();
+    let positions = || mesh.positions.iter().map(|p| [-p[0], p[1], p[2]]);
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    for p in &mesh.positions {
-        let p = [-p[0], p[1], p[2]];
+    for p in positions() {
         for i in 0..3 {
             min[i] = min[i].min(p[i]);
             max[i] = max[i].max(p[i]);
         }
     }
-    let v = view(&mut bin, &mut views, mesh.positions.len() * 12);
-    append_f32(
-        &mut bin,
-        mesh.positions.iter().flat_map(|p| [-p[0], p[1], p[2]]),
-    );
-    let position = accessor(
-        &mut accessors,
-        v,
-        5126,
+    let position = buffers.float_accessor(
         mesh.positions.len(),
+        3,
         "VEC3",
-        Some(min),
-        Some(max),
+        positions().flatten(),
+        Some((min, max)),
     );
     let mut attributes = serde_json::Map::new();
     attributes.insert("POSITION".into(), json!(position));
     if let Some(ns) = &mesh.normals {
-        let v = view(&mut bin, &mut views, ns.len() * 12);
-        append_f32(&mut bin, ns.iter().flat_map(|n| [-n[0], n[1], n[2]]));
-        let a = accessor(&mut accessors, v, 5126, ns.len(), "VEC3", None, None);
+        let values = ns.iter().flat_map(|n| [-n[0], n[1], n[2]]);
+        let a = buffers.float_accessor(ns.len(), 3, "VEC3", values, None);
         attributes.insert("NORMAL".into(), json!(a));
     }
     if let Some(ts) = &mesh.tangents {
-        let v = view(&mut bin, &mut views, ts.len() * 16);
-        append_f32(&mut bin, ts.iter().flat_map(|t| [-t[0], t[1], t[2], -t[3]]));
-        let a = accessor(&mut accessors, v, 5126, ts.len(), "VEC4", None, None);
+        let values = ts.iter().flat_map(|t| [-t[0], t[1], t[2], -t[3]]);
+        let a = buffers.float_accessor(ts.len(), 4, "VEC4", values, None);
         attributes.insert("TANGENT".into(), json!(a));
     }
     if let Some(cs) = &mesh.colors {
-        let v = view(&mut bin, &mut views, cs.len() * 16);
-        append_f32(&mut bin, cs.iter().flatten().copied());
-        let a = accessor(&mut accessors, v, 5126, cs.len(), "VEC4", None, None);
+        let a = buffers.float_accessor(cs.len(), 4, "VEC4", cs.iter().flatten().copied(), None);
         attributes.insert("COLOR_0".into(), json!(a));
     }
     for (i, uv) in mesh.uvs.iter().enumerate() {
-        let v = view(&mut bin, &mut views, uv.len() * 8);
-        append_f32(&mut bin, uv.iter().flat_map(|u| [u[0], 1.0 - u[1]]));
-        let a = accessor(&mut accessors, v, 5126, uv.len(), "VEC2", None, None);
+        let values = uv.iter().flat_map(|u| [u[0], 1.0 - u[1]]);
+        let a = buffers.float_accessor(uv.len(), 2, "VEC2", values, None);
         attributes.insert(format!("TEXCOORD_{i}"), json!(a));
     }
     let mut primitives = Vec::new();
@@ -468,28 +478,30 @@ pub fn write_glb(mesh: &DecodedMesh) -> Vec<u8> {
         let max_index = *sub.iter().max().unwrap();
         let short = max_index <= u16::MAX as u32;
         let byte_len = sub.len() * if short { 2 } else { 4 };
-        let v = view(&mut bin, &mut views, byte_len);
+        let v = buffers.view(byte_len);
         for tri in sub.as_chunks::<3>().0 {
             for index in [tri[0], tri[2], tri[1]] {
                 if short {
-                    bin.extend_from_slice(&(index as u16).to_le_bytes());
+                    buffers.bin.extend_from_slice(&(index as u16).to_le_bytes());
                 } else {
-                    bin.extend_from_slice(&index.to_le_bytes());
+                    buffers.bin.extend_from_slice(&index.to_le_bytes());
                 }
             }
         }
-        let a = accessor(
-            &mut accessors,
-            v,
-            if short { 5123 } else { 5125 },
-            sub.len(),
-            "SCALAR",
-            None,
-            None,
-        );
+        let component = if short {
+            COMPONENT_UNSIGNED_SHORT
+        } else {
+            COMPONENT_UNSIGNED_INT
+        };
+        let a = buffers.accessor(v, component, sub.len(), "SCALAR", None);
         primitives.push(json!({"attributes":attributes,"indices":a,"mode":4}));
     }
-    pad(&mut bin);
+    buffers.pad();
+    let GlbBuffers {
+        bin,
+        views,
+        accessors,
+    } = buffers;
     let document = json!({"asset":{"version":"2.0","generator":"fluorite"},"buffers":[{"byteLength":bin.len()}],"bufferViews":views,"accessors":accessors,"meshes":[{"name":mesh.name,"primitives":primitives}],"nodes":[{"name":mesh.name,"mesh":0}],"scenes":[{"nodes":[0]}],"scene":0});
     let mut json_bytes = serde_json::to_vec(&document).unwrap();
     while !json_bytes.len().is_multiple_of(4) {
@@ -549,33 +561,30 @@ pub fn extract_meshes(
                 }
             },
         };
+        let mesh_name = mesh.get("m_Name").and_then(Value::as_str);
         let glb = match mesh_to_glb(&mesh, resources) {
             Ok(glb) => glb,
             // Empty placeholder meshes are common and not worth reporting.
             Err(error) if error == "mesh has no vertices" => continue,
             Err(error) => {
-                let name = mesh.get("m_Name").and_then(Value::as_str).unwrap_or("");
+                let name = mesh_name.unwrap_or("");
                 eprintln!("  FAIL mesh {name} ({}): {error}", obj.path_id);
                 result.failed += 1;
                 continue;
             }
         };
-        let mut name = mesh
-            .get("m_Name")
-            .and_then(Value::as_str)
-            .map(|n| sanitize_filename(n).replace(['/', '\\'], "_"))
-            .unwrap_or_default();
+        let mut name = mesh_name.map(flat_filename).unwrap_or_default();
         if name.is_empty() {
             name = format!("mesh_{}", obj.path_id);
         }
-        let mut file_name = format!("{name}.glb");
-        let dir =
-            texture_layout::placement_dir(containers.get(&obj.path_id)).unwrap_or_else(|| {
-                // Unrelated chunks share `_unsorted/`; the path ID keeps names stable across runs.
-                file_name = format!("{name}__{}.glb", obj.path_id);
-                PathBuf::from("_unsorted")
-            });
-        let Some(path) = claim_path(out_dir.join(dir), &file_name, obj.path_id, seen) else {
+        let Some(path) = texture_layout::claim_object_path(
+            out_dir,
+            containers.get(&obj.path_id),
+            PathBuf::from("_unsorted"),
+            &format!("{name}.glb"),
+            obj.path_id,
+            seen,
+        ) else {
             continue;
         };
         if write_file(&path, &glb) {

@@ -1,8 +1,10 @@
-/// TextAsset and MonoBehaviour export, laid out by AssetBundle container path.
+//! TextAsset and MonoBehaviour export, laid out by AssetBundle container path.
 use crate::extraction::texture_layout::{self, Placement};
 use crate::extraction::unity::SerializedFile;
 use crate::extraction::unity_extract::{get_script_type_name, parse_text_asset};
-use crate::extraction::utils::{fit_filename, remove_dir_all_retry, sanitize_filename};
+use crate::extraction::utils::{
+    flat_filename, remove_dir_all_retry, sanitize_filename, split_extension, write_file,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,15 +70,6 @@ pub fn sniff_extension(content: &[u8]) -> Option<&'static str> {
         .map(|(_, ext)| *ext)
 }
 
-/// Split a trailing `.ext` (1-8 alphanumeric chars) off a file name.
-fn split_extension(name: &str) -> Option<(&str, &str)> {
-    let (stem, ext) = name.rsplit_once('.')?;
-    (!stem.is_empty()
-        && (1..=8).contains(&ext.len())
-        && ext.chars().all(|c| c.is_ascii_alphanumeric()))
-    .then_some((stem, ext))
-}
-
 fn classify(content: &[u8]) -> TextKind {
     match std::str::from_utf8(content) {
         Ok(text) if serde_json::from_str::<serde_json::Value>(text).is_ok() => TextKind::Json,
@@ -96,7 +89,7 @@ pub fn text_asset_filename(
     content: &[u8],
 ) -> (String, TextKind) {
     let kind = classify(content);
-    let safe = sanitize_filename(name).replace(['/', '\\'], "_");
+    let safe = flat_filename(name);
     let container_ext = container
         .and_then(|path| path.rsplit('/').next())
         .and_then(split_extension)
@@ -133,52 +126,6 @@ pub fn text_asset_filename(
     (format!("{stem}.{ext}"), kind)
 }
 
-/// Pick a unique path for `file_name` in `dir`, suffixing the path ID on collision.
-///
-/// `seen` is scoped to one SerializedFile, so the result is deterministic per object.
-pub(crate) fn claim_path(
-    dir: PathBuf,
-    file_name: &str,
-    path_id: i64,
-    seen: &mut HashSet<PathBuf>,
-) -> Option<PathBuf> {
-    let file_name = &fit_filename(file_name, path_id);
-    let path = dir.join(file_name);
-    if seen.insert(path.clone()) {
-        return Some(path);
-    }
-    let renamed = match split_extension(file_name) {
-        Some((stem, ext)) => format!("{stem}__{path_id}.{ext}"),
-        None => format!("{file_name}__{path_id}"),
-    };
-    let path = dir.join(renamed);
-    seen.insert(path.clone()).then_some(path)
-}
-
-/// Write a file atomically (temporary file + rename) so a crash never leaves it truncated.
-pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> bool {
-    if let Some(parent) = path.parent()
-        && fs::create_dir_all(parent).is_err()
-    {
-        return false;
-    }
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    fs::write(&tmp, bytes)
-        .and_then(|()| fs::rename(&tmp, path))
-        .is_ok()
-}
-
-/// Make a name unique for `_unsorted/`, where unrelated chunks share one directory.
-///
-/// Suffixing the path ID keeps each object's output path stable across incremental runs.
-fn unsorted_name(file_name: &str, path_id: i64) -> String {
-    match split_extension(file_name) {
-        Some((stem, ext)) => format!("{stem}__{path_id}.{ext}"),
-        None => format!("{file_name}__{path_id}"),
-    }
-}
-
 fn container_path(placement: Option<&Placement>) -> Option<&str> {
     match placement? {
         Placement::Direct(path) => Some(path),
@@ -205,12 +152,15 @@ pub fn extract_text_assets(
             continue;
         }
         let placement = containers.get(&obj.path_id);
-        let (mut file_name, kind) = text_asset_filename(&name, container_path(placement), &content);
-        let dir = texture_layout::placement_dir(placement).unwrap_or_else(|| {
-            file_name = unsorted_name(&file_name, obj.path_id);
-            PathBuf::from("_unsorted")
-        });
-        let Some(path) = claim_path(out_dir.join(dir), &file_name, obj.path_id, seen) else {
+        let (file_name, kind) = text_asset_filename(&name, container_path(placement), &content);
+        let Some(path) = texture_layout::claim_object_path(
+            out_dir,
+            placement,
+            PathBuf::from("_unsorted"),
+            &file_name,
+            obj.path_id,
+            seen,
+        ) else {
             continue;
         };
         let pretty = (kind == TextKind::Json)
@@ -252,7 +202,7 @@ pub fn extract_monobehaviours(
             .peek_name(obj)
             .ok()
             .flatten()
-            .map(|n| sanitize_filename(&n).replace(['/', '\\'], "_"))
+            .map(|n| flat_filename(&n))
             .filter(|n| !n.is_empty())
             .or_else(|| {
                 // Unnamed assets take their container's file name.
@@ -264,12 +214,14 @@ pub fn extract_monobehaviours(
                 )
             })
             .unwrap_or_else(|| format!("{type_name}_{}", obj.path_id));
-        let mut file_name = format!("{name}.json");
-        let dir = texture_layout::placement_dir(placement).unwrap_or_else(|| {
-            file_name = unsorted_name(&file_name, obj.path_id);
-            Path::new("_unsorted").join(&type_name)
-        });
-        let Some(path) = claim_path(out_dir.join(dir), &file_name, obj.path_id, seen) else {
+        let Some(path) = texture_layout::claim_object_path(
+            out_dir,
+            placement,
+            Path::new("_unsorted").join(&type_name),
+            &format!("{name}.json"),
+            obj.path_id,
+            seen,
+        ) else {
             continue;
         };
         let Ok(value) = sf.read_object(obj) else {

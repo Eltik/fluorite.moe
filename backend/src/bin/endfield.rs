@@ -1,37 +1,41 @@
-/// Unified CLI for Arknights Endfield asset extraction.
-///
-/// Subcommands:
-///   info          — show game config, version, patch info
-///   extract       — extract Unity assets (TextAssets, textures, MonoBehaviours, meshes)
-///   extract-file  — extract a single .chk by name
-///   decrypt       — extract BLC-catalogued VFS directories (tables, json, lua, audio, video)
-///   update        — incremental extraction of everything that changed upstream
-///   repair        — flip textures extracted before the orientation fix, in place
-///   list          — list all VFS directories and files
-///   scan          — scan for asset names/paths
-///   survey        — survey all Unity objects, types, counts
-use backend::extraction::blc;
+//! Unified CLI for Arknights Endfield asset extraction.
+//!
+//! Subcommands:
+//!   info          — show game config, version, patch info
+//!   extract       — extract Unity assets (TextAssets, textures, MonoBehaviours, meshes)
+//!   extract-file  — extract a single .chk by name
+//!   decrypt       — extract BLC-catalogued VFS directories (tables, json, lua, audio, video)
+//!   update        — incremental extraction of everything that changed upstream
+//!   repair        — flip textures extracted before the orientation fix, in place
+//!   list          — list all VFS directories and files
+//!   scan          — scan for asset names/paths
+//!   survey        — survey all Unity objects, types, counts
+use backend::core::endfield::config::{PatchIndex, resolve_game_config};
+use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
 use backend::extraction::mesh;
-use backend::extraction::pipeline::{self, VFS_DIRS};
+use backend::extraction::pipeline::{self, ResolvedPipeline, VFS_DIRS};
 use backend::extraction::texture;
-use backend::extraction::texture_layout;
+use backend::extraction::texture_layout::{self, FlipError};
 use backend::extraction::texture_sort;
 use backend::extraction::unity::SerializedFile;
 use backend::extraction::unity_extract::{ChkContents, class_name, extract_chk_contents};
-use backend::extraction::update;
+use backend::extraction::unityfs_header::process_chk_file;
+use backend::extraction::update::{self, UpdateState};
 use backend::extraction::utils::{format_bytes, hex_dump, remove_dir_all_retry, sanitize_filename};
 use backend::extraction::vfs_decrypt;
 use backend::extraction::zip_range::ZipCentralDirectory;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use reqwest::Client;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -161,20 +165,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
             scan_all,
         } => {
-            let modes = if all || (!json && !textures && !gamedata && !meshes) {
-                ExtractModes {
-                    json: true,
-                    textures: true,
-                    gamedata: true,
-                    meshes: true,
-                }
-            } else {
-                ExtractModes {
-                    json,
-                    textures,
-                    gamedata,
-                    meshes,
-                }
+            let everything = all || !(json || textures || gamedata || meshes);
+            let modes = ExtractModes {
+                json: json || everything,
+                textures: textures || everything,
+                gamedata: gamedata || everything,
+                meshes: meshes || everything,
             };
             cmd_extract(&client, modes, dir, &output, scan_all).await
         }
@@ -213,6 +209,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::List => cmd_list(&client).await,
         Commands::Scan { scan_all } => cmd_scan(&client, scan_all).await,
         Commands::Survey { scan_all } => cmd_survey(&client, scan_all).await,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// shared helpers
+// ═══════════════════════════════════════════════════════════
+
+/// Print the version and archive size most subcommands open with.
+fn print_pipeline_summary(resolved: &ResolvedPipeline) {
+    println!("Version: {}", resolved.config.version);
+    println!("ZIP entries: {}\n", resolved.cd.len());
+}
+
+/// `.chk` files of a VFS directory to process: all of them, or only the smallest one.
+fn chk_candidates(cd: &ZipCentralDirectory, dir: &str, scan_all: bool) -> Vec<(String, u64)> {
+    let mut candidates = pipeline::list_chk_files(cd, dir);
+    if !scan_all {
+        candidates.truncate(1);
+    }
+    candidates
+}
+
+/// Download a `.chk`, reporting a failure instead of aborting the run.
+async fn download_or_report(
+    client: &Client,
+    cd: &ZipCentralDirectory,
+    name: &str,
+) -> Option<Vec<u8>> {
+    match pipeline::download_chk(client, cd, name).await {
+        Ok(data) => Some(data),
+        Err(e) => {
+            println!("    Download error: {}", e);
+            None
+        }
     }
 }
 
@@ -271,6 +301,23 @@ struct ExtractModes {
     meshes: bool,
 }
 
+/// Per-kind output directories under the extraction output root.
+struct OutputDirs {
+    gamedata: PathBuf,
+    textures: PathBuf,
+    meshes: PathBuf,
+}
+
+impl OutputDirs {
+    fn new(output: &Path) -> Self {
+        Self {
+            gamedata: output.join("gamedata"),
+            textures: output.join("textures"),
+            meshes: output.join("meshes"),
+        }
+    }
+}
+
 async fn cmd_extract(
     client: &Client,
     modes: ExtractModes,
@@ -292,33 +339,26 @@ async fn cmd_extract(
     println!("Modes: {}", names.join(", "));
 
     let resolved = pipeline::resolve_pipeline(client, false).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
-    let dirs: Vec<(&str, &str)> = if let Some(ref d) = dir_filter {
-        VFS_DIRS
+    let dirs: Vec<(&str, &str)> = match &dir_filter {
+        Some(d) => VFS_DIRS
             .iter()
-            .filter(|(hash, _)| hash == &d.as_str())
+            .filter(|(hash, _)| *hash == d.as_str())
             .copied()
-            .collect()
-    } else {
-        VFS_DIRS.to_vec()
+            .collect(),
+        None => VFS_DIRS.to_vec(),
     };
 
     let output = Path::new(output);
-    std::fs::create_dir_all(output)?;
-    let gamedata_dir = output.join("gamedata");
-    let tex_dir = output.join("textures");
-    let mesh_dir = output.join("meshes");
+    fs::create_dir_all(output)?;
+    let out_dirs = OutputDirs::new(output);
 
     let mut stats = ExtractStats::default();
 
     for (dir, desc) in &dirs {
         println!("--- {} ({}) ---", dir, desc);
-        let mut candidates = pipeline::list_chk_files(&resolved.cd, dir);
-        if !scan_all {
-            candidates.truncate(1);
-        }
+        let candidates = chk_candidates(&resolved.cd, dir, scan_all);
         println!("  Processing {} .chk file(s)\n", candidates.len());
 
         for (i, (name, size)) in candidates.iter().enumerate() {
@@ -334,21 +374,15 @@ async fn cmd_extract(
                 println!("  {} ({})", name, format_bytes(*size));
             }
 
-            let data = match pipeline::download_chk(client, &resolved.cd, name).await {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("    Download error: {}", e);
-                    continue;
-                }
+            let Some(data) = download_or_report(client, &resolved.cd, name).await else {
+                continue;
             };
 
             let options = ChkExtractOptions {
                 chk_name: name,
                 modes,
                 skip_existing_textures: false,
-                gamedata_dir: &gamedata_dir,
-                tex_dir: &tex_dir,
-                mesh_dir: &mesh_dir,
+                out_dirs: &out_dirs,
             };
             process_chk_contents(&data, &options, &mut stats);
         }
@@ -356,7 +390,7 @@ async fn cmd_extract(
     }
 
     if modes.textures {
-        match texture_layout::rebuild_index(&tex_dir) {
+        match texture_layout::rebuild_index(&out_dirs.textures) {
             Ok(count) => println!("  Texture index entries: {count}"),
             Err(error) => eprintln!("  FAIL rebuild texture index: {error}"),
         }
@@ -416,9 +450,7 @@ struct ChkExtractOptions<'a> {
     modes: ExtractModes,
     /// Keep PNGs already on disk (only safe when they match the current texture layout).
     skip_existing_textures: bool,
-    gamedata_dir: &'a Path,
-    tex_dir: &'a Path,
-    mesh_dir: &'a Path,
+    out_dirs: &'a OutputDirs,
 }
 
 /// Process one downloaded `.chk`.
@@ -440,14 +472,14 @@ fn process_chk_contents(
         chk.resources.len()
     );
     let modes = options.modes;
+    let out_dirs = options.out_dirs;
     let mut tex_entries = Vec::new();
     let write_errors_before = stats.gamedata.write_errors;
     let mut write_errors = 0u64;
     let mut parsed = 0usize;
     for sf_bytes in &chk.sf_data {
-        let sf = match SerializedFile::parse(sf_bytes.clone()) {
-            Ok(sf) => sf,
-            Err(_) => continue,
+        let Ok(sf) = SerializedFile::parse(sf_bytes.clone()) else {
+            continue;
         };
         parsed += 1;
         let containers = texture_layout::container_map(&sf);
@@ -457,7 +489,7 @@ fn process_chk_contents(
             gamedata::extract_text_assets(
                 &sf,
                 &containers,
-                options.gamedata_dir,
+                &out_dirs.gamedata,
                 &mut seen,
                 &mut stats.gamedata,
             );
@@ -466,7 +498,7 @@ fn process_chk_contents(
             gamedata::extract_monobehaviours(
                 &sf,
                 &containers,
-                options.gamedata_dir,
+                &out_dirs.gamedata,
                 &mut seen,
                 &mut stats.gamedata,
             );
@@ -475,7 +507,7 @@ fn process_chk_contents(
             let result = texture::extract_textures(
                 &sf,
                 &chk.resources,
-                options.tex_dir,
+                &out_dirs.textures,
                 options.skip_existing_textures,
             );
             stats.total_tex_extracted += result.extracted;
@@ -489,7 +521,7 @@ fn process_chk_contents(
                 &sf,
                 &containers,
                 &chk.resources,
-                options.mesh_dir,
+                &out_dirs.meshes,
                 &mut seen,
             );
             stats.total_meshes += result.exported;
@@ -499,7 +531,7 @@ fn process_chk_contents(
     }
     if modes.textures
         && let Err(error) =
-            texture_layout::write_chk_index(options.tex_dir, options.chk_name, &tex_entries)
+            texture_layout::write_chk_index(&out_dirs.textures, options.chk_name, &tex_entries)
     {
         eprintln!(
             "    FAIL write texture index for {}: {}",
@@ -613,6 +645,36 @@ fn compressed_total<'a>(cd: &ZipCentralDirectory, names: impl Iterator<Item = &'
         .sum()
 }
 
+/// One finished chunk download: its name, the caller's data, and the bytes or an error.
+type ChunkDownload<T> = (String, T, Result<Vec<u8>, String>);
+
+/// Download chunks as spawned tasks (at most 4 in flight), yielded in input order.
+///
+/// Spawning keeps downloads progressing while the caller decodes the current chunk; memory
+/// stays bounded to the in-flight window.
+fn download_chunks<T: Send + 'static>(
+    client: &Client,
+    cd: &Arc<ZipCentralDirectory>,
+    progress: &DownloadProgress,
+    chunks: Vec<(String, T)>,
+) -> impl Stream<Item = Result<ChunkDownload<T>, tokio::task::JoinError>> + use<T> {
+    let client = client.clone();
+    let cd = Arc::clone(cd);
+    let downloaded = Arc::clone(&progress.downloaded);
+    stream::iter(chunks.into_iter().map(move |(name, extra)| {
+        let client = client.clone();
+        let cd = Arc::clone(&cd);
+        let downloaded = Arc::clone(&downloaded);
+        tokio::spawn(async move {
+            let result = pipeline::download_chk_counting(&client, &cd, &name, &downloaded)
+                .await
+                .map_err(|e| e.to_string());
+            (name, extra, result)
+        })
+    }))
+    .buffered(4)
+}
+
 struct UpdateOptions {
     force: bool,
     check: bool,
@@ -623,19 +685,28 @@ struct UpdateOptions {
     progress: bool,
 }
 
+/// Inputs shared by every phase of one `update` run.
+struct UpdateContext<'a> {
+    client: &'a Client,
+    resolved: &'a ResolvedPipeline,
+    state_path: &'a Path,
+    force: bool,
+    progress: bool,
+}
+
 /// Lock the update state so concurrent `update`/`repair` runs bail out instead of racing.
 /// Returns `None` when another run holds the lock.
 fn lock_state(state_path: &Path) -> Result<Option<File>, Box<dyn std::error::Error>> {
     if let Some(parent) = state_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
     let mut lock_name = state_path.as_os_str().to_os_string();
     lock_name.push(".lock");
     let lock = File::create(PathBuf::from(lock_name))?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(lock)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
     }
 }
 
@@ -661,14 +732,9 @@ async fn cmd_update(
 
     let mut state = update::load_state(state_path)?;
     emit_progress(progress, "resolve", 0, 0, "checking launcher");
-    let config = backend::core::endfield::config::resolve_game_config(
-        client,
-        &pipeline::default_resolve_params(),
-    )
-    .await?;
+    let config = resolve_game_config(client, &pipeline::default_resolve_params()).await?;
     let fingerprint = update::fingerprint(&config);
-    let current = state.fingerprint == fingerprint;
-    if current && !force {
+    if state.fingerprint == fingerprint && !force {
         println!(
             "up to date ({} / res {})",
             config.version, config.res_version
@@ -685,32 +751,96 @@ async fn cmd_update(
 
     emit_progress(progress, "resolve", 0, 0, "reading archive index");
     let resolved = pipeline::resolve_pipeline_from_config(client, config, true).await?;
-    let mut chk_dirty = 0u64;
-    let mut chk_ok = 0u64;
-    let mut chk_failed = 0u64;
-    let mut sort_failed = 0u64;
-    let mut sort_moved = 0u64;
-    let mut sort_chks = 0u64;
-    let mut blc_dirty = 0u64;
-    let mut blc_ok = 0u64;
-    let mut blc_failed = 0u64;
-    let mut stats = ExtractStats::default();
-    let gamedata_dir = output.join("gamedata");
-    let tex_dir = output.join("textures");
-    let mesh_dir = output.join("meshes");
-    std::fs::create_dir_all(&gamedata_dir)?;
+    let ctx = UpdateContext {
+        client,
+        resolved: &resolved,
+        state_path,
+        force,
+        progress,
+    };
+    let out_dirs = OutputDirs::new(output);
+    fs::create_dir_all(&out_dirs.gamedata)?;
+    let modes = ExtractModes {
+        json: true,
+        textures: !no_textures,
+        gamedata: true,
+        meshes: !no_meshes,
+    };
 
-    let mut existing_chks = HashSet::new();
+    let plan = plan_chunks(&resolved.cd, &state, force, modes);
+    state.chk.retain(|name, _| plan.existing.contains(name));
+    let chk = extract_dirty_chunks(&ctx, &mut state, &out_dirs, modes, plan.dirty).await?;
+    let sort = sort_legacy_chunks(&ctx, &mut state, &out_dirs.textures, plan.sort).await?;
+    if !no_textures {
+        clean_texture_outputs(
+            &out_dirs.textures,
+            &plan.existing,
+            &state,
+            chk.failed == 0 && sort.failed == 0,
+        );
+    }
+    if chk.failed == 0 {
+        clean_legacy_gamedata(&out_dirs.gamedata, &state);
+    }
+    let blc = extract_blc_directories(&ctx, &mut state, output, &skip_dirs).await?;
+
+    let failures = chk.failed + sort.failed + blc.failed;
+    if !skip_dirs.is_empty() {
+        // Left unrecorded so a later run without --skip-dir still fetches those directories.
+        println!("skipped BLC directories: {}", skip_dirs.join(", "));
+    } else if failures == 0 {
+        state.fingerprint = fingerprint;
+        state.version = resolved.config.version.clone();
+        state.res_version = resolved.config.res_version.clone();
+        state.updated_at = Utc::now().to_rfc3339();
+        update::save_state(state_path, &state)?;
+    }
+    fs::create_dir_all(output)?;
+    let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
+        "chk_dirty": chk.dirty, "chk_ok": chk.ok, "chk_failed": chk.failed, "sort_chks": sort.chks, "sort_moved": sort.moved, "sort_failed": sort.failed, "blc_dirty": blc.dirty, "blc_ok": blc.ok, "blc_failed": blc.failed,
+        "duration_secs": started.elapsed().as_secs_f64()});
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output.join("update-log.jsonl"))?;
+    writeln!(log, "{}", line)?;
+    println!(
+        "update: chk {}/{} ok, blc {}/{} ok, failures {failures}",
+        chk.ok, chk.dirty, blc.ok, blc.dirty
+    );
+    if failures > 0 {
+        return Err("update had failures".into());
+    }
+    Ok(())
+}
+
+/// How each upstream `.chk` is handled by this update run.
+struct ChunkPlan {
+    /// Every `.chk` currently in the archive.
+    existing: HashSet<String>,
+    /// Chunks to extract: name, new digest, and whether PNGs already on disk may be kept.
+    dirty: Vec<(String, (String, bool))>,
+    /// Unchanged chunks whose PNGs still sit in the legacy flat layout, with their new digest.
+    sort: Vec<(String, String)>,
+}
+
+fn plan_chunks(
+    cd: &ZipCentralDirectory,
+    state: &UpdateState,
+    force: bool,
+    modes: ExtractModes,
+) -> ChunkPlan {
+    let mut existing = HashSet::new();
     let mut dirty = Vec::new();
-    let mut sort_list = Vec::new();
+    let mut sort = Vec::new();
     for (dir, _) in VFS_DIRS {
-        for (name, _) in pipeline::list_chk_files(&resolved.cd, dir) {
-            let entry = resolved.cd.get(&name).expect("listed ZIP entry missing");
+        for (name, _) in pipeline::list_chk_files(cd, dir) {
+            let entry = cd.get(&name).expect("listed ZIP entry missing");
             let base = update::zip_digest(entry.crc32, entry.uncompressed_size);
-            let digest = update::chk_digest(&base, !no_textures, !no_meshes);
-            existing_chks.insert(name.clone());
-            if !no_textures && !force && state.chk.get(&name) == Some(&base) {
-                sort_list.push((name, digest));
+            let digest = update::chk_digest(&base, modes.textures, modes.meshes);
+            existing.insert(name.clone());
+            if modes.textures && !force && state.chk.get(&name) == Some(&base) {
+                sort.push((name, digest));
             } else if update::is_dirty(&state.chk, &name, &digest, force) {
                 // PNGs from an unchanged chunk in the current layout can be kept as-is.
                 let keep_textures = !force
@@ -719,43 +849,55 @@ async fn cmd_update(
                             .is_some_and(|tags| tags.starts_with('+'))
                             && update::textures_current(Some(old))
                     });
-                chk_dirty += 1;
-                dirty.push((name, digest, keep_textures));
+                dirty.push((name, (digest, keep_textures)));
             }
         }
     }
-    state.chk.retain(|name, _| existing_chks.contains(name));
     dirty.sort_by(|a, b| a.0.cmp(&b.0));
-    sort_list.sort_by(|a, b| a.0.cmp(&b.0));
-    // Downloads run as spawned tasks (at most 4 in flight) so they keep progressing while
-    // the current chk is being decoded; memory stays bounded to the in-flight window.
-    let mut chk_progress = DownloadProgress::start(
-        progress,
+    sort.sort_by(|a, b| a.0.cmp(&b.0));
+    ChunkPlan {
+        existing,
+        dirty,
+        sort,
+    }
+}
+
+struct ChunkCounts {
+    dirty: u64,
+    ok: u64,
+    failed: u64,
+}
+
+/// Download and extract every dirty chunk, checkpointing the state after each one.
+async fn extract_dirty_chunks(
+    ctx: &UpdateContext<'_>,
+    state: &mut UpdateState,
+    out_dirs: &OutputDirs,
+    modes: ExtractModes,
+    dirty: Vec<(String, (String, bool))>,
+) -> Result<ChunkCounts, Box<dyn std::error::Error>> {
+    let cd = &ctx.resolved.cd;
+    let mut counts = ChunkCounts {
+        dirty: dirty.len() as u64,
+        ok: 0,
+        failed: 0,
+    };
+    let mut stats = ExtractStats::default();
+    let mut progress = DownloadProgress::start(
+        ctx.progress,
         "chk",
-        compressed_total(&resolved.cd, dirty.iter().map(|(name, ..)| name)),
-        chk_dirty,
+        compressed_total(cd, dirty.iter().map(|(name, _)| name)),
+        counts.dirty,
     );
-    let chk_downloaded = Arc::clone(&chk_progress.downloaded);
-    let mut downloads = stream::iter(dirty.into_iter().map(|(name, digest, keep_textures)| {
-        let client = client.clone();
-        let cd = Arc::clone(&resolved.cd);
-        let downloaded = Arc::clone(&chk_downloaded);
-        tokio::spawn(async move {
-            let result = pipeline::download_chk_counting(&client, &cd, &name, &downloaded)
-                .await
-                .map_err(|e| e.to_string());
-            (name, digest, keep_textures, result)
-        })
-    }))
-    .buffered(4);
+    let mut downloads = download_chunks(ctx.client, cd, &progress, dirty);
     while let Some(joined) = downloads.next().await {
-        let (name, digest, keep_textures, result) = joined?;
-        chk_progress.chunk_done();
+        let (name, (digest, keep_textures), result) = joined?;
+        progress.chunk_done();
         let data = match result {
             Ok(data) => data,
             Err(e) => {
                 println!("  {}: download error: {}", name, e);
-                chk_failed += 1;
+                counts.failed += 1;
                 continue;
             }
         };
@@ -767,23 +909,16 @@ async fn cmd_update(
         {
             let stale = update::mark_textures_stale(old);
             state.chk.insert(name.clone(), stale);
-            update::save_state(state_path, &state)?;
+            update::save_state(ctx.state_path, state)?;
         }
         let ok = tokio::task::block_in_place(|| {
             process_chk_contents(
                 &data,
                 &ChkExtractOptions {
                     chk_name: &name,
-                    modes: ExtractModes {
-                        json: true,
-                        textures: !no_textures,
-                        gamedata: true,
-                        meshes: !no_meshes,
-                    },
+                    modes,
                     skip_existing_textures: keep_textures,
-                    gamedata_dir: &gamedata_dir,
-                    tex_dir: &tex_dir,
-                    mesh_dir: &mesh_dir,
+                    out_dirs,
                 },
                 &mut stats,
             )
@@ -791,155 +926,198 @@ async fn cmd_update(
         if ok {
             state.chk.insert(name, digest);
             // Checkpoint per chk so an interrupted run resumes instead of starting over.
-            update::save_state(state_path, &state)?;
-            chk_ok += 1;
+            update::save_state(ctx.state_path, state)?;
+            counts.ok += 1;
         } else {
             println!("  {}: not a valid VFS container", name);
-            chk_failed += 1;
+            counts.failed += 1;
         }
     }
-    chk_progress.finish();
-    update::save_state(state_path, &state)?;
-    if chk_dirty > 0 {
-        stats.print(ExtractModes {
-            json: true,
-            textures: !no_textures,
-            gamedata: true,
-            meshes: !no_meshes,
-        });
+    progress.finish();
+    update::save_state(ctx.state_path, state)?;
+    if counts.dirty > 0 {
+        stats.print(modes);
     }
+    Ok(counts)
+}
 
-    if !sort_list.is_empty() {
-        let sort_total = sort_list.len() as u64;
-        sort_chks = sort_total;
-        let mut sort_candidates = Vec::new();
-        let mut sorted_chks = Vec::new();
-        let mut sort_progress = DownloadProgress::start(
-            progress,
-            "sort",
-            compressed_total(&resolved.cd, sort_list.iter().map(|(name, _)| name)),
-            sort_total,
-        );
-        let sort_downloaded = Arc::clone(&sort_progress.downloaded);
-        let mut sort_downloads = stream::iter(sort_list.into_iter().map(|(name, digest)| {
-            let client = client.clone();
-            let cd = Arc::clone(&resolved.cd);
-            let downloaded = Arc::clone(&sort_downloaded);
-            tokio::spawn(async move {
-                let result = pipeline::download_chk_counting(&client, &cd, &name, &downloaded)
-                    .await
-                    .map_err(|e| e.to_string());
-                (name, digest, result)
-            })
-        }))
-        .buffered(4);
-        while let Some(joined) = sort_downloads.next().await {
-            let (name, digest, result) = joined?;
-            sort_progress.chunk_done();
-            let data = match result {
-                Ok(data) => data,
-                Err(error) => {
-                    println!("  {name}: download error: {error}");
-                    sort_failed += 1;
-                    continue;
-                }
-            };
-            let candidates = tokio::task::block_in_place(|| {
-                let chk = extract_chk_contents(&data)?;
-                Some(texture_sort::collect_candidates(&name, &chk))
-            });
-            let Some(candidates) = candidates else {
-                println!("  {name}: not a valid VFS container");
-                sort_failed += 1;
+#[derive(Default)]
+struct SortCounts {
+    chks: u64,
+    moved: u64,
+    failed: u64,
+}
+
+/// Move PNGs of unchanged chunks out of the legacy flat layout into the container layout.
+async fn sort_legacy_chunks(
+    ctx: &UpdateContext<'_>,
+    state: &mut UpdateState,
+    tex_dir: &Path,
+    sort_list: Vec<(String, String)>,
+) -> Result<SortCounts, Box<dyn std::error::Error>> {
+    let mut counts = SortCounts::default();
+    if sort_list.is_empty() {
+        return Ok(counts);
+    }
+    let cd = &ctx.resolved.cd;
+    counts.chks = sort_list.len() as u64;
+    let mut sort_candidates = Vec::new();
+    let mut sorted_chks = Vec::new();
+    let mut progress = DownloadProgress::start(
+        ctx.progress,
+        "sort",
+        compressed_total(cd, sort_list.iter().map(|(name, _)| name)),
+        counts.chks,
+    );
+    let mut downloads = download_chunks(ctx.client, cd, &progress, sort_list);
+    while let Some(joined) = downloads.next().await {
+        let (name, digest, result) = joined?;
+        progress.chunk_done();
+        let data = match result {
+            Ok(data) => data,
+            Err(error) => {
+                println!("  {name}: download error: {error}");
+                counts.failed += 1;
                 continue;
-            };
-            sort_candidates.extend(candidates);
-            sorted_chks.push((name, digest));
-        }
-        sort_progress.finish();
-        if sort_failed == 0 {
-            let report = texture_sort::sort_flat_textures(&tex_dir, &sort_candidates)?;
-            sort_moved = report.moved as u64;
-            for (name, _) in &sorted_chks {
-                let entries = report
-                    .moved_by_chk
-                    .get(name)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                texture_layout::write_chk_index(&tex_dir, name, entries)?;
             }
-            // Sorted PNGs come from the old decoder (upside down) and the chunk's gamedata and
-            // meshes are not extracted yet: record `+tex1` so `repair` flips them and the next
-            // update re-extracts the rest.
-            for (name, digest) in sorted_chks {
-                let base = digest.split('+').next().unwrap_or(&digest);
-                state.chk.insert(name, format!("{base}+tex1"));
-            }
-            update::save_state(state_path, &state)?;
-            println!(
-                "sort: moved {}, already sorted {}, ambiguous {} (see textures/_ambiguous/candidates.jsonl), missing {}, unmatched {}",
-                report.moved,
-                report.already_sorted,
-                report.ambiguous,
-                report.missing,
-                report.unmatched
-            );
-            if report.missing > 0 {
-                println!(
-                    "{} textures have no file (lost to flat-layout name collisions, or never decodable); run update --force to re-extract",
-                    report.missing
-                );
-            }
-        }
+        };
+        let candidates = tokio::task::block_in_place(|| {
+            let chk = extract_chk_contents(&data)?;
+            Some(texture_sort::collect_candidates(&name, &chk))
+        });
+        let Some(candidates) = candidates else {
+            println!("  {name}: not a valid VFS container");
+            counts.failed += 1;
+            continue;
+        };
+        sort_candidates.extend(candidates);
+        sorted_chks.push((name, digest));
     }
-
-    if !no_textures {
-        if let Err(error) = texture_layout::remove_chk_indexes_except(&tex_dir, &existing_chks) {
-            eprintln!("  FAIL remove stale texture indexes: {error}");
-        }
-        if chk_failed == 0 && sort_failed == 0 {
-            match texture_layout::remove_legacy_flat_textures(&tex_dir) {
-                Ok(removed) if removed > 0 => println!("removed {removed} legacy flat textures"),
-                Ok(_) => {}
-                Err(error) => eprintln!("  FAIL remove legacy flat textures: {error}"),
-            }
-            // Every chunk now has its full texture set in the container layout, which
-            // supersedes the textures the legacy sort could not place.
-            let all_current = state
-                .chk
-                .values()
-                .all(|digest| update::textures_current(Some(digest)));
-            let ambiguous = tex_dir.join("_ambiguous");
-            if all_current && ambiguous.is_dir() {
-                match remove_dir_all_retry(&ambiguous) {
-                    Ok(()) => println!("removed textures/_ambiguous"),
-                    Err(error) => eprintln!("  FAIL remove textures/_ambiguous: {error}"),
-                }
-            }
-        }
-        if let Err(error) = texture_layout::rebuild_index(&tex_dir) {
-            eprintln!("  FAIL rebuild texture index: {error}");
-        }
+    progress.finish();
+    if counts.failed > 0 {
+        return Ok(counts);
     }
+    let report = texture_sort::sort_flat_textures(tex_dir, &sort_candidates)?;
+    counts.moved = report.moved as u64;
+    for (name, _) in &sorted_chks {
+        let entries = report
+            .moved_by_chk
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        texture_layout::write_chk_index(tex_dir, name, entries)?;
+    }
+    // Sorted PNGs come from the old decoder (upside down) and the chunk's gamedata and
+    // meshes are not extracted yet: record `+tex1` so `repair` flips them and the next
+    // update re-extracts the rest.
+    for (name, digest) in sorted_chks {
+        state
+            .chk
+            .insert(name, update::sorted_legacy_digest(&digest));
+    }
+    update::save_state(ctx.state_path, state)?;
+    println!(
+        "sort: moved {}, already sorted {}, ambiguous {} (see textures/_ambiguous/candidates.jsonl), missing {}, unmatched {}",
+        report.moved, report.already_sorted, report.ambiguous, report.missing, report.unmatched
+    );
+    if report.missing > 0 {
+        println!(
+            "{} textures have no file (lost to flat-layout name collisions, or never decodable); run update --force to re-extract",
+            report.missing
+        );
+    }
+    Ok(counts)
+}
 
-    if chk_failed == 0 {
-        // Every dirty chunk was re-extracted into the container layout.
+/// Prune stale texture indexes and rebuild the combined one; once every chunk extracted
+/// cleanly (`remove_legacy`), also remove the legacy flat layout's leftovers.
+fn clean_texture_outputs(
+    tex_dir: &Path,
+    existing_chks: &HashSet<String>,
+    state: &UpdateState,
+    remove_legacy: bool,
+) {
+    if let Err(error) = texture_layout::remove_chk_indexes_except(tex_dir, existing_chks) {
+        eprintln!("  FAIL remove stale texture indexes: {error}");
+    }
+    if remove_legacy {
+        match texture_layout::remove_legacy_flat_textures(tex_dir) {
+            Ok(removed) if removed > 0 => println!("removed {removed} legacy flat textures"),
+            Ok(_) => {}
+            Err(error) => eprintln!("  FAIL remove legacy flat textures: {error}"),
+        }
+        // Every chunk now has its full texture set in the container layout, which
+        // supersedes the textures the legacy sort could not place.
         let all_current = state
             .chk
             .values()
-            .all(|digest| digest.contains(&format!("+x{}", update::EXTRACT_VERSION)));
-        if all_current {
-            match gamedata::remove_legacy_gamedata(&gamedata_dir) {
-                Ok(removed) if removed > 0 => println!("removed {removed} legacy gamedata entries"),
-                Ok(_) => {}
-                Err(error) => eprintln!("  FAIL remove legacy gamedata: {error}"),
+            .all(|digest| update::textures_current(Some(digest)));
+        let ambiguous = tex_dir.join("_ambiguous");
+        if all_current && ambiguous.is_dir() {
+            match remove_dir_all_retry(&ambiguous) {
+                Ok(()) => println!("removed textures/_ambiguous"),
+                Err(error) => eprintln!("  FAIL remove textures/_ambiguous: {error}"),
             }
         }
     }
+    if let Err(error) = texture_layout::rebuild_index(tex_dir) {
+        eprintln!("  FAIL rebuild texture index: {error}");
+    }
+}
 
+/// Remove the legacy flat gamedata once every chunk was re-extracted into the container layout.
+fn clean_legacy_gamedata(gamedata_dir: &Path, state: &UpdateState) {
+    let all_current = state
+        .chk
+        .values()
+        .all(|digest| update::extract_current(digest));
+    if all_current {
+        match gamedata::remove_legacy_gamedata(gamedata_dir) {
+            Ok(removed) if removed > 0 => println!("removed {removed} legacy gamedata entries"),
+            Ok(_) => {}
+            Err(error) => eprintln!("  FAIL remove legacy gamedata: {error}"),
+        }
+    }
+}
+
+struct BlcCounts {
+    dirty: u64,
+    ok: u64,
+    failed: u64,
+}
+
+/// Digest of a BLC directory: its catalog's ZIP identity plus every patch file under it.
+fn blc_digest(catalog_digest: String, patch_index: Option<&PatchIndex>, dir: &str) -> String {
+    let mut parts = vec![catalog_digest];
+    if let Some(index) = patch_index {
+        let mut patch: Vec<String> = index
+            .files
+            .iter()
+            .filter(|f| f.name.starts_with(&format!("{dir}/")))
+            .map(|f| format!("{}:{}", f.name, f.md5))
+            .collect();
+        patch.sort();
+        parts.extend(patch);
+    }
+    parts.join(";")
+}
+
+/// Extract every changed BLC directory not in `skip_dirs` into `<output>/decrypted/<group>`.
+async fn extract_blc_directories(
+    ctx: &UpdateContext<'_>,
+    state: &mut UpdateState,
+    output: &Path,
+    skip_dirs: &[String],
+) -> Result<BlcCounts, Box<dyn std::error::Error>> {
+    let resolved = ctx.resolved;
+    let mut counts = BlcCounts {
+        dirty: 0,
+        ok: 0,
+        failed: 0,
+    };
     let staging_parent = output.join("decrypted/.staging");
     let decrypted = output.join("decrypted");
-    std::fs::create_dir_all(&staging_parent)?;
+    fs::create_dir_all(&staging_parent)?;
     let upstream_dirs = pipeline::blc_directories(&resolved.cd);
     state.blc_dirs.retain(|dir, _| upstream_dirs.contains(dir));
     let blc_dirs: Vec<&String> = upstream_dirs
@@ -949,34 +1127,26 @@ async fn cmd_update(
     let blc_total = blc_dirs.len() as u64;
     for (i, dir) in blc_dirs.iter().enumerate() {
         let dir = dir.as_str();
-        emit_progress(progress, "blc", i as u64, blc_total, dir);
-        let blc_name = format!("Endfield_Data/StreamingAssets/VFS/{0}/{0}.blc", dir);
-        let Some(entry) = resolved.cd.get(&blc_name) else {
+        emit_progress(ctx.progress, "blc", i as u64, blc_total, dir);
+        let Some(entry) = resolved.cd.get(&pipeline::blc_path(dir)) else {
             state.blc_dirs.remove(dir);
             continue;
         };
-        let mut parts = vec![update::zip_digest(entry.crc32, entry.uncompressed_size)];
-        if let Some(index) = &resolved.patch_index {
-            let mut patch: Vec<String> = index
-                .files
-                .iter()
-                .filter(|f| f.name.starts_with(&format!("{dir}/")))
-                .map(|f| format!("{}:{}", f.name, f.md5))
-                .collect();
-            patch.sort();
-            parts.extend(patch);
-        }
-        let digest = parts.join(";");
-        if !update::is_dirty(&state.blc_dirs, dir, &digest, force) {
+        let digest = blc_digest(
+            update::zip_digest(entry.crc32, entry.uncompressed_size),
+            resolved.patch_index.as_ref(),
+            dir,
+        );
+        if !update::is_dirty(&state.blc_dirs, dir, &digest, ctx.force) {
             continue;
         }
-        blc_dirty += 1;
+        counts.dirty += 1;
         // Each directory stages under its own hash so a crash never leaves a half-written group.
         let staging = staging_parent.join(dir);
         if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
+            fs::remove_dir_all(&staging)?;
         }
-        match blc::extract_directory(client, &resolved, dir, &staging).await {
+        match blc::extract_directory(ctx.client, resolved, dir, &staging).await {
             Ok(result) if !result.errors.is_empty() => {
                 // Keep the previous complete copy; the directory stays dirty and is retried.
                 println!(
@@ -985,82 +1155,65 @@ async fn cmd_update(
                     result.errors.len(),
                     result.errors[0]
                 );
-                std::fs::remove_dir_all(&staging)?;
-                blc_failed += 1;
+                fs::remove_dir_all(&staging)?;
+                counts.failed += 1;
             }
             Ok(result) => {
-                let mut group = result
-                    .output
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dir.to_string());
-                // Another directory already owns this group folder: suffix ours with the hash.
-                let owner =
-                    std::fs::read_to_string(decrypted.join(&group).join("blc_metadata.txt"));
-                if owner.is_ok_and(|meta| {
-                    !meta
-                        .to_ascii_uppercase()
-                        .contains(&format!("({})", dir.to_ascii_uppercase()))
-                }) {
-                    group = format!("{group}-{dir}");
-                }
-                std::fs::create_dir_all(&decrypted)?;
-                let old = decrypted.join(format!(".old-{dir}"));
-                if old.exists() {
-                    std::fs::remove_dir_all(&old)?;
-                }
-                let final_dir = decrypted.join(&group);
-                if final_dir.exists() {
-                    std::fs::rename(&final_dir, &old)?;
-                }
-                std::fs::rename(&result.output, &final_dir)?;
-                std::fs::remove_dir_all(&staging)?;
-                if old.exists() {
-                    std::fs::remove_dir_all(old)?;
-                }
-                // Earlier versions wrote a flat `decrypted/<hash>/` directory.
-                let legacy = decrypted.join(dir);
-                if legacy != final_dir && legacy.is_dir() {
-                    std::fs::remove_dir_all(legacy)?;
-                }
+                install_blc_group(&decrypted, dir, &result, &staging)?;
                 state.blc_dirs.insert(dir.to_string(), digest);
-                update::save_state(state_path, &state)?;
-                blc_ok += 1;
+                update::save_state(ctx.state_path, state)?;
+                counts.ok += 1;
             }
             Err(error) => {
                 println!("  {dir}: {error}");
-                blc_failed += 1;
+                counts.failed += 1;
             }
         }
     }
-    emit_progress(progress, "blc", blc_total, blc_total, "");
-    update::save_state(state_path, &state)?;
-    let failures = chk_failed + sort_failed + blc_failed;
-    if !skip_dirs.is_empty() {
-        // Left unrecorded so a later run without --skip-dir still fetches those directories.
-        println!("skipped BLC directories: {}", skip_dirs.join(", "));
-    } else if failures == 0 {
-        state.fingerprint = fingerprint;
-        state.version = resolved.config.version.clone();
-        state.res_version = resolved.config.res_version.clone();
-        state.updated_at = Utc::now().to_rfc3339();
-        update::save_state(state_path, &state)?;
+    emit_progress(ctx.progress, "blc", blc_total, blc_total, "");
+    update::save_state(ctx.state_path, state)?;
+    Ok(counts)
+}
+
+/// Swap a fully staged BLC directory into `decrypted/<group>`, replacing the previous copy.
+fn install_blc_group(
+    decrypted: &Path,
+    dir: &str,
+    result: &DirExtractResult,
+    staging: &Path,
+) -> std::io::Result<()> {
+    let mut group = result
+        .output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string());
+    // Another directory already owns this group folder: suffix ours with the hash.
+    let owner = fs::read_to_string(decrypted.join(&group).join("blc_metadata.txt"));
+    if owner.is_ok_and(|meta| {
+        !meta
+            .to_ascii_uppercase()
+            .contains(&format!("({})", dir.to_ascii_uppercase()))
+    }) {
+        group = format!("{group}-{dir}");
     }
-    std::fs::create_dir_all(output)?;
-    let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
-        "chk_dirty": chk_dirty, "chk_ok": chk_ok, "chk_failed": chk_failed, "sort_chks": sort_chks, "sort_moved": sort_moved, "sort_failed": sort_failed, "blc_dirty": blc_dirty, "blc_ok": blc_ok, "blc_failed": blc_failed,
-        "duration_secs": started.elapsed().as_secs_f64()});
-    use std::io::Write;
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output.join("update-log.jsonl"))?;
-    writeln!(log, "{}", line)?;
-    println!(
-        "update: chk {chk_ok}/{chk_dirty} ok, blc {blc_ok}/{blc_dirty} ok, failures {failures}"
-    );
-    if failures > 0 {
-        return Err("update had failures".into());
+    fs::create_dir_all(decrypted)?;
+    let old = decrypted.join(format!(".old-{dir}"));
+    if old.exists() {
+        fs::remove_dir_all(&old)?;
+    }
+    let final_dir = decrypted.join(&group);
+    if final_dir.exists() {
+        fs::rename(&final_dir, &old)?;
+    }
+    fs::rename(&result.output, &final_dir)?;
+    fs::remove_dir_all(staging)?;
+    if old.exists() {
+        fs::remove_dir_all(old)?;
+    }
+    // Earlier versions wrote a flat `decrypted/<hash>/` directory.
+    let legacy = decrypted.join(dir);
+    if legacy != final_dir && legacy.is_dir() {
+        fs::remove_dir_all(legacy)?;
     }
     Ok(())
 }
@@ -1095,103 +1248,23 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
     for (i, name) in stale.iter().enumerate() {
         let index = texture_layout::chk_index_path(&tex_dir, name);
         let journal_path = index.with_extension("flipped");
-        let done: HashSet<String> = std::fs::read_to_string(&journal_path)
+        let done: HashSet<String> = fs::read_to_string(&journal_path)
             .map(|text| text.lines().map(str::to_string).collect())
             .unwrap_or_default();
-        // Deduplicated: two workers flipping one file would undo each other.
-        let mut index_missing = false;
-        let paths: Vec<String> = match std::fs::read_to_string(&index) {
-            Ok(text) => text
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .filter_map(|entry| entry.get("path")?.as_str().map(str::to_string))
-                .filter(|path| !done.contains(path))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                index_missing = true;
-                Vec::new()
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let journal = std::sync::Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&journal_path)?,
-        );
-        let next = AtomicU64::new(0);
-        let (flipped, missing, corrupt, failed) = (
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-        );
-        let abort = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    while !abort.load(Ordering::Relaxed)
-                        && let Some(relative) =
-                            paths.get(next.fetch_add(1, Ordering::Relaxed) as usize)
-                    {
-                        let path = tex_dir.join(relative);
-                        if !path.is_file() {
-                            // Never extracted; the next update decodes it fresh.
-                            missing.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        let tmp = match texture_layout::write_flipped_png(&path) {
-                            Ok(tmp) => tmp,
-                            Err(texture_layout::FlipError::Corrupt(error)) => {
-                                // Likely truncated by a crash. Removing it lets the next
-                                // update decode the texture again.
-                                eprintln!("  removing unreadable {}: {error}", path.display());
-                                match std::fs::remove_file(&path) {
-                                    Ok(()) => corrupt.fetch_add(1, Ordering::Relaxed),
-                                    Err(_) => failed.fetch_add(1, Ordering::Relaxed),
-                                };
-                                continue;
-                            }
-                            Err(error) => {
-                                eprintln!("  FAIL flip {}: {error}", path.display());
-                                failed.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                        };
-                        // Record the flip before it lands: if the journal cannot be
-                        // written the original stays untouched and the run stops.
-                        let recorded = {
-                            use std::io::Write;
-                            let mut journal = journal.lock().unwrap();
-                            journal
-                                .write_all(format!("{relative}\n").as_bytes())
-                                .is_ok()
-                        };
-                        if !recorded {
-                            let _ = std::fs::remove_file(&tmp);
-                            failed.fetch_add(1, Ordering::Relaxed);
-                            abort.store(true, Ordering::Relaxed);
-                            continue;
-                        }
-                        match std::fs::rename(&tmp, &path) {
-                            Ok(()) => flipped.fetch_add(1, Ordering::Relaxed),
-                            Err(error) => {
-                                eprintln!("  FAIL replace {}: {error}", path.display());
-                                failed.fetch_add(1, Ordering::Relaxed)
-                            }
-                        };
-                    }
-                });
-            }
-        });
-        let (flipped, missing, corrupt, failed) = (
-            flipped.into_inner(),
-            missing.into_inner(),
-            corrupt.into_inner(),
-            failed.into_inner(),
-        );
+        let pending = pending_index_paths(&index, &done)?;
+        let index_missing = pending.is_none();
+        let paths = pending.unwrap_or_default();
+        let journal = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal_path)?;
+        let (counts, aborted) = flip_textures(&tex_dir, &paths, journal, workers);
+        let FlipCounts {
+            flipped,
+            missing,
+            corrupt,
+            failed,
+        } = counts;
         println!(
             "[{}/{}] {}: flipped {flipped}, missing {missing}, removed unreadable {corrupt}, failed {failed}",
             i + 1,
@@ -1199,10 +1272,9 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
             name.rsplit('/').next().unwrap_or(name)
         );
         flipped_total += flipped;
-        missing_total += missing;
-        missing_total += corrupt;
+        missing_total += missing + corrupt;
         failed_total += failed;
-        if abort.into_inner() {
+        if aborted {
             return Err(format!("could not write {}", journal_path.display()).into());
         }
         if failed == 0 {
@@ -1218,7 +1290,7 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
             };
             state.chk.insert(name.clone(), digest);
             update::save_state(state_path, &state)?;
-            std::fs::remove_file(&journal_path)?;
+            fs::remove_file(&journal_path)?;
         }
     }
     println!(
@@ -1228,6 +1300,136 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
         return Err("repair had failures; rerun to retry".into());
     }
     Ok(())
+}
+
+/// Texture paths listed in a chunk index and not yet journaled as done, or `None` when the
+/// index does not exist.
+///
+/// Deduplicated: two workers flipping one file would undo each other.
+fn pending_index_paths(
+    index: &Path,
+    done: &HashSet<String>,
+) -> std::io::Result<Option<Vec<String>>> {
+    match fs::read_to_string(index) {
+        Ok(text) => Ok(Some(
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|entry| entry.get("path")?.as_str().map(str::to_string))
+                .filter(|path| !done.contains(path))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Per-chunk results of flipping PNGs in place.
+struct FlipCounts {
+    flipped: u64,
+    /// Listed but never extracted; the next update decodes them fresh.
+    missing: u64,
+    /// Unreadable files that were removed so the next update decodes them again.
+    corrupt: u64,
+    failed: u64,
+}
+
+enum FlipOutcome {
+    Flipped,
+    Missing,
+    RemovedCorrupt,
+    Failed,
+    /// The flip could not be journaled; the original is untouched and the run must stop.
+    JournalFailed,
+}
+
+/// Flip `paths` (relative to `tex_dir`) on `workers` threads, journaling each file before its
+/// flipped copy replaces it. Also returns whether a journal write failed.
+fn flip_textures(
+    tex_dir: &Path,
+    paths: &[String],
+    journal: File,
+    workers: usize,
+) -> (FlipCounts, bool) {
+    let journal = Mutex::new(journal);
+    let next = AtomicU64::new(0);
+    let (flipped, missing, corrupt, failed) = (
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    );
+    let abort = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while !abort.load(Ordering::Relaxed)
+                    && let Some(relative) = paths.get(next.fetch_add(1, Ordering::Relaxed) as usize)
+                {
+                    let counter = match flip_one(tex_dir, relative, &journal) {
+                        FlipOutcome::Flipped => &flipped,
+                        FlipOutcome::Missing => &missing,
+                        FlipOutcome::RemovedCorrupt => &corrupt,
+                        FlipOutcome::Failed => &failed,
+                        FlipOutcome::JournalFailed => {
+                            abort.store(true, Ordering::Relaxed);
+                            &failed
+                        }
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let counts = FlipCounts {
+        flipped: flipped.into_inner(),
+        missing: missing.into_inner(),
+        corrupt: corrupt.into_inner(),
+        failed: failed.into_inner(),
+    };
+    (counts, abort.into_inner())
+}
+
+fn flip_one(tex_dir: &Path, relative: &str, journal: &Mutex<File>) -> FlipOutcome {
+    let path = tex_dir.join(relative);
+    if !path.is_file() {
+        return FlipOutcome::Missing;
+    }
+    let tmp = match texture_layout::write_flipped_png(&path) {
+        Ok(tmp) => tmp,
+        Err(FlipError::Corrupt(error)) => {
+            // Likely truncated by a crash. Removing it lets the next update decode the
+            // texture again.
+            eprintln!("  removing unreadable {}: {error}", path.display());
+            return match fs::remove_file(&path) {
+                Ok(()) => FlipOutcome::RemovedCorrupt,
+                Err(_) => FlipOutcome::Failed,
+            };
+        }
+        Err(error) => {
+            eprintln!("  FAIL flip {}: {error}", path.display());
+            return FlipOutcome::Failed;
+        }
+    };
+    // Record the flip before it lands: if the journal cannot be written the original stays
+    // untouched and the run stops.
+    let recorded = journal
+        .lock()
+        .unwrap()
+        .write_all(format!("{relative}\n").as_bytes())
+        .is_ok();
+    if !recorded {
+        let _ = fs::remove_file(&tmp);
+        return FlipOutcome::JournalFailed;
+    }
+    match fs::rename(&tmp, &path) {
+        Ok(()) => FlipOutcome::Flipped,
+        Err(error) => {
+            eprintln!("  FAIL replace {}: {error}", path.display());
+            FlipOutcome::Failed
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1243,10 +1445,8 @@ async fn cmd_extract_file(
     println!("=== Extract Single File ===\n");
 
     let resolved = pipeline::resolve_pipeline(client, false).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
-    // Find the .chk file
     let matching: Vec<String> = resolved
         .cd
         .filenames()
@@ -1278,10 +1478,10 @@ async fn cmd_extract_file(
         return Ok(());
     }
 
-    let assets = backend::extraction::unityfs_header::process_chk_file(&data)?;
+    let assets = process_chk_file(&data)?;
     println!("{} assets from VFS pipeline\n", assets.len());
 
-    std::fs::create_dir_all(output)?;
+    fs::create_dir_all(output)?;
 
     for (i, asset) in assets.iter().enumerate() {
         if asset.is_unityfs {
@@ -1310,7 +1510,7 @@ async fn cmd_extract_file(
         }
 
         let save_path = format!("{}/{}", output, sanitize_filename(&asset.vfs_name));
-        std::fs::write(&save_path, &asset.data)?;
+        fs::write(&save_path, &asset.data)?;
         println!("  → saved to {}", save_path);
     }
 
@@ -1330,11 +1530,10 @@ async fn cmd_decrypt(
     println!("=== ChaCha20 VFS Decryption ===\n");
 
     let resolved = pipeline::resolve_pipeline(client, true).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
-    let output_path = std::path::Path::new(output);
-    std::fs::create_dir_all(output_path)?;
+    let output_path = Path::new(output);
+    fs::create_dir_all(output_path)?;
 
     let available = pipeline::blc_directories(&resolved.cd);
     let dirs: Vec<&str> = available
@@ -1404,8 +1603,7 @@ async fn cmd_list(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== VFS Directory Listing ===\n");
 
     let resolved = pipeline::resolve_pipeline(client, true).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
     let dirs = pipeline::list_vfs_directories(&resolved.cd);
     println!("VFS directories ({}):\n", dirs.len());
@@ -1458,12 +1656,31 @@ const SEARCH_KEYWORDS: &[&str] = &[
     "body",
 ];
 
+/// Names and strings found in one scanned `.chk`.
+struct ChkManifest {
+    dir: String,
+    vfs_names: Vec<String>,
+    bundle_paths: Vec<String>,
+    embedded_strings: Vec<String>,
+}
+
+/// Append each printable ASCII run of at least 8 bytes in `data` not already in `seen`.
+fn collect_embedded_strings(data: &[u8], seen: &mut HashSet<String>, out: &mut Vec<String>) {
+    for run in data.split(|byte| !(0x20..0x7F).contains(byte)) {
+        if run.len() >= 8
+            && let Ok(s) = std::str::from_utf8(run)
+            && seen.insert(s.to_string())
+        {
+            out.push(s.to_string());
+        }
+    }
+}
+
 async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Asset Name Scanner ===\n");
 
     let resolved = pipeline::resolve_pipeline(client, true).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
     if let Some(patch) = &resolved.patch_index {
         println!("Patch version: {}", patch.version);
@@ -1471,25 +1688,13 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
     }
 
     let output_dir = "./output";
-    std::fs::create_dir_all(output_dir)?;
-
-    #[allow(dead_code)]
-    struct ChkManifest {
-        dir: String,
-        chk_name: String,
-        vfs_names: Vec<String>,
-        bundle_paths: Vec<String>,
-        embedded_strings: Vec<String>,
-    }
+    fs::create_dir_all(output_dir)?;
 
     let mut manifests: Vec<ChkManifest> = Vec::new();
 
     for (dir, desc) in VFS_DIRS {
         println!("--- {} ({}) ---", dir, desc);
-        let mut candidates = pipeline::list_chk_files(&resolved.cd, dir);
-        if !scan_all {
-            candidates.truncate(1);
-        }
+        let candidates = chk_candidates(&resolved.cd, dir, scan_all);
 
         for (i, (name, size)) in candidates.iter().enumerate() {
             println!(
@@ -1499,12 +1704,8 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
                 name,
                 format_bytes(*size)
             );
-            let data = match pipeline::download_chk(client, &resolved.cd, name).await {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("    Download error: {}", e);
-                    continue;
-                }
+            let Some(data) = download_or_report(client, &resolved.cd, name).await else {
+                continue;
             };
 
             if !vfs_decrypt::is_valid_header(&data) {
@@ -1512,7 +1713,7 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
                 continue;
             }
 
-            let assets = match backend::extraction::unityfs_header::process_chk_file(&data) {
+            let assets = match process_chk_file(&data) {
                 Ok(a) => a,
                 Err(e) => {
                     println!("    Pipeline error: {}", e);
@@ -1534,27 +1735,7 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
                         bundle_paths.push(entry.path.clone());
                     }
                 }
-                // Extract readable strings from raw data
-                let mut current = Vec::new();
-                for &byte in &asset.data {
-                    if (0x20..0x7F).contains(&byte) {
-                        current.push(byte);
-                    } else {
-                        if current.len() >= 8
-                            && let Ok(s) = std::str::from_utf8(&current)
-                            && seen_strings.insert(s.to_string())
-                        {
-                            embedded_strings.push(s.to_string());
-                        }
-                        current.clear();
-                    }
-                }
-                if current.len() >= 8
-                    && let Ok(s) = std::str::from_utf8(&current)
-                    && seen_strings.insert(s.to_string())
-                {
-                    embedded_strings.push(s.to_string());
-                }
+                collect_embedded_strings(&asset.data, &mut seen_strings, &mut embedded_strings);
             }
 
             println!(
@@ -1567,7 +1748,6 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
 
             manifests.push(ChkManifest {
                 dir: dir.to_string(),
-                chk_name: name.clone(),
                 vfs_names,
                 bundle_paths,
                 embedded_strings,
@@ -1576,25 +1756,21 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
         println!();
     }
 
-    // Keyword search
     println!("=== Keyword Search Results ===\n");
     for keyword in SEARCH_KEYWORDS {
         let kw_lower = keyword.to_lowercase();
         let mut matches: Vec<(&str, &str, &str)> = Vec::new();
         for manifest in &manifests {
-            for name in &manifest.vfs_names {
-                if name.to_lowercase().contains(&kw_lower) {
-                    matches.push((&manifest.dir, "vfs", name));
-                }
-            }
-            for path in &manifest.bundle_paths {
-                if path.to_lowercase().contains(&kw_lower) {
-                    matches.push((&manifest.dir, "bundle", path));
-                }
-            }
-            for s in &manifest.embedded_strings {
-                if s.to_lowercase().contains(&kw_lower) {
-                    matches.push((&manifest.dir, "embedded", s));
+            let sources = [
+                ("vfs", &manifest.vfs_names),
+                ("bundle", &manifest.bundle_paths),
+                ("embedded", &manifest.embedded_strings),
+            ];
+            for (source, values) in sources {
+                for value in values {
+                    if value.to_lowercase().contains(&kw_lower) {
+                        matches.push((&manifest.dir, source, value));
+                    }
                 }
             }
         }
@@ -1623,26 +1799,18 @@ async fn cmd_survey(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::
     println!("=== Asset Survey ===\n");
 
     let resolved = pipeline::resolve_pipeline(client, false).await?;
-    println!("Version: {}", resolved.config.version);
-    println!("ZIP entries: {}\n", resolved.cd.len());
+    print_pipeline_summary(&resolved);
 
     let mut all_chks: Vec<ChkContents> = Vec::new();
 
     for (dir, desc) in VFS_DIRS {
         println!("--- {} ({}) ---", dir, desc);
-        let mut candidates = pipeline::list_chk_files(&resolved.cd, dir);
-        if !scan_all {
-            candidates.truncate(1);
-        }
+        let candidates = chk_candidates(&resolved.cd, dir, scan_all);
 
         for (name, size) in &candidates {
             println!("  {} ({})", name, format_bytes(*size));
-            let data = match pipeline::download_chk(client, &resolved.cd, name).await {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("    Download error: {}", e);
-                    continue;
-                }
+            let Some(data) = download_or_report(client, &resolved.cd, name).await else {
+                continue;
             };
             if let Some(chk) = extract_chk_contents(&data) {
                 println!(
@@ -1656,7 +1824,6 @@ async fn cmd_survey(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::
         println!();
     }
 
-    // Pass 1: Class ID Census
     println!("╔══════════════════════════════════════════╗");
     println!("║  Class ID Census                         ║");
     println!("╚══════════════════════════════════════════╝\n");
@@ -1667,9 +1834,8 @@ async fn cmd_survey(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::
 
     for chk in &all_chks {
         for sf_bytes in &chk.sf_data {
-            let sf = match SerializedFile::parse(sf_bytes.clone()) {
-                Ok(sf) => sf,
-                Err(_) => continue,
+            let Ok(sf) = SerializedFile::parse(sf_bytes.clone()) else {
+                continue;
             };
             for obj in &sf.objects {
                 *class_counts.entry(obj.class_id).or_insert(0) += 1;

@@ -1,6 +1,7 @@
-/// Persistent state and change detection for the incremental update command.
+//! Persistent state and change detection for the incremental update command.
 use crate::core::endfield::config::EndfieldGameConfig;
 use crate::extraction::texture_layout::LAYOUT_VERSION;
+use crate::extraction::utils::append_to_path;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -69,6 +70,22 @@ pub fn chk_digest(base: &str, textures: bool, meshes: bool) -> String {
     digest
 }
 
+/// The ZIP identity a `.chk` digest starts with, before any `+tag`.
+pub fn digest_base(digest: &str) -> &str {
+    digest.split('+').next().unwrap_or(digest)
+}
+
+/// Digest for a chunk whose PNGs were sorted out of the legacy flat layout: they come from the
+/// old decoder (upside down, `+tex1`) and its gamedata and meshes are not extracted yet.
+pub fn sorted_legacy_digest(digest: &str) -> String {
+    format!("{}+tex1", digest_base(digest))
+}
+
+/// Whether a `.chk` digest was produced by the current gamedata/mesh extraction.
+pub fn extract_current(digest: &str) -> bool {
+    digest.contains(&format!("+x{EXTRACT_VERSION}"))
+}
+
 /// Whether PNGs left by a previous run of a `.chk` already match the current texture layout,
 /// so re-extraction may keep them instead of decoding again.
 pub fn textures_current(previous: Option<&str>) -> bool {
@@ -80,8 +97,7 @@ pub fn textures_current(previous: Option<&str>) -> bool {
 /// `+tex1` PNGs (an interruption would leave a mix of orientations) and when `repair`
 /// cannot tell which files belong to a chunk.
 pub fn mark_textures_stale(digest: &str) -> String {
-    let base = digest.split('+').next().unwrap_or(digest);
-    format!("{base}+texstale")
+    format!("{}+texstale", digest_base(digest))
 }
 
 /// Rewrite a `+tex1` digest to `+tex2` once that chunk's PNGs were flipped in place.
@@ -114,9 +130,7 @@ pub fn save_state(path: &Path, state: &UpdateState) -> Result<(), Box<dyn std::e
     {
         fs::create_dir_all(parent)?;
     }
-    let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_name);
+    let tmp = append_to_path(path, ".tmp");
     let bytes = serde_json::to_vec_pretty(state)?;
     let mut file = File::create(&tmp)?;
     file.write_all(&bytes)?;

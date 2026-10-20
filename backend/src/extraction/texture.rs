@@ -1,5 +1,5 @@
-/// Texture2D extraction: decode compressed textures and export as PNG.
-use crate::extraction::texture_layout::{self, IndexEntry, Placement, PlannedTexture};
+//! Texture2D extraction: decode compressed textures and export as PNG.
+use crate::extraction::texture_layout::{self, IndexEntry, PlannedTexture};
 use crate::extraction::unity::{SerializedFile, value_bytes};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -64,66 +64,25 @@ pub fn decode_texture(
 ) -> Result<(), &'static str> {
     match format {
         // Alpha8 (1) — single-channel grayscale
-        1 => {
-            if data.len() < width * height {
-                return Err("Alpha8 data too short");
-            }
-            for (i, &a) in data.iter().take(width * height).enumerate() {
-                out[i] = u32::from_be_bytes([a, 255, 255, 255]);
-            }
-            Ok(())
-        }
+        1 => convert_pixels(data, width, height, out, 1, "Alpha8 data too short", |p| {
+            [255, 255, 255, p[0]]
+        }),
         // RGB24 (3)
-        3 => {
-            if data.len() < width * height * 3 {
-                return Err("RGB24 data too short");
-            }
-            for i in 0..(width * height) {
-                let r = data[i * 3];
-                let g = data[i * 3 + 1];
-                let b = data[i * 3 + 2];
-                out[i] = u32::from_le_bytes([b, g, r, 255]);
-            }
-            Ok(())
-        }
+        3 => convert_pixels(data, width, height, out, 3, "RGB24 data too short", |p| {
+            [p[2], p[1], p[0], 255]
+        }),
         // RGBA32 (4)
-        4 => {
-            if data.len() < width * height * 4 {
-                return Err("RGBA32 data too short");
-            }
-            for i in 0..(width * height) {
-                let r = data[i * 4];
-                let g = data[i * 4 + 1];
-                let b = data[i * 4 + 2];
-                let a = data[i * 4 + 3];
-                out[i] = u32::from_le_bytes([b, g, r, a]);
-            }
-            Ok(())
-        }
+        4 => convert_pixels(data, width, height, out, 4, "RGBA32 data too short", |p| {
+            [p[2], p[1], p[0], p[3]]
+        }),
         // ARGB32 (5)
-        5 => {
-            if data.len() < width * height * 4 {
-                return Err("ARGB32 data too short");
-            }
-            for i in 0..(width * height) {
-                let a = data[i * 4];
-                let r = data[i * 4 + 1];
-                let g = data[i * 4 + 2];
-                let b = data[i * 4 + 3];
-                out[i] = u32::from_le_bytes([b, g, r, a]);
-            }
-            Ok(())
-        }
+        5 => convert_pixels(data, width, height, out, 4, "ARGB32 data too short", |p| {
+            [p[3], p[2], p[1], p[0]]
+        }),
         // R8 (30)
-        30 => {
-            if data.len() < width * height {
-                return Err("R8 data too short");
-            }
-            for (i, &r) in data.iter().take(width * height).enumerate() {
-                out[i] = u32::from_le_bytes([0, 0, r, 255]);
-            }
-            Ok(())
-        }
+        30 => convert_pixels(data, width, height, out, 1, "R8 data too short", |p| {
+            [0, 0, p[0], 255]
+        }),
         // DXT1 / BC1 (10)
         10 => texture2ddecoder::decode_bc1(data, width, height, out),
         // DXT5 / BC3 (12)
@@ -147,6 +106,27 @@ pub fn decode_texture(
         50 | 56 => texture2ddecoder::decode_astc(data, width, height, 12, 12, out),
         _ => Err("unsupported"),
     }
+}
+
+/// Convert an uncompressed format with `bytes_per_pixel`-byte pixels into packed BGRA, using
+/// `to_bgra` to reorder one source pixel's channels.
+fn convert_pixels(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    out: &mut [u32],
+    bytes_per_pixel: usize,
+    too_short: &'static str,
+    to_bgra: impl Fn(&[u8]) -> [u8; 4],
+) -> Result<(), &'static str> {
+    let pixels = width * height;
+    if data.len() < pixels * bytes_per_pixel {
+        return Err(too_short);
+    }
+    for (i, pixel) in data.chunks_exact(bytes_per_pixel).take(pixels).enumerate() {
+        out[i] = u32::from_le_bytes(to_bgra(pixel));
+    }
+    Ok(())
 }
 
 /// Resolve streamed texture data from .resS resources.
@@ -182,25 +162,19 @@ pub fn resolve_stream_data(obj: &Value, resources: &HashMap<String, Vec<u8>>) ->
 }
 
 /// Get an integer field from a deserialized object.
-fn get_int(obj: &Value, key: &str) -> i64 {
+pub(crate) fn get_int(obj: &Value, key: &str) -> i64 {
     obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
 fn index_entry(plan: &PlannedTexture, width: usize, height: usize, format: i64) -> IndexEntry {
-    let (container, placement) = match &plan.placement {
-        Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
-        Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
-        None => (None, "unsorted"),
-    };
-    IndexEntry {
-        path: plan.relative.to_string_lossy().replace('\\', "/"),
-        name: plan.name.clone(),
-        container,
-        placement,
-        width: width as u32,
-        height: height as u32,
-        format: texture_format_name(format),
-    }
+    IndexEntry::new(
+        &plan.relative,
+        &plan.name,
+        plan.placement.as_ref(),
+        width as u32,
+        height as u32,
+        texture_format_name(format),
+    )
 }
 
 /// Texture extraction counts and index entries produced for one SerializedFile.
@@ -231,6 +205,22 @@ pub fn bgra_to_rgba_flipped(pixels: &[u32], width: usize, height: usize) -> Vec<
     rgba
 }
 
+/// Save RGBA pixels as a PNG, written beside the target and renamed so a crash never leaves a
+/// truncated PNG that a later run would keep as "already extracted".
+fn save_png(path: &Path, rgba: &[u8], width: usize, height: usize) -> Result<(), String> {
+    let tmp = path.with_extension("png.tmp");
+    image::save_buffer_with_format(
+        &tmp,
+        rgba,
+        width as u32,
+        height as u32,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|()| std::fs::rename(&tmp, path).map_err(|error| error.to_string()))
+}
+
 /// Extract all Texture2D objects from a SerializedFile as PNG files.
 ///
 /// With `skip_existing`, textures whose PNG is already on disk are indexed without re-decoding.
@@ -254,9 +244,8 @@ pub fn extract_textures(
         let Some(plan) = planned_by_id.get(&obj.path_id) else {
             continue;
         };
-        let unity_obj = match sf.read_object(obj) {
-            Ok(o) => o,
-            Err(_) => continue,
+        let Ok(unity_obj) = sf.read_object(obj) else {
+            continue;
         };
 
         let name = &plan.name;
@@ -276,19 +265,12 @@ pub fn extract_textures(
             continue;
         }
 
-        // Get pixel data: inline or from .resS stream
-        let pixel_data: Option<Vec<u8>> = {
-            let inline = unity_obj
-                .get("image data")
-                .and_then(value_bytes)
-                .filter(|b| !b.is_empty());
-
-            if inline.is_some() {
-                inline
-            } else {
-                resolve_stream_data(&unity_obj, resources)
-            }
-        };
+        // Pixel data is stored inline or in a .resS stream.
+        let pixel_data = unity_obj
+            .get("image data")
+            .and_then(value_bytes)
+            .filter(|b| !b.is_empty())
+            .or_else(|| resolve_stream_data(&unity_obj, resources));
 
         let Some(compressed) = pixel_data else {
             no_data += 1;
@@ -308,20 +290,7 @@ pub fn extract_textures(
                     write_errors += 1;
                     continue;
                 }
-                // Written beside the target and renamed so a crash never leaves a truncated
-                // PNG that a later run would keep as "already extracted".
-                let tmp = path.with_extension("png.tmp");
-                let saved = image::save_buffer_with_format(
-                    &tmp,
-                    &rgba_bytes,
-                    width as u32,
-                    height as u32,
-                    image::ColorType::Rgba8,
-                    image::ImageFormat::Png,
-                )
-                .map_err(|error| error.to_string())
-                .and_then(|()| std::fs::rename(&tmp, &path).map_err(|error| error.to_string()));
-                match saved {
+                match save_png(&path, &rgba_bytes, width, height) {
                     Ok(()) => {
                         extracted += 1;
                         entries.push(index_entry(plan, width, height, format));

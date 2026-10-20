@@ -2,7 +2,7 @@
 use std::io;
 
 use crate::extraction::unity::{
-    endian_reader::EndianReader,
+    endian_reader::{EndianReader, invalid_data},
     type_tree::{TypeTreeNode, read_type_tree_blob},
 };
 
@@ -56,14 +56,10 @@ pub struct SerializedType {
     pub assembly_name: String,
 }
 
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
 /// Read a non-negative element count.
 fn read_count(r: &mut EndianReader, what: &str) -> Result<usize, io::Error> {
     let count = r.read_i32()?;
-    usize::try_from(count).map_err(|_| invalid(format!("negative {what} count: {count}")))
+    usize::try_from(count).map_err(|_| invalid_data(format!("negative {what} count: {count}")))
 }
 
 fn read_serialized_type(
@@ -147,7 +143,7 @@ impl SerializedFile {
 
         // Reject blobs that are not SerializedFiles before trusting any count in them.
         if !(1..100).contains(&version) || data_offset == 0 || file_size <= data_offset {
-            return Err(invalid("invalid SerializedFile header"));
+            return Err(invalid_data("invalid SerializedFile header"));
         }
 
         r.set_big_endian(big_endian);
@@ -181,13 +177,13 @@ impl SerializedFile {
             };
             byte_start = byte_start
                 .checked_add(data_offset) // absolute offset into data
-                .ok_or_else(|| invalid("object offset overflow"))?;
+                .ok_or_else(|| invalid_data("object offset overflow"))?;
             let byte_size = r.read_u32()?;
             let raw_type_index = r.read_i32()?;
             let type_index = usize::try_from(raw_type_index)
                 .ok()
                 .filter(|&index| index < types.len())
-                .ok_or_else(|| invalid(format!("invalid type index: {raw_type_index}")))?;
+                .ok_or_else(|| invalid_data(format!("invalid type index: {raw_type_index}")))?;
             let class_id = types[type_index].class_id;
 
             objects.push(ObjectInfo {

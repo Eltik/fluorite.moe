@@ -1,12 +1,13 @@
-/// BLC catalog parser and ChaCha20 VFS extraction pipeline.
-///
-/// BLC files are per-directory metadata catalogs listing all .chk files,
-/// their offsets, sizes, encryption flags, and IV seeds.
+//! BLC catalog parser and ChaCha20 VFS extraction pipeline.
+//!
+//! BLC files are per-directory metadata catalogs listing all .chk files,
+//! their offsets, sizes, encryption flags, and IV seeds.
 use super::chacha20::{CHACHA_KEY, chacha20_crypt};
-use super::pipeline::{self, ResolvedPipeline};
+use super::pipeline::{self, ResolvedPipeline, VFS_ROOT};
 use super::sparkbuffer;
-use crate::extraction::utils::sanitize_filename;
+use crate::extraction::utils::{flat_filename, sanitize_filename, to_hex};
 use reqwest::Client;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -72,11 +73,7 @@ impl<'a> Reader<'a> {
     }
 
     fn md5(&mut self) -> Result<String, String> {
-        Ok(self
-            .take(16)?
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect())
+        Ok(to_hex(self.take(16)?))
     }
 
     fn count(&mut self) -> Result<usize, String> {
@@ -233,6 +230,33 @@ pub fn relative_file_path(file_name: &str) -> PathBuf {
     }
 }
 
+/// Fetch a chunk missing from the archive from the patch CDN, by its `<dir>/<md5>.chk` name.
+///
+/// `Ok(None)` when the patch index does not list it or the request fails.
+async fn download_patch_chunk(
+    client: &Client,
+    resolved: &ResolvedPipeline,
+    patch_name: &str,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let Some(patch) = &resolved.patch_index else {
+        return Ok(None);
+    };
+    let Some(pf) = patch.files.iter().find(|p| p.name == patch_name) else {
+        return Ok(None);
+    };
+    let main_res = resolved
+        .config
+        .resources
+        .iter()
+        .find(|r| r.name == "main")
+        .expect("no main resource");
+    let url = format!("{}/{}", main_res.path, pf.name);
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(Some(resp.bytes().await?.to_vec())),
+        _ => Ok(None),
+    }
+}
+
 /// Extract all files from a single BLC-catalogued VFS directory into `<output_dir>/<group>`.
 pub async fn extract_directory(
     client: &Client,
@@ -240,14 +264,11 @@ pub async fn extract_directory(
     dir_hash: &str,
     output_dir: &Path,
 ) -> Result<DirExtractResult, Box<dyn std::error::Error>> {
-    let blc_name = format!(
-        "Endfield_Data/StreamingAssets/VFS/{}/{}.blc",
-        dir_hash, dir_hash
-    );
-    let blc_data = pipeline::download_chk(client, &resolved.cd, &blc_name).await?;
+    let blc_data =
+        pipeline::download_chk(client, &resolved.cd, &pipeline::blc_path(dir_hash)).await?;
     let blc = parse_blc(&blc_data).map_err(|e| format!("BLC parse error: {e}"))?;
 
-    let mut group = sanitize_filename(&blc.group_cfg_name).replace(['/', '\\'], "_");
+    let mut group = flat_filename(&blc.group_cfg_name);
     if group.is_empty() {
         group = dir_hash.to_string();
     }
@@ -280,8 +301,7 @@ pub async fn extract_directory(
     }
 
     // Group files by chunk MD5
-    let mut chunks_needed: std::collections::BTreeMap<String, Vec<usize>> =
-        std::collections::BTreeMap::new();
+    let mut chunks_needed: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, f) in blc.files.iter().enumerate() {
         chunks_needed
             .entry(f.chunk_md5.clone())
@@ -290,42 +310,18 @@ pub async fn extract_directory(
     }
 
     for (chunk_md5, file_indices) in &chunks_needed {
-        let chunk_name = format!(
-            "Endfield_Data/StreamingAssets/VFS/{}/{}.chk",
-            dir_hash,
-            chunk_md5.to_uppercase()
-        );
+        let chunk_file = format!("{}/{}.chk", dir_hash, chunk_md5.to_uppercase());
+        let chunk_name = format!("{VFS_ROOT}{chunk_file}");
 
         let chunk_data = match pipeline::download_chk(client, &resolved.cd, &chunk_name).await {
             Ok(data) => data,
-            Err(_) => {
-                // Try patch
-                if let Some(patch) = &resolved.patch_index {
-                    let patch_name = format!("{}/{}.chk", dir_hash, chunk_md5.to_uppercase());
-                    if let Some(pf) = patch.files.iter().find(|p| p.name == patch_name) {
-                        let main_res = resolved
-                            .config
-                            .resources
-                            .iter()
-                            .find(|r| r.name == "main")
-                            .expect("no main resource");
-                        let url = format!("{}/{}", main_res.path, pf.name);
-                        match client.get(&url).send().await {
-                            Ok(resp) if resp.status().is_success() => resp.bytes().await?.to_vec(),
-                            _ => {
-                                result.errors.push(format!("chunk {} not found", chunk_md5));
-                                continue;
-                            }
-                        }
-                    } else {
-                        result.errors.push(format!("chunk {} not found", chunk_md5));
-                        continue;
-                    }
-                } else {
+            Err(_) => match download_patch_chunk(client, resolved, &chunk_file).await? {
+                Some(data) => data,
+                None => {
                     result.errors.push(format!("chunk {} not found", chunk_md5));
                     continue;
                 }
-            }
+            },
         };
 
         for &fi in file_indices {

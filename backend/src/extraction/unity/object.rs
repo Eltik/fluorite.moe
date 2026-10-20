@@ -1,5 +1,5 @@
 //! Object access on a parsed `SerializedFile`.
-use crate::extraction::unity::endian_reader::EndianReader;
+use crate::extraction::unity::endian_reader::{EndianReader, invalid_data};
 use crate::extraction::unity::object_reader::{ReadContext, read_field, read_struct};
 use crate::extraction::unity::serialized_file::{ObjectInfo, SerializedFile};
 use crate::extraction::unity::type_tree::TypeTreeNode;
@@ -23,12 +23,7 @@ impl SerializedFile {
                 self.data
                     .get(start..start.checked_add(obj.byte_size as usize)?)
             })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("object {} data out of bounds", obj.path_id),
-                )
-            })
+            .ok_or_else(|| invalid_data(format!("object {} data out of bounds", obj.path_id)))
     }
 
     /// Deserialize an object through its type tree. Any read error fails the whole object.
@@ -45,7 +40,7 @@ impl SerializedFile {
     fn read_object_with(&self, obj: &ObjectInfo, pair_arrays: bool) -> io::Result<Value> {
         let tree = self
             .type_tree(obj)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no type tree"))?;
+            .ok_or_else(|| invalid_data("no type tree"))?;
         let mut r = EndianReader::new(self.object_bytes(obj)?, self.big_endian);
         let mut ctx = ReadContext::new(&self.ref_types, pair_arrays);
         read_struct(&mut r, tree, &mut ctx)

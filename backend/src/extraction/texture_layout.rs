@@ -1,6 +1,8 @@
-/// Texture output layout derived from Unity AssetBundle container metadata.
+//! Output layout derived from Unity AssetBundle container metadata.
 use crate::extraction::unity::SerializedFile;
-use crate::extraction::utils::{fit_filename, sanitize_filename};
+use crate::extraction::utils::{
+    claim_path, fit_filename, flat_filename, sanitize_filename, with_path_id,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -134,7 +136,7 @@ fn local_path_id(value: &Value) -> Option<i64> {
 
 /// Build a texture path relative to the textures output directory.
 pub fn relative_path(placement: Option<&Placement>, name: &str, path_id: i64) -> PathBuf {
-    let mut stem = sanitize_filename(name).replace(['/', '\\'], "_");
+    let mut stem = flat_filename(name);
     if stem.is_empty() {
         stem = format!("obj_{path_id}");
     }
@@ -175,6 +177,25 @@ pub fn placement_dir(placement: Option<&Placement>) -> Option<PathBuf> {
     })
 }
 
+/// Claim the output path for an object under `out_dir`, laid out by its placement.
+///
+/// Objects without a container go to `unsorted_dir`, where unrelated chunks share one
+/// directory; suffixing the path ID keeps each object's output path stable across runs.
+pub(crate) fn claim_object_path(
+    out_dir: &Path,
+    placement: Option<&Placement>,
+    unsorted_dir: PathBuf,
+    file_name: &str,
+    path_id: i64,
+    seen: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let (dir, file_name) = match placement_dir(placement) {
+        Some(dir) => (dir, file_name.to_string()),
+        None => (unsorted_dir, with_path_id(file_name, path_id)),
+    };
+    claim_path(out_dir.join(dir), &file_name, path_id, seen)
+}
+
 fn without_extension(path: &str) -> &str {
     let file_start = path.rfind('/').map_or(0, |index| index + 1);
     match path[file_start..].rfind('.') {
@@ -194,11 +215,41 @@ pub struct IndexEntry {
     pub format: &'static str,
 }
 
+impl IndexEntry {
+    pub fn new(
+        relative: &Path,
+        name: &str,
+        placement: Option<&Placement>,
+        width: u32,
+        height: u32,
+        format: &'static str,
+    ) -> Self {
+        let (container, placement) = match placement {
+            Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
+            Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
+            None => (None, "unsorted"),
+        };
+        Self {
+            path: slash_path(relative),
+            name: name.to_string(),
+            container,
+            placement,
+            width,
+            height,
+            format,
+        }
+    }
+}
+
+/// A relative output path with `/` separators on every platform.
+pub fn slash_path(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
 /// Write one chunk's texture index atomically.
 pub fn write_chk_index(tex_dir: &Path, chk_name: &str, entries: &[IndexEntry]) -> io::Result<()> {
-    let index_dir = tex_dir.join(".index");
-    fs::create_dir_all(&index_dir)?;
-    let path = index_dir.join(index_filename(chk_name));
+    fs::create_dir_all(tex_dir.join(".index"))?;
+    let path = chk_index_path(tex_dir, chk_name);
     let tmp = path.with_extension("jsonl.tmp");
     let mut file = fs::File::create(&tmp)?;
     for entry in entries {
@@ -278,16 +329,21 @@ pub fn remove_legacy_flat_textures(tex_dir: &Path) -> io::Result<usize> {
     let mut removed = 0;
     for entry in entries {
         let entry = entry?;
-        let is_png = entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
-        if entry.file_type()?.is_file() && is_png {
+        if is_png_file(&entry)? {
             fs::remove_file(entry.path())?;
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// Whether a directory entry is a regular file with a `.png` extension (any case).
+pub(crate) fn is_png_file(entry: &fs::DirEntry) -> io::Result<bool> {
+    Ok(entry.file_type()?.is_file()
+        && entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("png")))
 }
 
 /// Path of one chunk's texture index (`<tex_dir>/.index/<chk>.jsonl`).

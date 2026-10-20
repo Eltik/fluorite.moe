@@ -1,7 +1,7 @@
 // Adapted from Myrtle (assets/unpacker/src/unity).
 use std::io;
 
-use crate::extraction::unity::endian_reader::EndianReader;
+use crate::extraction::unity::endian_reader::{EndianReader, invalid_data};
 
 #[allow(dead_code)]
 pub struct TypeTreeNode {
@@ -36,10 +36,9 @@ pub fn read_type_tree_blob(r: &mut EndianReader) -> Result<Option<TypeTreeNode>,
     let node_count = r.read_i32()?;
     let string_buffer_size = r.read_i32()?;
     if node_count < 0 || string_buffer_size < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("negative type tree size: {node_count} nodes, {string_buffer_size} bytes"),
-        ));
+        return Err(invalid_data(format!(
+            "negative type tree size: {node_count} nodes, {string_buffer_size} bytes"
+        )));
     }
 
     // Each flat node is 32 bytes; cap the reservation so a garbage count can't over-allocate.

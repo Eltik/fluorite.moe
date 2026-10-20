@@ -1,4 +1,4 @@
-/// VFS download + extract pipeline shared by multiple binaries.
+//! VFS download + extract pipeline shared by multiple binaries.
 use crate::core::endfield::{
     config::{
         EndfieldGameConfig, PatchIndex, ResolveParams, fetch_patch_index, resolve_game_config,
@@ -8,11 +8,20 @@ use crate::core::endfield::{
 use crate::core::hypergryph::launcher::Platform;
 use crate::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 /// Known VFS directories.
 pub const VFS_DIRS: &[(&str, &str)] = &[("7064D8E2", "bundles/configs"), ("0CE8FA57", "textures")];
+
+/// Archive path prefix under which every VFS directory lives.
+pub const VFS_ROOT: &str = "Endfield_Data/StreamingAssets/VFS/";
+
+/// Archive path of a VFS directory's `.blc` catalog.
+pub fn blc_path(dir_hash: &str) -> String {
+    format!("{VFS_ROOT}{dir_hash}/{dir_hash}.blc")
+}
 
 /// Default resolve params for OS Windows release.
 pub fn default_resolve_params() -> ResolveParams<'static> {
@@ -61,14 +70,12 @@ pub async fn resolve_pipeline_from_config(
         .collect();
     let cd = ZipCentralDirectory::from_split_archive(client, parts).await?;
 
-    let patch_index = if fetch_patch {
-        if let Some(main_resource) = config.resources.iter().find(|r| r.name == "main") {
+    let main_resource = config.resources.iter().find(|r| r.name == "main");
+    let patch_index = match main_resource {
+        Some(main_resource) if fetch_patch => {
             Some(fetch_patch_index(client, &main_resource.path).await?)
-        } else {
-            None
         }
-    } else {
-        None
+        _ => None,
     };
 
     Ok(ResolvedPipeline {
@@ -78,39 +85,40 @@ pub async fn resolve_pipeline_from_config(
     })
 }
 
-/// List .chk file names and sizes for a VFS directory, sorted by size (ascending).
-pub fn list_chk_files(cd: &ZipCentralDirectory, dir: &str) -> Vec<(String, u64)> {
-    let mut candidates: Vec<(String, u64)> = cd
-        .filenames()
-        .filter(|f| f.ends_with(".chk") && f.contains(dir))
+/// Names and uncompressed sizes of the archive entries matching `filter`, in archive order.
+fn entries_with_sizes(
+    cd: &ZipCentralDirectory,
+    filter: impl Fn(&str) -> bool,
+) -> Vec<(String, u64)> {
+    cd.filenames()
+        .filter(|f| filter(f))
         .map(|f| {
             let size = cd.get(f).map_or(0, |e| e.uncompressed_size);
             (f.to_string(), size)
         })
-        .collect();
+        .collect()
+}
+
+/// List .chk file names and sizes for a VFS directory, sorted by size (ascending).
+pub fn list_chk_files(cd: &ZipCentralDirectory, dir: &str) -> Vec<(String, u64)> {
+    let mut candidates = entries_with_sizes(cd, |f| f.ends_with(".chk") && f.contains(dir));
     candidates.sort_by_key(|(_n, s)| *s);
     candidates
 }
 
 /// List ALL files in a VFS directory (including .blc catalogs), sorted by name.
 pub fn list_vfs_dir_files(cd: &ZipCentralDirectory, dir: &str) -> Vec<(String, u64)> {
-    let mut files: Vec<(String, u64)> = cd
-        .filenames()
-        .filter(|f| f.contains(&format!("VFS/{dir}/")))
-        .map(|f| {
-            let size = cd.get(f).map_or(0, |e| e.uncompressed_size);
-            (f.to_string(), size)
-        })
-        .collect();
+    let needle = format!("VFS/{dir}/");
+    let mut files = entries_with_sizes(cd, |f| f.contains(&needle));
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
 }
 
 /// List ALL VFS directories found in the ZIP.
 pub fn list_vfs_directories(cd: &ZipCentralDirectory) -> Vec<String> {
-    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut dirs = BTreeSet::new();
     for f in cd.filenames() {
-        if let Some(rest) = f.strip_prefix("Endfield_Data/StreamingAssets/VFS/")
+        if let Some(rest) = f.strip_prefix(VFS_ROOT)
             && let Some(slash) = rest.find('/')
         {
             dirs.insert(rest[..slash].to_string());

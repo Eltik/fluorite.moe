@@ -1,6 +1,6 @@
 //! Migration of legacy flat texture output into the container-based layout.
 use crate::extraction::texture;
-use crate::extraction::texture_layout::{self, IndexEntry, Placement};
+use crate::extraction::texture_layout::{self, IndexEntry, Placement, slash_path};
 use crate::extraction::unity::SerializedFile;
 use crate::extraction::unity_extract::ChkContents;
 use crate::extraction::utils::sanitize_filename;
@@ -36,15 +36,12 @@ pub fn collect_candidates(chk_name: &str, chk: &ChkContents) -> Vec<SortCandidat
             let Ok(value) = sf.read_object(obj) else {
                 continue;
             };
-            let width = value.get("m_Width").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
-            let height = value.get("m_Height").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+            let width = texture::get_int(&value, "m_Width") as u32;
+            let height = texture::get_int(&value, "m_Height") as u32;
             if width == 0 || height == 0 {
                 continue;
             }
-            let format = value
-                .get("m_TextureFormat")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+            let format = texture::get_int(&value, "m_TextureFormat");
             candidates.push(SortCandidate {
                 chk_name: chk_name.to_string(),
                 relative: planned.relative,
@@ -108,7 +105,7 @@ pub fn sort_flat_textures(tex_dir: &Path, candidates: &[SortCandidate]) -> io::R
             fs::rename(&flat, &destination)?;
             let paths: Vec<String> = group
                 .iter()
-                .map(|candidate| candidate.relative.to_string_lossy().replace('\\', "/"))
+                .map(|candidate| slash_path(&candidate.relative))
                 .collect();
             serde_json::to_writer(
                 &mut ambiguous_file,
@@ -136,20 +133,18 @@ pub fn sort_flat_textures(tex_dir: &Path, candidates: &[SortCandidate]) -> io::R
             fs::rename(&flat, target)?;
             report.moved += 1;
         }
-        let (container, placement) = placement_fields(candidate.placement.as_ref());
         report
             .moved_by_chk
             .entry(candidate.chk_name.clone())
             .or_default()
-            .push(IndexEntry {
-                path: candidate.relative.to_string_lossy().replace('\\', "/"),
-                name: candidate.name.clone(),
-                container,
-                placement,
-                width: candidate.width,
-                height: candidate.height,
-                format: candidate.format,
-            });
+            .push(IndexEntry::new(
+                &candidate.relative,
+                &candidate.name,
+                candidate.placement.as_ref(),
+                candidate.width,
+                candidate.height,
+                candidate.format,
+            ));
     }
 
     report.missing = relative_paths
@@ -159,23 +154,11 @@ pub fn sort_flat_textures(tex_dir: &Path, candidates: &[SortCandidate]) -> io::R
     let group_names: HashSet<_> = groups.keys().collect();
     for entry in fs::read_dir(tex_dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+        if texture_layout::is_png_file(&entry)?
             && !group_names.contains(&entry.file_name().to_string_lossy().to_string())
         {
             report.unmatched += 1;
         }
     }
     Ok(report)
-}
-
-fn placement_fields(placement: Option<&Placement>) -> (Option<String>, &'static str) {
-    match placement {
-        Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
-        Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
-        None => (None, "unsorted"),
-    }
 }

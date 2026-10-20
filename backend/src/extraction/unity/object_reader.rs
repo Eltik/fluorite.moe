@@ -1,10 +1,13 @@
 // Adapted from Myrtle (assets/unpacker/src/unity).
-use crate::extraction::unity::endian_reader::EndianReader;
+use crate::extraction::unity::endian_reader::{EndianReader, invalid_data};
 use crate::extraction::unity::serialized_file::SerializedType;
 use crate::extraction::unity::type_tree::TypeTreeNode;
 use base64::Engine;
 use serde_json::{Map, Value, json};
 use std::io;
+
+/// Unity's `kAlignBytes` meta flag: align the reader to 4 bytes after this node.
+const ALIGN_BYTES: u32 = 0x4000;
 
 /// State carried through one object's read.
 pub struct ReadContext<'a> {
@@ -26,10 +29,6 @@ impl<'a> ReadContext<'a> {
             pair_arrays,
         }
     }
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 pub fn read_value(
@@ -59,7 +58,7 @@ pub fn read_value(
         "string" => {
             let len = r.read_i32()?;
             if len < 0 {
-                return Err(invalid(format!("negative string length: {len}")));
+                return Err(invalid_data(format!("negative string length: {len}")));
             }
             let bytes = r.read_bytes(len as usize)?;
             r.align(4);
@@ -75,7 +74,7 @@ pub fn read_value(
         "TypelessData" => {
             let size = r.read_i32()?;
             if size < 0 {
-                return Err(invalid(format!("negative TypelessData size: {size}")));
+                return Err(invalid_data(format!("negative TypelessData size: {size}")));
             }
             let bytes = r.read_bytes(size as usize)?;
             r.align(4);
@@ -91,7 +90,7 @@ pub fn read_value(
     };
 
     // Post-read alignment
-    if node.meta_flag & 0x4000 != 0 {
+    if node.meta_flag & ALIGN_BYTES != 0 {
         r.align(4);
     }
 
@@ -145,7 +144,7 @@ fn read_referenced_object(
             match resolve_ref_type(&map, ref_types) {
                 Some(tree) => {
                     let value = read_struct(r, tree, ctx)?;
-                    if child.meta_flag & 0x4000 != 0 {
+                    if child.meta_flag & ALIGN_BYTES != 0 {
                         r.align(4);
                     }
                     value
@@ -192,13 +191,13 @@ fn read_array(
     // array_node.children[0] = "size" (int), children[1] = element type
     let size = r.read_i32()?;
     if size < 0 {
-        return Err(invalid(format!("negative array size: {size}")));
+        return Err(invalid_data(format!("negative array size: {size}")));
     }
     let size = size as usize;
     let element_node = array_node
         .children
         .get(1)
-        .ok_or_else(|| invalid("array node has no element type"))?;
+        .ok_or_else(|| invalid_data("array node has no element type"))?;
 
     // Bound the element count against the bytes left in this object. Every array
     // element reads at least one byte, so a well-formed array of `size` elements
@@ -212,7 +211,7 @@ fn read_array(
     // The self-limiting "fails on EOF if data is short" assumption below only holds
     // when each element actually consumes input; this guard covers when it doesn't.
     if size > r.remaining() {
-        return Err(invalid(format!(
+        return Err(invalid_data(format!(
             "array size {size} exceeds {} remaining bytes (misread type-tree)",
             r.remaining()
         )));
@@ -225,7 +224,7 @@ fn read_array(
     // Check if this is a map (element type is "pair")
     let result = if element_node.type_name == "pair" {
         let [first, second] = element_node.children.as_slice() else {
-            return Err(invalid("pair node does not have two children"));
+            return Err(invalid_data("pair node does not have two children"));
         };
         if ctx.pair_arrays {
             let mut arr = Vec::with_capacity(size.min(MAX_INITIAL_CAP));
@@ -263,7 +262,7 @@ fn read_array(
     // `m_IndexBuffer`); omitting it leaves the reader misaligned and corrupts
     // every subsequent field. align(4) on an already-aligned position is a no-op,
     // so this never over-shifts arrays that were already aligned.
-    if array_node.meta_flag & 0x4000 != 0 {
+    if array_node.meta_flag & ALIGN_BYTES != 0 {
         r.align(4);
     }
 

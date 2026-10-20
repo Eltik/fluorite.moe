@@ -1,6 +1,25 @@
 // Adapted from Myrtle (assets/unpacker/src/unity).
 use std::io;
 
+/// An `InvalidData` error for malformed serialized data.
+pub fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Fixed-width numeric readers honoring the current byte order.
+macro_rules! read_numbers {
+    ($($name:ident -> $ty:ty),* $(,)?) => {$(
+        pub fn $name(&mut self) -> Result<$ty, io::Error> {
+            let bytes = self.read_array()?;
+            Ok(if self.big_endian {
+                <$ty>::from_be_bytes(bytes)
+            } else {
+                <$ty>::from_le_bytes(bytes)
+            })
+        }
+    )*};
+}
+
 pub struct EndianReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -46,92 +65,15 @@ impl<'a> EndianReader<'a> {
         Ok(val)
     }
 
-    pub fn read_i16(&mut self) -> Result<i16, io::Error> {
-        self.ensure(2)?;
-        let bytes: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
-        self.pos += 2;
-        Ok(if self.big_endian {
-            i16::from_be_bytes(bytes)
-        } else {
-            i16::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_u16(&mut self) -> Result<u16, io::Error> {
-        self.ensure(2)?;
-        let bytes: [u8; 2] = self.data[self.pos..self.pos + 2].try_into().unwrap();
-        self.pos += 2;
-        Ok(if self.big_endian {
-            u16::from_be_bytes(bytes)
-        } else {
-            u16::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_i32(&mut self) -> Result<i32, io::Error> {
-        self.ensure(4)?;
-        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().unwrap();
-        self.pos += 4;
-        Ok(if self.big_endian {
-            i32::from_be_bytes(bytes)
-        } else {
-            i32::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_u32(&mut self) -> Result<u32, io::Error> {
-        self.ensure(4)?;
-        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().unwrap();
-        self.pos += 4;
-        Ok(if self.big_endian {
-            u32::from_be_bytes(bytes)
-        } else {
-            u32::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_f32(&mut self) -> Result<f32, io::Error> {
-        self.ensure(4)?;
-        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().unwrap();
-        self.pos += 4;
-        Ok(if self.big_endian {
-            f32::from_be_bytes(bytes)
-        } else {
-            f32::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_i64(&mut self) -> Result<i64, io::Error> {
-        self.ensure(8)?;
-        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().unwrap();
-        self.pos += 8;
-        Ok(if self.big_endian {
-            i64::from_be_bytes(bytes)
-        } else {
-            i64::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_u64(&mut self) -> Result<u64, io::Error> {
-        self.ensure(8)?;
-        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().unwrap();
-        self.pos += 8;
-        Ok(if self.big_endian {
-            u64::from_be_bytes(bytes)
-        } else {
-            u64::from_le_bytes(bytes)
-        })
-    }
-
-    pub fn read_f64(&mut self) -> Result<f64, io::Error> {
-        self.ensure(8)?;
-        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().unwrap();
-        self.pos += 8;
-        Ok(if self.big_endian {
-            f64::from_be_bytes(bytes)
-        } else {
-            f64::from_le_bytes(bytes)
-        })
+    read_numbers! {
+        read_i16 -> i16,
+        read_u16 -> u16,
+        read_i32 -> i32,
+        read_u32 -> u32,
+        read_f32 -> f32,
+        read_i64 -> i64,
+        read_u64 -> u64,
+        read_f64 -> f64,
     }
 
     pub fn read_bool(&mut self) -> Result<bool, io::Error> {
@@ -154,13 +96,17 @@ impl<'a> EndianReader<'a> {
     pub fn read_string(&mut self) -> Result<String, io::Error> {
         let len = self.read_i32()?;
         if len < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("negative string length: {len}"),
-            ));
+            return Err(invalid_data(format!("negative string length: {len}")));
         }
         let bytes = self.read_bytes(len as usize)?;
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], io::Error> {
+        self.ensure(N)?;
+        let bytes = self.data[self.pos..self.pos + N].try_into().unwrap();
+        self.pos += N;
+        Ok(bytes)
     }
 
     pub fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>, io::Error> {

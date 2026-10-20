@@ -1,5 +1,6 @@
+//! Unity asset extraction helpers: ChkContents, TextAsset parsing, class names.
 use crate::extraction::unity::{ObjectInfo, SerializedFile};
-/// Unity asset extraction helpers: ChkContents, TextAsset parsing, class names.
+use crate::extraction::utils::to_hex;
 use crate::extraction::{unityfs_header, vfs_decrypt};
 use std::collections::HashMap;
 
@@ -20,10 +21,7 @@ pub fn extract_chk_contents(data: &[u8]) -> Option<ChkContents> {
     if !vfs_decrypt::is_valid_header(data) {
         return None;
     }
-    let assets = match unityfs_header::process_chk_file(data) {
-        Ok(a) => a,
-        Err(_) => return None,
-    };
+    let assets = unityfs_header::process_chk_file(data).ok()?;
 
     let mut resources: HashMap<String, Vec<u8>> = HashMap::new();
     let mut sf_data: Vec<Vec<u8>> = Vec::new();
@@ -36,13 +34,13 @@ pub fn extract_chk_contents(data: &[u8]) -> Option<ChkContents> {
                 if start >= asset.data.len() {
                     continue;
                 }
-                if entry.path.ends_with(".resS") || entry.path.ends_with(".resource") {
+                if is_resource_stream(&entry.path) {
                     resources.insert(entry.path.clone(), asset.data[start..end].to_vec());
                 } else {
                     sf_data.push(asset.data[start..end].to_vec());
                 }
             }
-        } else if asset.vfs_name.ends_with(".resS") || asset.vfs_name.ends_with(".resource") {
+        } else if is_resource_stream(&asset.vfs_name) {
             resources.insert(asset.vfs_name, asset.data);
         } else {
             sf_data.push(asset.data);
@@ -50,6 +48,10 @@ pub fn extract_chk_contents(data: &[u8]) -> Option<ChkContents> {
     }
 
     Some(ChkContents { sf_data, resources })
+}
+
+fn is_resource_stream(name: &str) -> bool {
+    name.ends_with(".resS") || name.ends_with(".resource")
 }
 
 /// Parse a TextAsset from raw object bytes (little-endian).
@@ -106,13 +108,7 @@ pub fn get_script_type_name(sf: &SerializedFile, info: &ObjectInfo) -> String {
             return st.class_name.clone();
         }
         if st.script_id != [0u8; 16] {
-            return format!(
-                "script_{}",
-                st.script_id
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            );
+            return format!("script_{}", to_hex(&st.script_id));
         }
     }
     format!("class_{}", info.class_id)
