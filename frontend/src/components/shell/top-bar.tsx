@@ -102,7 +102,11 @@ function Crumbs(): React.ReactElement {
 		for (const match of matches) {
 			const crumb = match.staticData.crumb;
 			if (!crumb) continue;
-			const label = crumbLabel(crumb, match.params as Record<string, string>);
+			const label = crumbLabel(
+				crumb,
+				match.params as Record<string, string>,
+				match.loaderData,
+			);
 			if (out[out.length - 1]?.label === label) continue;
 			out.push({ label, to: match.pathname });
 		}

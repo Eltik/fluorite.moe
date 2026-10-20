@@ -56,6 +56,18 @@
 			}
 		},
 		{
+			"includes": ["**/src/components/studio/**"],
+			"linter": {
+				"rules": {
+					"a11y": {
+						"useSemanticElements": "off",
+						"noLabelWithoutControl": "off",
+						"noStaticElementInteractions": "off"
+					}
+				}
+			}
+		},
+		{
 			"includes": [
 				"**/src/components/table/**",
 				"**/src/components/gallery/**",

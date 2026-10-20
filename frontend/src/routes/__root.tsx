@@ -4,6 +4,7 @@ import {
 	HeadContent,
 	Outlet,
 	Scripts,
+	useMatches,
 } from "@tanstack/react-router";
 import * as React from "react";
 import { AppShell } from "@/components/shell/app-shell";
@@ -73,6 +74,10 @@ function RootDocument({
 }
 
 function RootLayout(): React.ReactElement {
+	const fullBleed = useMatches({
+		select: (matches) => matches.some((m) => m.staticData?.fullBleed),
+	});
+	if (fullBleed) return <Outlet />;
 	return (
 		<AppShell>
 			<Outlet />

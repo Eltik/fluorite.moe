@@ -20,10 +20,16 @@ import {
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
-import { isApiError, type Root, type SearchItem } from "@/lib/api";
+import { isApiError, type Root, type SearchItem, thumbUrl } from "@/lib/api";
+import {
+	type CatalogHit,
+	catalogSearchQuery,
+	KIND_SINGULAR,
+} from "@/lib/catalog";
 import { dirname, formatBytes } from "@/lib/format";
 import { fileTarget, ROOT_META } from "@/lib/nav";
 import { searchQuery } from "@/lib/queries";
+import { useSettings } from "@/lib/settings";
 
 // ---------------------------------------------------------------- context
 
@@ -82,7 +88,8 @@ type PageEntry = {
 	nav: (typeof NAV)[number]["items"][number];
 };
 type FileEntry = { type: "file"; id: string; item: SearchItem };
-type Entry = PageEntry | FileEntry;
+type EntityEntry = { type: "entity"; id: string; hit: CatalogHit };
+type Entry = PageEntry | FileEntry | EntityEntry;
 type Group = { value: string; label: string; items: Entry[] };
 
 const PAGES: PageEntry[] = NAV.flatMap((section) =>
@@ -106,6 +113,11 @@ function PaletteBody({ onDone }: { onDone: () => void }): React.ReactElement {
 		...searchQuery({ q, limit: 80 }),
 		placeholderData: keepPreviousData,
 	});
+	const { textLanguage } = useSettings();
+	const catalog = useQuery({
+		...catalogSearchQuery(q, textLanguage),
+		placeholderData: keepPreviousData,
+	});
 
 	const groups = React.useMemo<Group[]>(() => {
 		const needle = value.trim().toLowerCase();
@@ -118,6 +130,19 @@ function PaletteBody({ onDone }: { onDone: () => void }): React.ReactElement {
 		const out: Group[] = [];
 		if (pages.length)
 			out.push({ value: "pages", label: "Go to", items: pages });
+		if (q && catalog.data && catalog.data.length > 0) {
+			out.push({
+				value: "catalog",
+				label: "Catalog",
+				items: catalog.data.flatMap((group) =>
+					group.items.map((hit) => ({
+						type: "entity" as const,
+						id: `entity:${hit.kind}:${hit.id}`,
+						hit,
+					})),
+				),
+			});
+		}
 		if (q && search.data) {
 			const byRoot = new Map<Root, FileEntry[]>();
 			for (const item of search.data.items) {
@@ -132,20 +157,25 @@ function PaletteBody({ onDone }: { onDone: () => void }): React.ReactElement {
 			}
 		}
 		return out;
-	}, [value, q, search.data]);
+	}, [value, q, search.data, catalog.data]);
 
 	const open = (entry: Entry) => {
 		onDone();
 		if (entry.type === "page") {
 			void navigate(entry.nav.link);
+		} else if (entry.type === "entity") {
+			void navigate({
+				to: "/catalog/$kind/$id",
+				params: { kind: entry.hit.kind, id: entry.hit.id },
+			});
 		} else {
 			void navigate(fileTarget(entry.item.root, entry.item.path));
 		}
 	};
 
-	const pending = value.trim() !== q || search.isFetching;
+	const pending = value.trim() !== q || search.isFetching || catalog.isFetching;
 	const status = (() => {
-		if (!value.trim()) return "Type to search every file path";
+		if (!value.trim()) return "Type to search the catalog and every file path";
 		if (search.isError) {
 			return isApiError(search.error) && search.error.status === 0
 				? "Search is unavailable: the API is offline"
@@ -154,7 +184,7 @@ function PaletteBody({ onDone }: { onDone: () => void }): React.ReactElement {
 		if (pending && !search.data) return "Searching…";
 		if (search.data && q) {
 			const shown = groups
-				.filter((g) => g.value !== "pages")
+				.filter((g) => g.value !== "pages" && g.value !== "catalog")
 				.reduce((n, g) => n + g.items.length, 0);
 			return `${search.data.total.toLocaleString()} matches${
 				search.data.total > shown ? ` · showing ${shown}` : ""
@@ -168,15 +198,19 @@ function PaletteBody({ onDone }: { onDone: () => void }): React.ReactElement {
 			filter={null}
 			itemToStringValue={(value) => {
 				const entry = value as Entry;
-				return entry.type === "page" ? entry.label : entry.item.path;
+				return entry.type === "page"
+					? entry.label
+					: entry.type === "entity"
+						? entry.hit.name
+						: entry.item.path;
 			}}
 			items={groups}
 			onValueChange={setValue}
 			value={value}
 		>
 			<CommandInput
-				aria-label="Search pages and files"
-				placeholder="Search pages and files…"
+				aria-label="Search pages, catalog and files"
+				placeholder="Search pages, catalog and files…"
 			/>
 			<CommandPanel>
 				<CommandEmpty>
@@ -241,6 +275,29 @@ function EntryRow({ entry }: { entry: Entry }): React.ReactElement {
 				<Icon className="size-4 text-muted-foreground" />
 				<span className="flex-1 truncate">{entry.label}</span>
 				<span className="text-muted-foreground text-xs">{entry.section}</span>
+			</>
+		);
+	}
+	if (entry.type === "entity") {
+		const { hit } = entry;
+		return (
+			<>
+				{hit.icon ? (
+					<img
+						alt=""
+						className="size-6 shrink-0 rounded-md bg-muted object-contain"
+						loading="lazy"
+						src={thumbUrl(hit.icon, 128)}
+					/>
+				) : (
+					<span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted font-medium text-[0.625rem] text-muted-foreground">
+						{[...hit.name][0]}
+					</span>
+				)}
+				<span className="flex-1 truncate">{hit.name}</span>
+				<span className="shrink-0 text-muted-foreground text-xs">
+					{KIND_SINGULAR[hit.kind]}
+				</span>
 			</>
 		);
 	}

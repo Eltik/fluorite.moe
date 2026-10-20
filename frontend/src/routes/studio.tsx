@@ -1,54 +1,50 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
-import { BoxesIcon } from "lucide-react";
-import type * as React from "react";
-import { Button } from "@/components/ui/button";
-import {
-	Empty,
-	EmptyContent,
-	EmptyDescription,
-	EmptyHeader,
-	EmptyMedia,
-	EmptyTitle,
-} from "@/components/ui/empty";
+import { ClientOnly, createFileRoute } from "@tanstack/react-router";
+import * as React from "react";
+import { z } from "zod";
+import { LogoMark } from "@/components/shell/logo";
+import { Spinner } from "@/components/ui/spinner";
 import { pageTitle } from "@/lib/route-meta";
 
-export const Route = createFileRoute("/studio")({
-	head: () => ({ meta: [{ title: pageTitle("Studio") }] }),
-	staticData: { crumb: "Studio" },
-	component: Studio,
+/** The Studio bundle (three, r3f, drei) loads only when the Studio opens. */
+const loadStudio = () => import("@/components/studio/studio-app");
+const StudioApp = React.lazy(loadStudio);
+
+const searchSchema = z.object({
+	bg: z.string().max(32).optional().catch(undefined),
+	clip: z.string().max(200).optional().catch(undefined),
 });
 
-function Studio(): React.ReactElement {
+export const Route = createFileRoute("/studio")({
+	validateSearch: searchSchema,
+	// Start fetching the 3D chunk while the route is matched / preloaded.
+	loader: () => {
+		if (typeof window !== "undefined") void loadStudio();
+	},
+	head: () => ({ meta: [{ title: pageTitle("Studio") }] }),
+	staticData: { crumb: "Studio", fullBleed: true },
+	component: StudioRoute,
+});
+
+function StudioSplash(): React.ReactElement {
 	return (
-		<div className="relative flex flex-1 flex-col overflow-hidden">
-			{/* Soft stage glow hinting at the 3D viewport to come. */}
-			<div
-				aria-hidden="true"
-				className="pointer-events-none absolute inset-x-0 top-1/3 mx-auto h-72 max-w-2xl rounded-full bg-violet-500/10 blur-3xl dark:bg-violet-400/10"
-			/>
-			<Empty className="relative">
-				<EmptyHeader>
-					<EmptyMedia variant="icon">
-						<BoxesIcon />
-					</EmptyMedia>
-					<EmptyTitle>The studio is being built</EmptyTitle>
-					<EmptyDescription>
-						A full 3D viewer for operators, enemies and weapons, with
-						animations, in-game shading and props, is on its way. Until then,
-						static models can be previewed from the model browser.
-					</EmptyDescription>
-				</EmptyHeader>
-				<EmptyContent className="flex-row justify-center gap-2">
-					<Button
-						render={<Link params={{ root: "meshes" }} to="/browse/$root" />}
-					>
-						Browse models
-					</Button>
-					<Button render={<Link to="/" />} variant="outline">
-						Overview
-					</Button>
-				</EmptyContent>
-			</Empty>
-		</div>
+		<main className="flex h-dvh w-screen items-center justify-center bg-[radial-gradient(120%_90%_at_50%_38%,#ffffff_0%,#ebeaf2_45%,#c4c2d3_100%)] dark:bg-[radial-gradient(120%_90%_at_50%_38%,#353048_0%,#1a1824_50%,#09080d_100%)]">
+			<div className="flex flex-col items-center gap-3 text-muted-foreground text-sm">
+				<LogoMark className="size-8" />
+				<span className="flex items-center gap-2">
+					<Spinner className="size-4" />
+					Preparing the Studio…
+				</span>
+			</div>
+		</main>
+	);
+}
+
+function StudioRoute(): React.ReactElement {
+	return (
+		<ClientOnly fallback={<StudioSplash />}>
+			<React.Suspense fallback={<StudioSplash />}>
+				<StudioApp />
+			</React.Suspense>
+		</ClientOnly>
 	);
 }

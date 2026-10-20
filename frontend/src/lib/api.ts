@@ -115,10 +115,35 @@ export interface CatalogItem {
 	id: string;
 	name: string;
 	rarity?: number;
-	tags: string[];
+	tags: CatalogTag[];
 	/** Path relative to the `textures` root. */
 	icon?: string;
-	model?: { parts: string[] };
+	/** Whether a 3D model was found for this entry (Studio). */
+	hasModel?: boolean;
+	model?: CatalogModel;
+}
+
+export interface CatalogTag {
+	kind: string;
+	code: string;
+	name: string;
+}
+
+export interface CatalogModelPart {
+	name: string;
+	/** Path under the `meshes` root. */
+	path: string;
+	lod: number;
+}
+
+/** 3D model references for an entity (see the Studio). */
+export interface CatalogModel {
+	/** Mesh folder under the `meshes` root. */
+	dir?: string;
+	/** Static GLB parts under the `meshes` root, best LOD per part. */
+	parts: CatalogModelPart[];
+	/** Skinned, textured GLB under the `models` root, when one was exported. */
+	rigged?: string;
 }
 
 export interface CatalogList {
@@ -223,6 +248,15 @@ async function request<T>(
 ): Promise<T> {
 	const res = await send(path, init);
 	return (await res.json()) as T;
+}
+
+/** GET a JSON endpoint; used by feature modules (e.g. `lib/catalog.ts`). */
+export function getJson<T>(
+	path: string,
+	query?: Query,
+	signal?: AbortSignal,
+): Promise<T> {
+	return request<T>(path, { query, signal });
 }
 
 /** Encodes each segment of a relative path, keeping the slashes. */
@@ -337,6 +371,11 @@ export const api = {
 
 export function fileUrl(root: Root, path: string): string {
 	return `${API_URL}/files/${root}/${encodePath(path)}`;
+}
+
+/** Rigged GLBs live in the `models` root, which the browser views don't list. */
+export function modelFileUrl(path: string): string {
+	return `${API_URL}/files/models/${encodePath(path)}`;
 }
 
 export type ThumbSize = 128 | 256 | 512;

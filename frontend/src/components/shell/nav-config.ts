@@ -1,11 +1,14 @@
 import type { LinkOptions } from "@tanstack/react-router";
 import {
+	BookOpenIcon,
 	BoxesIcon,
+	FactoryIcon,
 	HouseIcon,
 	type LucideIcon,
 	PackageIcon,
 	SkullIcon,
 	SwordIcon,
+	UserRoundIcon,
 	UsersIcon,
 } from "lucide-react";
 import type { StatusCounts } from "@/lib/api";
@@ -65,6 +68,24 @@ export const NAV: NavSection[] = [
 				icon: PackageIcon,
 				link: { to: "/catalog/$kind", params: { kind: "items" } },
 				href: "/catalog/items",
+			},
+			{
+				label: "NPCs",
+				icon: UserRoundIcon,
+				link: { to: "/catalog/$kind", params: { kind: "npcs" } },
+				href: "/catalog/npcs",
+			},
+			{
+				label: "Facilities",
+				icon: FactoryIcon,
+				link: { to: "/catalog/$kind", params: { kind: "facilities" } },
+				href: "/catalog/facilities",
+			},
+			{
+				label: "Story",
+				icon: BookOpenIcon,
+				link: { to: "/story" },
+				href: "/story",
 			},
 		],
 	},

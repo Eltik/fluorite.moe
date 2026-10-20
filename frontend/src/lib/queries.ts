@@ -100,3 +100,14 @@ export const catalogQuery = (kind: CatalogKind, lang: string) =>
 			!(error instanceof Error && "status" in error && error.status === 501) &&
 			count < 1,
 	});
+
+export const catalogDetailQuery = (
+	kind: CatalogKind,
+	id: string,
+	lang: string,
+) =>
+	queryOptions({
+		queryKey: ["catalog", kind, lang, "detail", id],
+		queryFn: ({ signal }) => api.catalogDetail(kind, id, lang, signal),
+		staleTime: 10 * MINUTE,
+	});
