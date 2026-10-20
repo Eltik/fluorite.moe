@@ -1,6 +1,6 @@
 //! Skinning data of a Unity Mesh: bone weights/indices (vertex channels 12/13) and bind poses.
 use super::convert::{RowMajor, normalize_influences};
-use crate::extraction::mesh::decode_scalar;
+use crate::extraction::mesh::{CompressedSkin, decode_compressed_skin, decode_scalar};
 use crate::extraction::texture::resolve_stream_data;
 use crate::extraction::unity::value_bytes;
 use serde_json::Value;
@@ -76,6 +76,9 @@ pub fn decode_skin_weights(
     mesh: &Value,
     resources: &HashMap<String, Vec<u8>>,
 ) -> Result<Option<SkinWeights>, String> {
+    if let Some(skin) = decode_compressed_skin(mesh)? {
+        return Ok(Some(from_compressed(skin)));
+    }
     let vertex = mesh.get("m_VertexData").ok_or("missing m_VertexData")?;
     let count = vertex
         .get("m_VertexCount")
@@ -95,6 +98,29 @@ pub fn decode_skin_weights(
         .filter(|c| c.dimension > 0);
     let data = vertex_bytes(mesh, resources).ok_or("missing vertex data")?;
     decode_with_layout(&chans, indices, weights, &data, count).map(Some)
+}
+
+/// Normalize influences decoded from `m_CompressedMesh` (always four slots, 5-bit weights).
+fn from_compressed(skin: CompressedSkin) -> SkinWeights {
+    let mut out = SkinWeights {
+        joints: Vec::with_capacity(skin.joints.len()),
+        weights: Vec::with_capacity(skin.weights.len()),
+        influences: 4,
+        renormalized: 0,
+        unweighted: 0,
+    };
+    for (mut j, mut w) in skin.joints.into_iter().zip(skin.weights) {
+        let sum: f32 = w.iter().sum();
+        if sum <= 0.0 {
+            out.unweighted += 1;
+        } else if (sum - 1.0).abs() > 1e-3 {
+            out.renormalized += 1;
+        }
+        normalize_influences(&mut j, &mut w, 0);
+        out.joints.push(j);
+        out.weights.push(w);
+    }
+    out
 }
 
 fn decode_with_layout(

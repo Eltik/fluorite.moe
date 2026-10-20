@@ -182,20 +182,397 @@ fn channel_values(
         .collect()
 }
 
+/// Bytes per index of `m_IndexFormat` (0: UInt16, 1: UInt32).
+fn index_size(mesh: &Value) -> Result<usize, String> {
+    match mesh
+        .get("m_IndexFormat")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+    {
+        0 => Ok(2),
+        1 => Ok(4),
+        _ => Err("unsupported index format".into()),
+    }
+}
+
+/// Triangle lists of `m_SubMeshes`, resolved against the mesh's whole index list.
+///
+/// `firstByte` counts bytes of an `index_size`-wide index buffer, also for compressed meshes
+/// whose indices are bit-packed.
+fn submeshes(
+    mesh: &Value,
+    indices: &[u32],
+    index_size: usize,
+    count: usize,
+) -> Result<Vec<Vec<u32>>, String> {
+    let submeshes = mesh
+        .get("m_SubMeshes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing m_SubMeshes".to_string())?
+        .iter()
+        .filter_map(|v| v.as_object())
+        .filter(|o| integer(o, "topology").ok() == Some(0))
+        .map(|o| {
+            let first_byte = index_field(o, "firstByte")?;
+            let n = index_field(o, "indexCount")?;
+            let base = integer(o, "baseVertex")?;
+            if n % 3 != 0 {
+                return Err("triangle index count is not divisible by three".into());
+            }
+            if !first_byte.is_multiple_of(index_size) {
+                return Err("misaligned submesh firstByte".into());
+            }
+            let first = first_byte / index_size;
+            let end = first
+                .checked_add(n)
+                .ok_or_else(|| "index buffer overflow".to_string())?;
+            let slice = indices
+                .get(first..end)
+                .ok_or_else(|| "index buffer is too short".to_string())?;
+            slice
+                .iter()
+                .map(|&raw| {
+                    let index = i64::from(raw)
+                        .checked_add(base)
+                        .ok_or_else(|| "index overflow".to_string())?;
+                    if index < 0 || index as usize >= count {
+                        return Err("index out of range".into());
+                    }
+                    Ok(index as u32)
+                })
+                .collect()
+        })
+        .collect::<Result<Vec<Vec<u32>>, String>>()?;
+    if submeshes.iter().all(Vec::is_empty) {
+        return Err("mesh has no triangles".into());
+    }
+    Ok(submeshes)
+}
+
+/// Whether `m_CompressedMesh` actually carries vertices.
+///
+/// Endfield sets m_MeshCompression to values stock Unity never writes (4, 5) on meshes whose
+/// m_CompressedMesh is empty and whose vertices are in m_VertexData as usual, so the payload
+/// decides, not the flag.
+fn has_compressed_vertices(mesh: &Value) -> bool {
+    mesh.pointer("/m_CompressedMesh/m_Vertices/m_NumItems")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        > 0
+}
+
+/// A Unity `PackedBitVector`: `num_items` unsigned values of `bit_size` bits each, packed
+/// least-significant bit first. Float vectors map each value linearly onto
+/// `[start, start + range]`.
+pub(crate) struct PackedBitVector {
+    pub num_items: usize,
+    pub bit_size: u32,
+    pub data: Vec<u8>,
+    pub range: f32,
+    pub start: f32,
+}
+
+impl PackedBitVector {
+    /// Parse a `PackedBitVector` value; `Ok(None)` when it is absent or empty.
+    fn from_value(value: Option<&Value>, name: &str) -> Result<Option<Self>, String> {
+        let Some(map) = value.and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        let num_items = usize::try_from(map.get("m_NumItems").and_then(Value::as_i64).unwrap_or(0))
+            .map_err(|_| format!("invalid {name}"))?;
+        if num_items == 0 {
+            return Ok(None);
+        }
+        let bit_size = map
+            .get("m_BitSize")
+            .and_then(Value::as_u64)
+            .and_then(|b| u32::try_from(b).ok())
+            .ok_or_else(|| format!("invalid {name}"))?;
+        let float = |key: &str| map.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        Ok(Some(Self {
+            num_items,
+            bit_size,
+            data: bytes(map.get("m_Data")).map_err(|e| format!("{name}: {e}"))?,
+            range: float("m_Range"),
+            start: float("m_Start"),
+        }))
+    }
+
+    /// The raw packed values.
+    pub fn unpack_ints(&self) -> Result<Vec<u32>, String> {
+        if self.bit_size > 32 {
+            return Err("packed bit size exceeds 32".into());
+        }
+        let bits = self.bit_size as usize;
+        let needed = self
+            .num_items
+            .checked_mul(bits)
+            .ok_or_else(|| "packed vector overflow".to_string())?
+            .div_ceil(8);
+        if self.data.len() < needed {
+            return Err("packed vector data is too short".into());
+        }
+        let mut out = Vec::with_capacity(self.num_items);
+        let mut pos = 0usize;
+        for _ in 0..self.num_items {
+            let mut value = 0u64;
+            let mut filled = 0usize;
+            while filled < bits {
+                let shift = pos % 8;
+                let take = (bits - filled).min(8 - shift);
+                let chunk = (u64::from(self.data[pos / 8]) >> shift) & ((1u64 << take) - 1);
+                value |= chunk << filled;
+                filled += take;
+                pos += take;
+            }
+            out.push(value as u32);
+        }
+        Ok(out)
+    }
+
+    /// The values dequantized to floats.
+    pub fn unpack_floats(&self) -> Result<Vec<f32>, String> {
+        let max = (1u64 << self.bit_size.min(32)) - 1;
+        Ok(self
+            .unpack_ints()?
+            .into_iter()
+            .map(|x| {
+                if max == 0 {
+                    self.start
+                } else {
+                    (f64::from(x) * f64::from(self.range) / max as f64) as f32 + self.start
+                }
+            })
+            .collect())
+    }
+}
+
+/// Rebuild a unit vector from its x and y and the sign of its z.
+///
+/// `x² + y² > 1` (quantization error) leaves z at 0 and renormalizes x and y instead.
+pub(crate) fn reconstruct_unit(x: f32, y: f32, z_positive: bool) -> [f32; 3] {
+    let z_squared = 1.0 - x * x - y * y;
+    let [x, y, z] = if z_squared >= 0.0 {
+        [x, y, z_squared.sqrt()]
+    } else {
+        let length = (x * x + y * y).sqrt();
+        if length < 1e-6 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [x / length, y / length, 0.0]
+        }
+    };
+    [x, y, if z_positive { z } else { -z }]
+}
+
+/// Bits per texture coordinate channel in `m_UVInfo`.
+const UV_INFO_BITS: u32 = 4;
+/// `m_UVInfo` bits holding a channel's dimension minus one.
+const UV_DIMENSION_MASK: i64 = 3;
+/// `m_UVInfo` bit marking a channel as present.
+const UV_CHANNEL_EXISTS: i64 = 4;
+
+/// Split the flat `m_UV` floats into per-channel `[u, v]` lists.
+///
+/// With `uv_info` set (Unity 2017.4+), channels are stored one after another, each
+/// `dimension * count` floats; channels of dimension 1 get v = 0 and components past the
+/// second are dropped. Without it, the first `2 * count` floats are uv0 and the next uv1.
+pub(crate) fn split_uvs(floats: &[f32], uv_info: i64, count: usize) -> Vec<Vec<[f32; 2]>> {
+    let mut uvs = Vec::new();
+    let mut offset = 0usize;
+    let channels: Vec<usize> = if uv_info == 0 {
+        (0..2)
+            .take_while(|i| floats.len() >= (i + 1) * 2 * count)
+            .map(|_| 2)
+            .collect()
+    } else {
+        (0..8)
+            .map(|i| (uv_info >> (i * UV_INFO_BITS)) & 0xf)
+            .filter(|bits| bits & UV_CHANNEL_EXISTS != 0)
+            .map(|bits| 1 + (bits & UV_DIMENSION_MASK) as usize)
+            .collect()
+    };
+    for dimension in channels {
+        let Some(values) = floats.get(offset..offset + dimension * count) else {
+            break;
+        };
+        uvs.push(
+            values
+                .chunks_exact(dimension)
+                .map(|c| [c[0], c.get(1).copied().unwrap_or(0.0)])
+                .collect(),
+        );
+        offset += dimension * count;
+    }
+    uvs
+}
+
+fn compressed_field<'a>(mesh: &'a Value, name: &str) -> Option<&'a Value> {
+    mesh.get("m_CompressedMesh").and_then(|cm| cm.get(name))
+}
+
+fn packed_field(mesh: &Value, name: &str) -> Result<Option<PackedBitVector>, String> {
+    PackedBitVector::from_value(compressed_field(mesh, name), name)
+}
+
+/// Reconstructed unit vectors and the raw sign bits they were read with.
+type UnitsWithSigns = (Vec<[f32; 3]>, Vec<u32>);
+
+/// Unit vectors stored as packed (x, y) pairs plus one z-sign bit per vector, where the sign
+/// of vector `i` is `signs[i * sign_stride]`. `None` when absent or not one per vertex.
+fn compressed_units(
+    mesh: &Value,
+    name: &str,
+    signs_name: &str,
+    sign_stride: usize,
+    count: usize,
+) -> Result<Option<UnitsWithSigns>, String> {
+    let Some(packed) = packed_field(mesh, name)? else {
+        return Ok(None);
+    };
+    let signs = packed_field(mesh, signs_name)?
+        .map(|s| s.unpack_ints())
+        .transpose()?
+        .unwrap_or_default();
+    if packed.num_items != count * 2 || signs.len() < count * sign_stride {
+        return Ok(None);
+    }
+    let units = packed
+        .unpack_floats()?
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, [x, y])| reconstruct_unit(*x, *y, signs[i * sign_stride] != 0))
+        .collect();
+    Ok(Some((units, signs)))
+}
+
+/// Decode a mesh whose geometry lives in `m_CompressedMesh` (the import-time "Mesh
+/// Compression" setting), as AssetStudio and UnityPy do.
+fn decode_compressed_mesh(mesh: &Value) -> Result<DecodedMesh, String> {
+    let vertices =
+        packed_field(mesh, "m_Vertices")?.ok_or_else(|| "mesh has no vertices".to_string())?;
+    if !vertices.num_items.is_multiple_of(3) {
+        return Err("compressed vertex count is not divisible by three".into());
+    }
+    let count = vertices.num_items / 3;
+    let positions = vertices.unpack_floats()?.as_chunks::<3>().0.to_vec();
+    let uvs = match packed_field(mesh, "m_UV")? {
+        Some(uv) => {
+            let uv_info = compressed_field(mesh, "m_UVInfo")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            split_uvs(&uv.unpack_floats()?, uv_info, count)
+        }
+        None => Vec::new(),
+    };
+    let normals = compressed_units(mesh, "m_Normals", "m_NormalSigns", 1, count)?.map(|(n, _)| n);
+    // Tangent signs alternate: z sign, then handedness (w).
+    let tangents =
+        compressed_units(mesh, "m_Tangents", "m_TangentSigns", 2, count)?.map(|(units, signs)| {
+            units
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    [
+                        t[0],
+                        t[1],
+                        t[2],
+                        if signs[i * 2 + 1] != 0 { 1.0 } else { -1.0 },
+                    ]
+                })
+                .collect()
+        });
+    let colors = match packed_field(mesh, "m_FloatColors")? {
+        Some(c) if c.num_items == count * 4 => Some(c.unpack_floats()?.as_chunks::<4>().0.to_vec()),
+        _ => None,
+    };
+    let indices = packed_field(mesh, "m_Triangles")?
+        .ok_or_else(|| "mesh has no triangles".to_string())?
+        .unpack_ints()?;
+    let submeshes = submeshes(mesh, &indices, index_size(mesh)?, count)?;
+    Ok(DecodedMesh {
+        name: mesh
+            .get("m_Name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        positions,
+        normals,
+        tangents,
+        colors,
+        uvs,
+        submeshes,
+    })
+}
+
+/// Skin influences of a compressed mesh: per vertex up to four bone indices and weights.
+///
+/// Weights are 5-bit (sum 31) and listed per vertex until they reach 31; a vertex with three
+/// listed weights short of 31 gets the remainder as an implicit fourth. Every listed weight,
+/// implicit ones included, consumes one entry of `m_BoneIndices`. `Ok(None)` when the mesh
+/// has no compressed weights.
+pub fn decode_compressed_skin(mesh: &Value) -> Result<Option<CompressedSkin>, String> {
+    if !has_compressed_vertices(mesh) {
+        return Ok(None);
+    }
+    let Some(weights) = packed_field(mesh, "m_Weights")? else {
+        return Ok(None);
+    };
+    let weights = weights.unpack_ints()?;
+    let bones = packed_field(mesh, "m_BoneIndices")?
+        .map(|b| b.unpack_ints())
+        .transpose()?
+        .unwrap_or_default();
+    let mut bones = bones.into_iter();
+    let mut next_bone = || -> Result<u16, String> {
+        let bone = bones
+            .next()
+            .ok_or_else(|| "compressed bone indices are too short".to_string())?;
+        u16::try_from(bone).map_err(|_| format!("bone index {bone} out of range"))
+    };
+    let mut skin = CompressedSkin::default();
+    let (mut joints, mut values, mut slot, mut sum) = ([0u16; 4], [0f32; 4], 0usize, 0u32);
+    for weight in weights {
+        joints[slot] = next_bone()?;
+        values[slot] = weight as f32 / 31.0;
+        slot += 1;
+        sum += weight;
+        if sum >= 31 || slot == 3 {
+            if sum < 31 {
+                joints[3] = next_bone()?;
+                values[3] = (31 - sum) as f32 / 31.0;
+            }
+            skin.joints.push(joints);
+            skin.weights.push(values);
+            (joints, values, slot, sum) = ([0; 4], [0.0; 4], 0, 0);
+        }
+    }
+    let vertices = packed_field(mesh, "m_Vertices")?.map_or(0, |v| v.num_items / 3);
+    if skin.joints.len() != vertices {
+        return Err(format!(
+            "compressed skin covers {} of {vertices} vertices",
+            skin.joints.len()
+        ));
+    }
+    Ok(Some(skin))
+}
+
+/// Per-vertex skin influences decoded from `m_CompressedMesh`.
+#[derive(Debug, Default, PartialEq)]
+pub struct CompressedSkin {
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
+}
+
 /// Decode a Unity Mesh object, including streamed vertex data.
 pub fn decode_mesh(
     mesh: &Value,
     resources: &HashMap<String, Vec<u8>>,
 ) -> Result<DecodedMesh, String> {
-    // Endfield sets m_MeshCompression to values stock Unity never writes (4, 5) on meshes whose
-    // m_CompressedMesh is empty and whose vertices are in m_VertexData as usual, so trust the
-    // payload rather than the flag.
-    let compressed_vertices = mesh
-        .pointer("/m_CompressedMesh/m_Vertices/m_NumItems")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    if compressed_vertices > 0 {
-        return Err("compressed mesh unsupported".into());
+    if has_compressed_vertices(mesh) {
+        return decode_compressed_mesh(mesh);
     }
     let vertex = object(mesh.get("m_VertexData"), "m_VertexData")?;
     let count =
@@ -298,60 +675,23 @@ pub fn decode_mesh(
         }
     }
     let index_data = bytes(mesh.get("m_IndexBuffer"))?;
-    let index_size = match mesh
-        .get("m_IndexFormat")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-    {
-        0 => 2,
-        1 => 4,
-        _ => return Err("unsupported index format".into()),
+    let index_size = index_size(mesh)?;
+    let indices: Vec<u32> = if index_size == 2 {
+        index_data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u32::from(u16::from_le_bytes(*b)))
+            .collect()
+    } else {
+        index_data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect()
     };
-    let submeshes = mesh
-        .get("m_SubMeshes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "missing m_SubMeshes".to_string())?
-        .iter()
-        .filter_map(|v| v.as_object())
-        .filter(|o| integer(o, "topology").ok() == Some(0))
-        .map(|o| {
-            let first = index_field(o, "firstByte")?;
-            let n = index_field(o, "indexCount")?;
-            let base = integer(o, "baseVertex")?;
-            if n % 3 != 0 {
-                return Err("triangle index count is not divisible by three".into());
-            }
-            let end = first
-                .checked_add(
-                    n.checked_mul(index_size)
-                        .ok_or_else(|| "index buffer overflow".to_string())?,
-                )
-                .ok_or_else(|| "index buffer overflow".to_string())?;
-            if end > index_data.len() {
-                return Err("index buffer is too short".into());
-            }
-            (0..n)
-                .map(|i| {
-                    let off = first + i * index_size;
-                    let raw = if index_size == 2 {
-                        u16::from_le_bytes(index_data[off..off + 2].try_into().unwrap()) as i64
-                    } else {
-                        u32::from_le_bytes(index_data[off..off + 4].try_into().unwrap()) as i64
-                    };
-                    let index = raw
-                        .checked_add(base)
-                        .ok_or_else(|| "index overflow".to_string())?;
-                    if index < 0 || index as usize >= count {
-                        return Err("index out of range".into());
-                    }
-                    Ok(index as u32)
-                })
-                .collect()
-        })
-        .collect::<Result<Vec<Vec<u32>>, String>>()?;
-    if submeshes.iter().all(Vec::is_empty) {
-        return Err("mesh has no triangles".into());
-    }
+    let submeshes = submeshes(mesh, &indices, index_size, count)?;
     Ok(DecodedMesh {
         name: mesh
             .get("m_Name")
