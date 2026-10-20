@@ -238,6 +238,8 @@ enum Node {
 /// A compiled MemoryPack schema (`{format, game_version, nodes, roots, dir_roots}`).
 #[derive(Debug)]
 pub struct Schema {
+    /// Game version the schema was compiled from, when recorded.
+    game_version: Option<String>,
     nodes: Vec<Node>,
     roots: HashMap<String, usize>,
     dir_roots: HashMap<String, Vec<String>>,
@@ -381,7 +383,12 @@ impl Schema {
         // Byte-wise `String` order is code point order, which is how the reference sorts.
         obj_roots.values_mut().for_each(|names| names.sort());
         union_roots.sort();
+        let game_version = value
+            .get("game_version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         Ok(Self {
+            game_version,
             nodes,
             roots,
             dir_roots,
@@ -406,6 +413,11 @@ impl Schema {
             .get_or_init(|| Schema::from_gzip(EMBEDDED_SCHEMA))
             .as_ref()
             .map_err(|e| invalid(format!("embedded MemoryPack schema: {e}")))
+    }
+
+    /// Game version the schema was compiled from (`"1.6.4"`), if it records one.
+    pub fn game_version(&self) -> Option<&str> {
+        self.game_version.as_deref()
     }
 
     /// Root types to try for a file in `rel_dir` whose first byte is `first`, in order: the

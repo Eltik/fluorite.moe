@@ -3,6 +3,7 @@ pub mod chacha20;
 pub mod crypto_constants;
 pub mod fair_guard_utils;
 pub mod gamedata;
+pub mod health;
 pub mod lua;
 pub mod lz4_inv;
 pub mod memorypack;

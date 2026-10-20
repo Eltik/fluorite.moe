@@ -4,7 +4,7 @@ Rust toolkit for extracting and decrypting game assets from the Arknights: Endfi
 
 ## Installation
 
-Requires Rust 2024 edition (nightly or recent stable) and an internet connection. No game installation needed since all data is fetched from the public CDN.
+Requires Rust 2024 edition and an internet connection. No game installation needed since all data is fetched from the public CDN. `backend/rust-toolchain.toml` pins the toolchain (currently 1.98.0, with rustfmt and clippy), so rustup installs that version on the first build and a later update of stable can't break the unattended cron builds. Bump the pin deliberately after checking `cargo clippy --release --all-targets` and `cargo test --release` pass.
 
 ```bash
 git clone https://github.com/eltik/fluorite.moe.git
@@ -194,7 +194,22 @@ cargo run --release --bin endfield -- update --check
 | `--no-meshes` | Skip mesh export |
 | `--skip-dir <HASH,...>` | Leave these BLC directories alone; the version fingerprint is not recorded, so a later run without it fetches them |
 
-Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`.
+Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`: version and `res_version`, chunk/sort/BLC counts (`chk_dirty`, `chk_ok`, `chk_failed`, `sort_*`, `blc_*`), asset counts from the chunk phase (`tex_extracted`, `tex_failed`, `mesh_exported`, `mesh_failed`), decode counts summed over the BLC directories it extracted (`lua_decrypted`, `memorypack_decoded`, `memorypack_failed`), the embedded MemoryPack schema's game version (`schema_version`), and `duration_secs`.
+
+#### `endfield health`
+
+Reads `<output>/update-log.jsonl` and prints one `OK:` / `WARN:` / `FAIL:` line per check. Exits `0` if everything is OK, `1` on any warning, `2` on any failure. Old log lines without the newer counters are fine, and blank or garbled lines are skipped.
+
+```bash
+cargo run --release --bin endfield -- health --output ./output --max-age-hours 26
+```
+
+| Check | WARN | FAIL |
+|-------|------|------|
+| Freshness | | Log missing or empty, or the newest run is older than `--max-age-hours` (default 26) |
+| Run failures | Newest run had `chk_failed + sort_failed + blc_failed > 0` | The last 3 runs all had failures |
+| MemoryPack | Newest run that decoded any JsonData files had more than 1% fail; or the game version's major.minor differs from `schema_version`'s. Regenerate the schema per `backend/scripts/memorypack-schema/README.md` | |
+| Textures / meshes | `tex_failed` or `mesh_failed` exceeds the previous run that logged it by more than max(50, 10%) | |
 
 When the texture layout changes, the next `update` sorts existing PNGs instead of re-extracting them. For each chunk that is unchanged upstream, it downloads the chunk and reads only its bundle metadata, then moves the old flat PNGs (`textures/<name>.png`) into the new folders. Nothing is decoded and no PNG is rewritten. Chunks that did change upstream are extracted normally. When a name matches several textures, the file's dimensions pick one; if they can't, it goes to `textures/_ambiguous/` with its candidate paths listed in `candidates.jsonl`. State is saved only after the sort finishes, so an interrupted run starts the sort again on the next run. Leftover top-level PNGs (textures no longer in the game) are deleted once every chunk succeeds.
 
@@ -214,7 +229,10 @@ Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonD
 
 ```cron
 */15 * * * * /abs/path/to/fluorite.moe/backend/scripts/auto-update.sh
+0 9 * * * FLUORITE_ALERT_WEBHOOK=https://discord.com/api/webhooks/... /abs/path/to/fluorite.moe/backend/scripts/health-check.sh >> /abs/path/to/fluorite.moe/backend/data/logs/health.log 2>&1
 ```
+
+`backend/scripts/health-check.sh` rebuilds the binary if needed and runs `endfield health` (arguments pass through, e.g. `--max-age-hours 30`). When the result isn't OK, it posts a macOS notification (when `osascript` is available) and, if `FLUORITE_ALERT_WEBHOOK` is set, POSTs `{"content": ..., "text": ...}` to it, which works for both Discord and Slack incoming webhooks. It exits with the health exit code. Both scripts build with the toolchain pinned in `backend/rust-toolchain.toml`.
 
 ### auth-test
 
@@ -252,6 +270,7 @@ backend/
 │       ├── crypto_constants.rs # Encryption keys and constants
 │       ├── fair_guard_utils.rs # FairGuard anti-cheat obfuscation helpers
 │       ├── gamedata.rs         # TextAsset/MonoBehaviour export by container path
+│       ├── health.rs           # `health` checks over the update run log
 │       ├── lua.rs              # Lua script decryption (base64 + XXTEA)
 │       ├── lz4_inv.rs          # Custom LZ4 decompression
 │       ├── memorypack.rs       # JsonData MemoryPack → JSON (schema-driven)

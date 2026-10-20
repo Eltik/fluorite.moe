@@ -7,12 +7,14 @@
 //!   decrypt       — extract BLC-catalogued VFS directories (tables, json, lua, audio, video)
 //!   update        — incremental extraction of everything that changed upstream
 //!   repair        — flip textures extracted before the orientation fix, in place
+//!   health        — check the update run log for staleness and regressions
 //!   list          — list all VFS directories and files
 //!   scan          — scan for asset names/paths
 //!   survey        — survey all Unity objects, types, counts
 use backend::core::endfield::config::{PatchIndex, resolve_game_config};
 use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
+use backend::extraction::health;
 use backend::extraction::lua;
 use backend::extraction::memorypack;
 use backend::extraction::mesh;
@@ -134,6 +136,15 @@ enum Commands {
         #[arg(long, default_value = "./data/update-state.json")]
         state: String,
     },
+    /// Check `<output>/update-log.jsonl`; exit 0 if healthy, 1 on warnings, 2 on failures
+    Health {
+        /// Output directory
+        #[arg(long, default_value = "./output")]
+        output: String,
+        /// Newest run older than this many hours fails the check
+        #[arg(long, default_value_t = 26)]
+        max_age_hours: i64,
+    },
     /// List all VFS directories and files in the CDN archive
     List,
     /// Scan for asset names/paths
@@ -208,6 +219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Commands::Repair { output, state } => cmd_repair(Path::new(&output), Path::new(&state)),
+        Commands::Health {
+            output,
+            max_age_hours,
+        } => cmd_health(Path::new(&output), max_age_hours),
         Commands::List => cmd_list(&client).await,
         Commands::Scan { scan_all } => cmd_scan(&client, scan_all).await,
         Commands::Survey { scan_all } => cmd_survey(&client, scan_all).await,
@@ -820,6 +835,9 @@ async fn cmd_update(
     fs::create_dir_all(output)?;
     let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
         "chk_dirty": chk.dirty, "chk_ok": chk.ok, "chk_failed": chk.failed, "sort_chks": sort.chks, "sort_moved": sort.moved, "sort_failed": sort.failed, "blc_dirty": blc.dirty, "blc_ok": blc.ok, "blc_failed": blc.failed,
+        "tex_extracted": chk.tex_extracted, "tex_failed": chk.tex_failed, "mesh_exported": chk.mesh_exported, "mesh_failed": chk.mesh_failed,
+        "lua_decrypted": blc.lua_decrypted, "memorypack_decoded": blc.memorypack_decoded, "memorypack_failed": blc.memorypack_failed,
+        "schema_version": memorypack::Schema::embedded().ok().and_then(memorypack::Schema::game_version),
         "duration_secs": started.elapsed().as_secs_f64()});
     let mut log = fs::OpenOptions::new()
         .create(true)
@@ -888,6 +906,10 @@ struct ChunkCounts {
     dirty: u64,
     ok: u64,
     failed: u64,
+    tex_extracted: u64,
+    tex_failed: u64,
+    mesh_exported: u64,
+    mesh_failed: u64,
 }
 
 /// Download and extract every dirty chunk, checkpointing the state after each one.
@@ -903,6 +925,10 @@ async fn extract_dirty_chunks(
         dirty: dirty.len() as u64,
         ok: 0,
         failed: 0,
+        tex_extracted: 0,
+        tex_failed: 0,
+        mesh_exported: 0,
+        mesh_failed: 0,
     };
     let mut stats = ExtractStats::default();
     let mut progress = DownloadProgress::start(
@@ -963,6 +989,10 @@ async fn extract_dirty_chunks(
     if counts.dirty > 0 {
         stats.print(modes);
     }
+    counts.tex_extracted = stats.total_tex_extracted;
+    counts.tex_failed = stats.total_tex_failed;
+    counts.mesh_exported = stats.total_meshes;
+    counts.mesh_failed = stats.total_mesh_failed;
     Ok(counts)
 }
 
@@ -1105,10 +1135,23 @@ fn clean_legacy_gamedata(gamedata_dir: &Path, state: &UpdateState) {
     }
 }
 
+#[derive(Default)]
 struct BlcCounts {
     dirty: u64,
     ok: u64,
     failed: u64,
+    lua_decrypted: u64,
+    memorypack_decoded: u64,
+    memorypack_failed: u64,
+}
+
+impl BlcCounts {
+    /// Sum a directory's decode counts, whether or not the directory is installed.
+    fn add_decodes(&mut self, result: &DirExtractResult) {
+        self.lua_decrypted += result.lua_decrypted as u64;
+        self.memorypack_decoded += result.memorypack_decoded as u64;
+        self.memorypack_failed += result.memorypack_failed as u64;
+    }
 }
 
 /// Digest of a BLC directory: its catalog's ZIP identity plus every patch file under it.
@@ -1135,11 +1178,7 @@ async fn extract_blc_directories(
     skip_dirs: &[String],
 ) -> Result<BlcCounts, Box<dyn std::error::Error>> {
     let resolved = ctx.resolved;
-    let mut counts = BlcCounts {
-        dirty: 0,
-        ok: 0,
-        failed: 0,
-    };
+    let mut counts = BlcCounts::default();
     let staging_parent = output.join("decrypted/.staging");
     let decrypted = output.join("decrypted");
     fs::create_dir_all(&staging_parent)?;
@@ -1173,6 +1212,7 @@ async fn extract_blc_directories(
         }
         match blc::extract_directory(ctx.client, resolved, dir, &staging).await {
             Ok(result) if !result.errors.is_empty() => {
+                counts.add_decodes(&result);
                 // Keep the previous complete copy; the directory stays dirty and is retried.
                 println!(
                     "  {} ({dir}): {} errors, first: {}",
@@ -1184,6 +1224,7 @@ async fn extract_blc_directories(
                 counts.failed += 1;
             }
             Ok(result) => {
+                counts.add_decodes(&result);
                 install_blc_group(&decrypted, dir, &result, &staging)?;
                 state.blc_dirs.insert(dir.to_string(), digest);
                 update::save_state(ctx.state_path, state)?;
@@ -1241,6 +1282,28 @@ fn install_blc_group(
         fs::remove_dir_all(legacy)?;
     }
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
+// health — check the update run log
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_health(output: &Path, max_age_hours: i64) -> Result<(), Box<dyn std::error::Error>> {
+    // A missing log reads as empty, which the evaluation reports as a failure.
+    let text = match fs::read_to_string(output.join("update-log.jsonl")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let entries = health::parse_log(&text);
+    let thresholds = health::Thresholds {
+        max_age: chrono::Duration::hours(max_age_hours),
+    };
+    let findings = health::evaluate(&entries, Utc::now(), thresholds);
+    for finding in &findings {
+        println!("{}: {}", finding.level.label(), finding.message);
+    }
+    std::process::exit(health::worst(&findings).exit_code());
 }
 
 // ═══════════════════════════════════════════════════════════
