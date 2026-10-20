@@ -9,7 +9,6 @@ import {
 	Table2Icon,
 } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState } from "@/components/status-views";
 import { DataGrid } from "@/components/table/data-grid";
@@ -33,17 +32,18 @@ import { formatNumber } from "@/lib/format";
 import { tableQuery } from "@/lib/queries";
 import { pushRecent } from "@/lib/recent";
 import { pageTitle } from "@/lib/route-meta";
+import { bool, nat, oneOf, searchParams, str } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
 import { collectI18nIds, type Rec, toTabular } from "@/lib/table-shape";
 
 const JsonViewer = React.lazy(() => import("@/components/viewers/json-viewer"));
 
-const searchSchema = z.object({
-	view: z.enum(["grid", "json"]).optional().catch(undefined),
-	q: z.string().optional().catch(undefined),
-	sort: z.string().optional().catch(undefined),
-	i18n: z.boolean().optional().catch(undefined),
-	row: z.number().int().nonnegative().optional().catch(undefined),
+const parseSearch = searchParams({
+	view: oneOf(["grid", "json"]),
+	q: str(),
+	sort: str(),
+	i18n: bool,
+	row: nat,
 });
 
 function parseSort(value: string | undefined): SortingState {
@@ -64,7 +64,7 @@ function formatSort(sorting: SortingState): string | undefined {
 }
 
 export const Route = createFileRoute("/tables/$name")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loader: ({ context, params, preload }) => {
 		// Table bodies can be many MB: never SSR/dehydrate them, and don't
 		// prefetch on hover; start the request early on real client navigations.
@@ -142,7 +142,7 @@ function TablePage(): React.ReactElement {
 
 	const sorting = React.useMemo(() => parseSort(search.sort), [search.sort]);
 	const setSearch = (
-		patch: Partial<z.infer<typeof searchSchema>>,
+		patch: Partial<ReturnType<typeof parseSearch>>,
 		replace = true,
 	) => void navigate({ search: (prev) => ({ ...prev, ...patch }), replace });
 

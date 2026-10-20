@@ -7,7 +7,6 @@ import {
 	SearchXIcon,
 } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { PageHeader } from "@/components/page-header";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState } from "@/components/status-views";
@@ -37,22 +36,22 @@ import {
 	loaderLanguage,
 	STORY_CATEGORY_LABELS,
 	type StoryCategoryId,
-	searchText,
 	storyListQuery,
 } from "@/lib/catalog";
 import { pageTitle } from "@/lib/route-meta";
+import { bool, oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
 
 const CATEGORIES = ["mission", "level", "gameplay", "npc"] as const;
 
-const searchSchema = z.object({
-	cat: z.enum(CATEGORIES).optional().catch(undefined),
-	q: searchText,
-	system: z.boolean().optional().catch(undefined),
+const parseSearch = searchParams({
+	cat: oneOf(CATEGORIES),
+	q: text,
+	system: bool,
 });
 
 export const Route = createFileRoute("/story/")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loader: ({ context }) =>
 		context.queryClient
 			.ensureQueryData(storyListQuery(loaderLanguage()))

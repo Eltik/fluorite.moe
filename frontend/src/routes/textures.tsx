@@ -6,7 +6,6 @@ import {
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { FolderIcon, ImageIcon, SearchXIcon } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { FolderCards } from "@/components/gallery/folder-cards";
 import { Lightbox } from "@/components/gallery/lightbox";
 import { type GridItem, TextureGrid } from "@/components/gallery/texture-grid";
@@ -28,11 +27,12 @@ import { api } from "@/lib/api";
 import { basename, extname, formatNumber } from "@/lib/format";
 import { treeQuery } from "@/lib/queries";
 import { pageTitle } from "@/lib/route-meta";
+import { searchParams, str, withDefault } from "@/lib/search-params";
 
-const searchSchema = z.object({
-	dir: z.string().catch("").default(""),
-	q: z.string().optional().catch(undefined),
-	view: z.string().optional().catch(undefined),
+const parseSearch = searchParams({
+	dir: withDefault(str(), ""),
+	q: str(),
+	view: str(),
 });
 
 const PAGE = 240;
@@ -54,7 +54,7 @@ const textureSearch = (q: string) =>
 	});
 
 export const Route = createFileRoute("/textures")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loaderDeps: ({ search }) => ({
 		dir: search.dir,
 		searching: Boolean(search.q),

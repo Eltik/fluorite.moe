@@ -1,21 +1,21 @@
 import { ClientOnly, createFileRoute } from "@tanstack/react-router";
 import * as React from "react";
-import { z } from "zod";
 import { LogoMark } from "@/components/shell/logo";
 import { Spinner } from "@/components/ui/spinner";
 import { pageTitle } from "@/lib/route-meta";
+import { searchParams, str } from "@/lib/search-params";
 
 /** The Studio bundle (three, r3f, drei) loads only when the Studio opens. */
 const loadStudio = () => import("@/components/studio/studio-app");
 const StudioApp = React.lazy(loadStudio);
 
-const searchSchema = z.object({
-	bg: z.string().max(32).optional().catch(undefined),
-	clip: z.string().max(200).optional().catch(undefined),
+const parseSearch = searchParams({
+	bg: str(32),
+	clip: str(200),
 });
 
 export const Route = createFileRoute("/studio")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	// Start fetching the 3D chunk while the route is matched / preloaded.
 	loader: () => {
 		if (typeof window !== "undefined") void loadStudio();

@@ -8,7 +8,6 @@ import {
 	Settings2Icon,
 } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { GenderToggle } from "@/components/catalog/detail-layout";
 import { DefaultPending, ErrorState } from "@/components/status-views";
 import {
@@ -36,18 +35,18 @@ import {
 	loaderLanguage,
 	locateDialog,
 	STORY_CATEGORY_LABELS,
-	searchText,
 	storyListQuery,
 } from "@/lib/catalog";
 import { pageTitle } from "@/lib/route-meta";
+import { bool, oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
 
-const searchSchema = z.object({
-	mode: z.enum(["play", "all"]).optional().catch(undefined),
+const parseSearch = searchParams({
+	mode: oneOf(["play", "all"]),
 	// Node ids are numeric: the router parses `?line=17` as a number.
-	line: searchText,
-	alt: z.boolean().optional().catch(undefined),
-	gender: z.enum(["f", "m"]).optional().catch(undefined),
+	line: text,
+	alt: bool,
+	gender: oneOf(["f", "m"]),
 });
 
 const TYPEWRITER_KEY = "fluorite.story.typewriter";
@@ -61,7 +60,7 @@ function readTypewriter(): boolean {
 }
 
 export const Route = createFileRoute("/story/$dialogId")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loaderDeps: ({ search }) => ({ gender: (search.gender ?? "f") as Gender }),
 	loader: async ({ context, params, deps }) => {
 		const lang = loaderLanguage();
@@ -136,7 +135,7 @@ function DialogPage(): React.ReactElement {
 	};
 
 	const setSearch = React.useCallback(
-		(patch: Partial<z.infer<typeof searchSchema>>) =>
+		(patch: Partial<ReturnType<typeof parseSearch>>) =>
 			void navigate({
 				search: (prev) => ({ ...prev, ...patch }),
 				replace: true,

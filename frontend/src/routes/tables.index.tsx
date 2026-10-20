@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { ClockIcon, SearchXIcon, TableIcon } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { PageHeader } from "@/components/page-header";
 import { SearchInput } from "@/components/search-input";
 import { ErrorState, ListSkeleton } from "@/components/status-views";
@@ -19,14 +18,15 @@ import { formatBytes, formatNumber } from "@/lib/format";
 import { tablesQuery } from "@/lib/queries";
 import { useRecent } from "@/lib/recent";
 import { pageTitle } from "@/lib/route-meta";
+import { oneOf, searchParams, text } from "@/lib/search-params";
 
-const searchSchema = z.object({
-	q: z.string().optional().catch(undefined),
-	sort: z.enum(["name", "size"]).optional().catch(undefined),
+const parseSearch = searchParams({
+	q: text,
+	sort: oneOf(["name", "size"]),
 });
 
 export const Route = createFileRoute("/tables/")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loader: ({ context }) => context.queryClient.query(tablesQuery()),
 	head: () => ({ meta: [{ title: pageTitle("Tables") }] }),
 	pendingComponent: () => <ListSkeleton className="p-6" rows={20} />,

@@ -3,7 +3,6 @@
  * factories used by both route loaders and components.
  */
 import { queryOptions } from "@tanstack/react-query";
-import { z } from "zod";
 import {
 	CATALOG_KINDS,
 	type CatalogKind,
@@ -775,15 +774,3 @@ export function locateDialog(
 	}
 	return null;
 }
-
-// ---------------------------------------------------------------- search params
-
-/**
- * Optional string search param. The router JSON-parses values, so `?q=130`
- * or `?line=17` arrive as numbers; accept both and keep strings.
- */
-export const searchText = z
-	.union([z.string(), z.number()])
-	.transform(String)
-	.optional()
-	.catch(undefined);

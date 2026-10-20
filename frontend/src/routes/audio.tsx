@@ -7,7 +7,6 @@ import {
 	SearchXIcon,
 } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import { audioEngine, useAudioState } from "@/components/audio/engine";
 import {
 	AudioEntryList,
@@ -49,6 +48,7 @@ import {
 } from "@/lib/audio";
 import { formatNumber } from "@/lib/format";
 import { pageTitle } from "@/lib/route-meta";
+import { oneOf, searchParams, str } from "@/lib/search-params";
 
 const KINDS = ["stream", "external", "bank"] as const;
 /** No `kind` in the URL means "playable": everything except soundbank refs. */
@@ -71,18 +71,15 @@ const KIND_LABELS: Record<KindFilter, string> = {
 /** Skeleton this long means something is wrong; offer a retry. */
 const STALL_MS = 6000;
 
-const searchSchema = z.object({
-	pack: z.string().optional().catch(undefined),
-	lang: z.string().optional().catch(undefined),
-	kind: z
-		.enum([...KINDS, "all"])
-		.optional()
-		.catch(undefined),
-	q: z.string().optional().catch(undefined),
+const parseSearch = searchParams({
+	pack: str(),
+	lang: str(),
+	kind: oneOf([...KINDS, "all"]),
+	q: str(),
 });
 
 export const Route = createFileRoute("/audio")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loader: ({ context }) => context.queryClient.query(audioSummaryQuery()),
 	head: () => ({ meta: [{ title: pageTitle("Audio") }] }),
 	staticData: { section: "Assets", crumb: "Audio" },

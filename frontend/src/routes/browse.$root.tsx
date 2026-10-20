@@ -7,7 +7,6 @@ import {
 } from "@tanstack/react-router";
 import { ArrowLeftIcon, FolderOpenIcon, FolderXIcon } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import {
 	DirectoryList,
 	type DirectoryListHandle,
@@ -30,16 +29,17 @@ import { ROOT_META } from "@/lib/nav";
 import { treeQuery } from "@/lib/queries";
 import { pushRecent } from "@/lib/recent";
 import { pageTitle } from "@/lib/route-meta";
+import { searchParams, str, withDefault } from "@/lib/search-params";
 import { cn } from "@/lib/utils";
 
-const searchSchema = z.object({
-	path: z.string().catch("").default(""),
-	file: z.string().optional().catch(undefined),
-	q: z.string().optional().catch(undefined),
+const parseSearch = searchParams({
+	path: withDefault(str(), ""),
+	file: str(),
+	q: str(),
 });
 
 export const Route = createFileRoute("/browse/$root")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	params: {
 		parse: ({ root }) => {
 			if (!isRoot(root)) throw notFound();

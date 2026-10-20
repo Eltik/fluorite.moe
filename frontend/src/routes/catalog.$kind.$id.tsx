@@ -1,7 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, notFound } from "@tanstack/react-router";
 import * as React from "react";
-import { z } from "zod";
 import type { DetailProps } from "@/components/catalog/detail-layout";
 import { TermsProvider } from "@/components/rich-text/rich-text";
 import { DefaultPending, ErrorState } from "@/components/status-views";
@@ -12,9 +11,9 @@ import {
 	type Gender,
 	KIND_LABELS,
 	loaderLanguage,
-	searchText,
 } from "@/lib/catalog";
 import { pageTitle } from "@/lib/route-meta";
+import { oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
 
 // Each kind's body is its own chunk; only the one being viewed is loaded.
@@ -41,13 +40,13 @@ const BODIES: Record<CatalogKind, React.LazyExoticComponent<Body>> = {
 	),
 };
 
-const searchSchema = z.object({
-	tab: searchText,
-	gender: z.enum(["f", "m"]).optional().catch(undefined),
+const parseSearch = searchParams({
+	tab: text,
+	gender: oneOf(["f", "m"]),
 });
 
 export const Route = createFileRoute("/catalog/$kind/$id")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loaderDeps: ({ search }) => ({ gender: (search.gender ?? "f") as Gender }),
 	loader: async ({ context, params, deps }) => {
 		const kind = params.kind as CatalogKind;

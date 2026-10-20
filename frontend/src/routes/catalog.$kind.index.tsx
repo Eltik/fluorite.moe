@@ -6,7 +6,6 @@ import {
 	SearchXIcon,
 } from "lucide-react";
 import * as React from "react";
-import { z } from "zod";
 import {
 	CatalogFilters,
 	type Facet,
@@ -41,9 +40,9 @@ import {
 	KIND_LABELS,
 	type ListItem,
 	loaderLanguage,
-	searchText,
 } from "@/lib/catalog";
 import { pageTitle } from "@/lib/route-meta";
+import { oneOf, searchParams, text } from "@/lib/search-params";
 import { useSettings } from "@/lib/settings";
 
 const SORTS = ["default", "name", "rarity", "id"] as const;
@@ -71,18 +70,18 @@ const NATURAL_DIR: Record<Sort, Dir> = {
 	id: "asc",
 };
 
-const searchSchema = z.object({
-	q: searchText,
+const parseSearch = searchParams({
+	q: text,
 	/** Comma-separated `kind:code` tag filters (OR within a kind, AND across). */
-	tags: searchText,
+	tags: text,
 	/** Comma-separated rarities. */
-	rarity: searchText,
-	sort: z.enum(SORTS).optional().catch(undefined),
-	dir: z.enum(["asc", "desc"]).optional().catch(undefined),
+	rarity: text,
+	sort: oneOf(SORTS),
+	dir: oneOf(["asc", "desc"]),
 });
 
 export const Route = createFileRoute("/catalog/$kind/")({
-	validateSearch: searchSchema,
+	validateSearch: parseSearch,
 	loader: async ({ context, params }) => {
 		const kind = params.kind as CatalogKind;
 		// The items list is large; let the client fetch it instead of inlining
@@ -353,7 +352,7 @@ function CatalogListPage(): React.ReactElement {
 		return out;
 	}, [matched, kind, tokens.length, sort, dir, typeCounts]);
 
-	const setSearch = (patch: Partial<z.infer<typeof searchSchema>>) =>
+	const setSearch = (patch: Partial<ReturnType<typeof parseSearch>>) =>
 		void navigate({
 			search: (prev) => ({ ...prev, ...patch }),
 			replace: true,
