@@ -157,6 +157,7 @@ export function TransportBar({
 			<div className="mx-2 min-w-0 flex-1 sm:w-40 sm:flex-none">
 				<Slider
 					aria-label="Seek"
+					getAriaLabel={() => "Seek"}
 					className="[&_[data-slot=slider-control]]:min-w-0"
 					disabled={!ready}
 					max={Math.max(state.duration, 0.001)}

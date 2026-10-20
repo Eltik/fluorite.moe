@@ -154,6 +154,7 @@ function StoryIndex(): React.ReactElement {
 				<>
 					<div className="flex flex-wrap items-center justify-between gap-3">
 						<Tabs
+							className="min-w-0 max-w-full"
 							onValueChange={(value) =>
 								void navigate({
 									search: (prev) => ({
@@ -168,7 +169,7 @@ function StoryIndex(): React.ReactElement {
 							}
 							value={cat}
 						>
-							<TabsList>
+							<TabsList className="max-w-full justify-start overflow-x-auto [scrollbar-width:none]">
 								{CATEGORIES.map((id) => {
 									const count = query.data?.categories.find(
 										(c) => c.id === id,
@@ -341,7 +342,7 @@ function StoryCardView({ card }: { card: StoryCard }): React.ReactElement {
 					{card.dialogs.map((dialog) => (
 						<li key={dialog}>
 							<Link
-								className="inline-flex h-7 items-center justify-center rounded-md border bg-background px-2 text-xs outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/32"
+								className="inline-flex h-7 items-center justify-center rounded-md border bg-background px-2 text-xs outline-none pointer-coarse:h-9 transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring dark:bg-input/32"
 								params={{ dialogId: dialog }}
 								title={`${card.title} · ${card.labels.get(dialog) ?? dialog}`}
 								to="/story/$dialogId"

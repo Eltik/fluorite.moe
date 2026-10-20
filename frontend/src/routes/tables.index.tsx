@@ -170,11 +170,11 @@ function TablesPage(): React.ReactElement {
 									{group.tables.length}
 								</span>
 							</h2>
-							<ul className="grid gap-x-4 sm:grid-cols-2 lg:grid-cols-3">
+							<ul className="grid grid-cols-1 gap-x-4 sm:grid-cols-2 lg:grid-cols-3">
 								{group.tables.map((t) => (
 									<li key={t.name}>
 										<Link
-											className="flex h-8 items-center justify-between gap-3 rounded-md px-2 text-sm outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+											className="flex h-10 items-center justify-between gap-3 rounded-md px-2 text-sm sm:h-8 outline-none transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
 											params={{ name: t.name }}
 											to="/tables/$name"
 										>

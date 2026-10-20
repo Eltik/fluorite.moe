@@ -249,7 +249,12 @@ export function ModelPicker({
 	const scrollBy = (dir: 1 | -1) => {
 		const el = listRef.current;
 		if (el)
-			el.scrollBy({ left: dir * el.clientWidth * 0.8, behavior: "smooth" });
+			el.scrollBy({
+				left: dir * el.clientWidth * 0.8,
+				behavior: matchMedia("(prefers-reduced-motion: reduce)").matches
+					? "auto"
+					: "smooth",
+			});
 	};
 
 	const label = STUDIO_KIND_LABELS[tab];

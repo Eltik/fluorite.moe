@@ -429,7 +429,7 @@ function Cell({
 	if (typeof value === "string") {
 		return (
 			<span className="truncate" title={value.length > 40 ? value : undefined}>
-				{value || <span className="text-muted-foreground/50">""</span>}
+				{value || <span className="text-muted-foreground">""</span>}
 			</span>
 		);
 	}
@@ -467,7 +467,7 @@ function NestedCell({ value }: { value: object }): React.ReactElement {
 	const size = isArray ? value.length : Object.keys(value).length;
 	if (size === 0) {
 		return (
-			<span className="font-mono text-muted-foreground/60 text-xs">
+			<span className="font-mono text-muted-foreground text-xs">
 				{isArray ? "[]" : "{}"}
 			</span>
 		);

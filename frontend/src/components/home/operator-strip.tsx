@@ -130,7 +130,7 @@ function OperatorCard({ item }: { item: ListItem }): React.ReactElement {
 				<Link
 					{...studioLink("operators", item.id)}
 					aria-label={`Open ${item.name} in Studio`}
-					className="absolute top-1 right-1 flex size-7 items-center justify-center rounded-lg bg-background/85 text-foreground opacity-0 shadow-sm backdrop-blur-sm transition-opacity hover:bg-background focus-visible:opacity-100 group-hover/op:opacity-100 pointer-coarse:opacity-100"
+					className="absolute top-1 right-1 flex size-7 items-center justify-center rounded-lg bg-background/85 text-foreground opacity-0 shadow-sm backdrop-blur-sm transition-opacity outline-none hover:bg-background focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/op:opacity-100 pointer-coarse:opacity-100 pointer-coarse:after:absolute pointer-coarse:after:-inset-1.5"
 					title="Open in Studio"
 				>
 					<BoxesIcon aria-hidden="true" className="size-3.5" />

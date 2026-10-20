@@ -126,6 +126,7 @@ export function PlayerBar({
 					</span>
 					<Slider
 						aria-label="Seek"
+						getAriaLabel={() => "Seek"}
 						className="[&_[data-slot=slider-control]]:min-w-0"
 						disabled={!s.track || duration <= 0}
 						max={Math.max(duration, 0.001)}

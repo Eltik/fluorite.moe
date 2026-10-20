@@ -382,6 +382,7 @@ export function LightingPanel({
 				</div>
 				<Slider
 					aria-labelledby="exposure-label"
+					getAriaLabel={() => "Exposure"}
 					max={2}
 					min={0.4}
 					onValueChange={(v) =>
