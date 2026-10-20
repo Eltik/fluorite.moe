@@ -846,3 +846,60 @@ async fn has_model_follows_the_rig_index() {
     let v = body_json(get(&app, "/api/catalog/operators").await).await;
     assert_eq!(pelica(&v), true);
 }
+
+/// Kinds only see their own folder (operators and NPC variants share stems), and NPCs
+/// resolve through `npc_chr_` / `npc_eny_` data keys.
+#[test]
+fn rig_index_scopes_kinds_and_maps_npc_data_keys() {
+    let out = std::env::temp_dir().join(format!("fluorite-rig-npc-{}", std::process::id()));
+    let models = out.join("models");
+    for rel in [
+        "operator/chr_0005_chen.glb",
+        "npc/chr_0005_chen.glb",
+        "operator/chr_0023_antal.glb",
+        "enemy/eny_0021_agmelee.glb",
+    ] {
+        let path = models.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"glTF").unwrap();
+    }
+    let rig = RigIndex {
+        by_stem: [("chr_0005_chen", "operator/chr_0005_chen.glb")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect(),
+        stamp: Some(std::time::SystemTime::UNIX_EPOCH),
+    };
+    assert_eq!(
+        rig.find(&out, "operators", "chr_0005_chen").as_deref(),
+        Some("operator/chr_0005_chen.glb")
+    );
+    assert_eq!(
+        rig.find(&out, "npcs", "chr_0005_chen").as_deref(),
+        Some("npc/chr_0005_chen.glb")
+    );
+    assert_eq!(
+        rig.find(&out, "enemies", "eny_0021_agmelee").as_deref(),
+        Some("enemy/eny_0021_agmelee.glb")
+    );
+    // NPC rows: an NPC-mode prefab first, then the operator, then enemies via `npc_eny_`.
+    assert_eq!(
+        rig.find_npc(&out, "npc_0001_chen_g01_i001", "npc_chr_0005_chen")
+            .as_deref(),
+        Some("npc/chr_0005_chen.glb")
+    );
+    assert_eq!(
+        rig.find_npc(&out, "npc_x", "npc_chr_0023_antal").as_deref(),
+        Some("operator/chr_0023_antal.glb")
+    );
+    assert_eq!(
+        rig.find_npc(&out, "npc_agmelee_1", "npc_eny_0021_agmelee")
+            .as_deref(),
+        Some("enemy/eny_0021_agmelee.glb")
+    );
+    assert_eq!(
+        rig.find_npc(&out, "dajiang", "npc_gentleman_riverbandits_a_01"),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}

@@ -99,7 +99,8 @@ pub fn base(t: &Tables, env: &Env) -> Vec<BaseItem> {
                 rarity: None,
                 tags,
                 icon: npc_icon(env, &npc_names, id, &n.data_key),
-                has_model: env.meshes.npc(&n.data_key).is_some(),
+                has_model: env.meshes.npc(&n.data_key).is_some()
+                    || env.rig.find_npc(&env.output, id, &n.data_key).is_some(),
                 type_code: None,
             }
         })
@@ -138,13 +139,16 @@ pub fn detail(t: &Tables, env: &Env, texts: &Texts, id: &str) -> Option<Value> {
         data_key: n.data_key.clone(),
         group_id: n.npc_group_id.clone(),
         icon: npc_icon(env, &npc_icon_names(env), id, &n.data_key),
-        model: model_info(
-            &env.output,
-            &env.rig,
-            "npcs",
-            id,
-            env.meshes.npc(&n.data_key),
-        ),
+        model: ModelInfo {
+            rigged: env.rig.find_npc(&env.output, id, &n.data_key),
+            ..model_info(
+                &env.output,
+                &env.rig,
+                "npcs",
+                id,
+                env.meshes.npc(&n.data_key),
+            )
+        },
     };
     Some(finish_detail(&d, texts))
 }

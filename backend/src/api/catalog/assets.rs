@@ -324,26 +324,44 @@ impl RigIndex {
     /// `<kind>/<id>.glb` when the index exists.
     pub fn find(&self, output: &Path, kind: &str, id: &str) -> Option<String> {
         self.stamp?;
-        if let Some(p) = self.by_stem.get(id) {
-            return Some(p.clone());
-        }
+        let dirs = kind_dirs(kind);
+        let in_dirs = |path: &str| dirs.iter().any(|d| path.split('/').next() == Some(d));
+        // The kind's own folder first: operators and their NPC variants share stems
+        // (`operator/chr_0005_chen.glb`, `npc/chr_0005_chen.glb`).
         let root = Root::Models.dir(output);
-        let singular = kind.trim_end_matches('s');
-        [kind, singular, "characters"]
-            .iter()
+        dirs.iter()
             .map(|k| format!("{k}/{id}.glb"))
             .find(|rel| root.join(rel).is_file())
-            .or_else(|| self.find_variant(id))
+            .or_else(|| self.by_stem.get(id).filter(|p| in_dirs(p)).cloned())
+            .or_else(|| self.find_variant(id, &in_dirs))
+    }
+
+    /// Rigged GLB for an NPC: by catalog id, else through its `dataKey`. `npc_chr_<chrId>`
+    /// is an operator's NPC-mode prefab (`npc/<chrId>.glb`, else the operator's own GLB),
+    /// `npc_eny_<enemyId>` an enemy.
+    pub fn find_npc(&self, output: &Path, id: &str, data_key: &str) -> Option<String> {
+        self.find(output, "npcs", id).or_else(|| {
+            if let Some(chr) = data_key.strip_prefix("npc_chr_") {
+                let chr = format!("chr_{chr}");
+                self.find(output, "npcs", &chr)
+                    .or_else(|| self.find(output, "operators", &chr))
+            } else if let Some(eny) = data_key.strip_prefix("npc_eny_") {
+                self.find(output, "enemies", &format!("eny_{eny}"))
+            } else {
+                None
+            }
+        })
     }
 
     /// A variant prefab of a catalog id: templates such as `eny_0054_hsmino` only have
     /// `eny_0054_hsmino1` / `eny_0054_hsmino_chrdg`, and some weapons only `<id>_refined`.
     /// Digit suffixes count only after a letter (so `wpn_x_0009` never matches `wpn_x_00091`);
     /// digit variants win over `_` variants, then the shortest, then the first by name.
-    fn find_variant(&self, id: &str) -> Option<String> {
+    fn find_variant(&self, id: &str, in_dirs: &dyn Fn(&str) -> bool) -> Option<String> {
         let digit_ok = id.ends_with(|c: char| c.is_ascii_alphabetic());
         self.by_stem
             .iter()
+            .filter(|(_, path)| in_dirs(path))
             .filter_map(|(stem, path)| {
                 let rest = stem.strip_prefix(id)?;
                 let rank = match rest.chars().next()? {
@@ -356,6 +374,23 @@ impl RigIndex {
             .min_by(|a, b| a.0.cmp(&b.0))
             .map(|(_, path)| path.clone())
     }
+}
+
+/// Folders of `models/` that hold a catalog kind's GLBs (the exporter writes singular kinds).
+/// The plural kind itself is accepted too.
+fn kind_dirs(kind: &str) -> Vec<String> {
+    let singular = match kind {
+        "operators" => "operator",
+        "enemies" => "enemy",
+        "weapons" => "weapon",
+        "npcs" => "npc",
+        other => other.trim_end_matches('s'),
+    };
+    let mut dirs = vec![singular.to_string(), kind.to_string()];
+    if kind == "operators" {
+        dirs.push("characters".into());
+    }
+    dirs
 }
 
 fn collect_glb_strings(v: &serde_json::Value, out: &mut Vec<String>) {
