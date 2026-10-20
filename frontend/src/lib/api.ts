@@ -7,9 +7,74 @@
  */
 import { parseJsonSafe } from "@/lib/json-parse";
 
-export const API_URL: string = (
-	import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8787"
-).replace(/\/+$/, "");
+// ---------------------------------------------------------------- endpoints
+//
+// One build serves any deployment: the server reads the API location from its
+// environment at startup and hands the browser-facing value to the client through
+// `window.__FLUORITE_API_URL__` (rendered by the root route, see `apiConfigScript`).
+//
+//   FLUORITE_API_URL         where the frontend server reaches the API (SSR fetches,
+//                            the same-origin proxy). Default `http://127.0.0.1:8787`.
+//   FLUORITE_PUBLIC_API_URL  API base the browser uses. Empty = same origin, served
+//                            by the proxy in `src/server.ts`. Default: same origin in
+//                            production, `FLUORITE_API_URL` under `vite dev`.
+//   VITE_API_URL             build-time fallback for both (kept for `vite dev`).
+
+const DEFAULT_API_URL = "http://127.0.0.1:8787";
+const BUILD_API_URL: string | undefined = import.meta.env.VITE_API_URL;
+
+declare global {
+	interface Window {
+		__FLUORITE_API_URL__?: string;
+	}
+}
+
+function trimBase(url: string): string {
+	return url.trim().replace(/\/+$/, "");
+}
+
+/** `process.env` on the server; `tsconfig` deliberately carries no Node types. */
+function serverEnv(): Record<string, string | undefined> {
+	const proc = (
+		globalThis as { process?: { env: Record<string, string | undefined> } }
+	).process;
+	return proc?.env ?? {};
+}
+
+/** Server only: where the frontend server reaches the API. */
+export function upstreamApiUrl(): string {
+	return trimBase(
+		serverEnv().FLUORITE_API_URL || BUILD_API_URL || DEFAULT_API_URL,
+	);
+}
+
+/** Server only: the API base handed to browsers (`""` = same origin). */
+export function publicApiUrl(): string {
+	const configured = serverEnv().FLUORITE_PUBLIC_API_URL ?? BUILD_API_URL;
+	if (configured !== undefined) return trimBase(configured);
+	return import.meta.env.DEV ? upstreamApiUrl() : "";
+}
+
+/**
+ * API base for URLs that end up in markup or the browser (`<img src>`, links,
+ * audio). Identical on server and client so hydration matches; `""` means the
+ * API is served from the frontend's own origin.
+ */
+export const API_URL: string = import.meta.env.SSR
+	? publicApiUrl()
+	: trimBase(window.__FLUORITE_API_URL__ ?? BUILD_API_URL ?? DEFAULT_API_URL);
+
+/** Human-readable API location for status and error copy. */
+export const API_LABEL: string = API_URL || "this origin (/api)";
+
+/** Base for `fetch`: SSR talks to the API directly, browsers use `API_URL`. */
+const FETCH_BASE: string = import.meta.env.SSR ? upstreamApiUrl() : API_URL;
+
+/** Inline script for the document head that publishes `API_URL` to the client. */
+export function apiConfigScript(): string {
+	const value = JSON.stringify(API_URL).replace(/</g, "\\u003c");
+	return `window.__FLUORITE_API_URL__=${value};`;
+}
 
 export const ROOTS = [
 	"textures",
@@ -200,7 +265,8 @@ export function isNetworkError(error: unknown): boolean {
 type Query = Record<string, string | number | undefined | null>;
 
 function buildUrl(path: string, query?: Query): string {
-	const url = new URL(`${API_URL}${path}`);
+	// `FETCH_BASE` may be empty (same origin), so resolve against the page.
+	const url = new URL(`${FETCH_BASE}${path}`, globalThis.location?.href);
 	if (query) {
 		for (const [k, v] of Object.entries(query)) {
 			if (v !== undefined && v !== null && v !== "") {
@@ -238,7 +304,7 @@ async function send(
 		const error = new ApiError(
 			0,
 			"unreachable",
-			`Could not reach the fluorite API at ${API_URL}`,
+			`Could not reach the fluorite API at ${API_LABEL}`,
 		);
 		error.cause = cause;
 		throw error;

@@ -9,7 +9,7 @@ import {
 	PopoverTitle,
 	PopoverTrigger,
 } from "@/components/ui/popover";
-import { API_URL } from "@/lib/api";
+import { API_LABEL } from "@/lib/api";
 import { statusQuery } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
@@ -113,7 +113,7 @@ export function StatusIndicator(): React.ReactElement {
 				)}
 				<div className="mt-3 flex items-center justify-between gap-2 border-t pt-3">
 					<code className="truncate text-muted-foreground text-xs">
-						{API_URL}
+						{API_LABEL}
 					</code>
 					<Button
 						aria-label="Recheck status"

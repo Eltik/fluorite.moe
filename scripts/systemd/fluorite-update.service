@@ -1,0 +1,14 @@
+# One-shot `endfield update` (via backend/scripts/auto-update.sh); fired by fluorite-update.timer.
+[Unit]
+Description=fluorite.moe asset update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fluorite
+Group=fluorite
+WorkingDirectory=/srv/fluorite.moe/backend
+ExecStart=/srv/fluorite.moe/backend/scripts/auto-update.sh
+Nice=10
+IOSchedulingClass=idle

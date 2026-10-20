@@ -1,0 +1,34 @@
+# fluorite-api: read-only HTTP API over the extracted output.
+# Install: copy to /etc/systemd/system/, adjust paths/User, then
+#   systemctl daemon-reload && systemctl enable --now fluorite-api
+# Build first: (cd /srv/fluorite.moe/backend && cargo build --release --bin fluorite-api)
+[Unit]
+Description=fluorite.moe API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fluorite
+Group=fluorite
+WorkingDirectory=/srv/fluorite.moe/backend
+ExecStart=/srv/fluorite.moe/backend/target/release/fluorite-api
+Environment=FLUORITE_API_ADDR=127.0.0.1:8787
+Environment=FLUORITE_OUTPUT=/srv/fluorite.moe/backend/output
+# Derived caches (thumbnails, transcoded audio, search index). Must be writable.
+Environment=FLUORITE_CACHE_DIR=/var/cache/fluorite
+Environment=FLUORITE_STATE=/srv/fluorite.moe/backend/data/update-state.json
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the API only reads the output and writes its cache.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CacheDirectory=fluorite
+ReadOnlyPaths=/srv/fluorite.moe/backend/output /srv/fluorite.moe/backend/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+# fluorite-web: the TanStack Start SSR server (Bun), also proxying /api, /files,
+# /thumb and /audio/{pack}/{file} to fluorite-api so the site is one origin.
+# Install: copy to /etc/systemd/system/, adjust paths/User, then
+#   systemctl daemon-reload && systemctl enable --now fluorite-web
+# Build first: (cd /srv/fluorite.moe/frontend && bun install --frozen-lockfile && bun run build)
+# Needs Bun >= 1.3.14.
+[Unit]
+Description=fluorite.moe web (SSR)
+After=network-online.target fluorite-api.service
+Wants=network-online.target fluorite-api.service
+
+[Service]
+Type=simple
+User=fluorite
+Group=fluorite
+WorkingDirectory=/srv/fluorite.moe/frontend
+ExecStart=/usr/local/bin/bun .output/server/index.mjs
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+Environment=FLUORITE_API_URL=http://127.0.0.1:8787
+# Unset: browsers use this origin (proxy). Set to e.g. https://api.fluorite.moe to
+# send them straight to a separately published API (and FLUORITE_PROXY=0).
+#Environment=FLUORITE_PUBLIC_API_URL=https://api.fluorite.moe
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -22,7 +22,7 @@ import {
 	EmptyTitle,
 } from "@/components/ui/empty";
 import { Skeleton } from "@/components/ui/skeleton";
-import { API_URL, isApiError } from "@/lib/api";
+import { API_LABEL, isApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function describe(error: unknown): {
@@ -34,7 +34,7 @@ function describe(error: unknown): {
 		if (error.status === 0) {
 			return {
 				title: "API unreachable",
-				message: `Could not connect to ${API_URL}. Start fluorite-api or set VITE_API_URL.`,
+				message: `Could not connect to ${API_LABEL}. Start fluorite-api or set FLUORITE_API_URL.`,
 				offline: true,
 			};
 		}

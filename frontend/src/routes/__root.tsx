@@ -9,6 +9,7 @@ import {
 import * as React from "react";
 import { AppShell } from "@/components/shell/app-shell";
 import { AnchoredToastProvider, ToastProvider } from "@/components/ui/toast";
+import { apiConfigScript } from "@/lib/api";
 import { PREHYDRATION_SCRIPT } from "@/lib/settings";
 import appCss from "../styles.css?url";
 
@@ -51,6 +52,11 @@ function RootDocument({
 	return (
 		<html lang="en" suppressHydrationWarning>
 			<head>
+				{/* Runtime API location (server env), read by `lib/api.ts` in the browser. */}
+				<script
+					// biome-ignore lint/security/noDangerouslySetInnerHtml: JSON-encoded config value, `<` escaped
+					dangerouslySetInnerHTML={{ __html: apiConfigScript() }}
+				/>
 				{/* Applies theme + density before first paint (no flash). */}
 				<script
 					// biome-ignore lint/security/noDangerouslySetInnerHtml: static, first-party pre-hydration script
