@@ -13,6 +13,7 @@ pub mod memorypack_schema;
 pub mod memorypack_store;
 pub mod mesh;
 pub mod pipeline;
+pub mod rig;
 pub mod sparkbuffer;
 pub mod texture;
 pub mod texture_layout;
