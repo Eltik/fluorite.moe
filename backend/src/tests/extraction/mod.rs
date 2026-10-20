@@ -11,6 +11,7 @@ mod memorypack;
 mod memorypack_schema;
 mod memorypack_store;
 mod mesh;
+mod pipeline;
 mod rig;
 mod sparkbuffer;
 mod texture;

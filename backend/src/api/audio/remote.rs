@@ -6,6 +6,9 @@
 //! `.pck` files are stored unencrypted at offset 0 of a chunk, so a package entry is one
 //! HTTP range request away (then the usual per-entry decipher).
 //!
+//! Once `endfield update` has extracted a group into `output/decrypted/<group>/`, its hash is
+//! skipped here and the local packages are served instead (see `local_group_hashes`).
+//!
 //! Discovery keeps small packages (the `*_banks.pck`, ~2 MB) as local copies and only the
 //! header of the 1.6 GB stream packages, all under `<cache>/audio/remote/`. The result is
 //! saved to `<cache>/audio/remote.json` so a restart works before the CDN answers.
@@ -22,7 +25,9 @@ use super::{audio_cache, transcode::write_atomic, unix_secs};
 use crate::core::endfield::config::{fetch_patch_index, resolve_game_config};
 use crate::extraction::audio::{PckEntry, decipher_entry, header_len};
 use crate::extraction::blc::parse_blc;
-use crate::extraction::pipeline::default_resolve_params;
+use crate::extraction::pipeline::{
+    cdn_blc_url, cdn_vfs_url, default_resolve_params, main_resource_path, patch_directories,
+};
 
 /// Packages up to this size are copied whole; larger ones are read by range.
 const COPY_LIMIT: u64 = 64 << 20;
@@ -194,31 +199,23 @@ async fn discover(state: &SharedState) -> Result<Vec<RemotePack>, String> {
     let config = resolve_game_config(http, &default_resolve_params())
         .await
         .map_err(|e| format!("launcher: {e}"))?;
-    let main = config
-        .resources
-        .iter()
-        .find(|r| r.name == "main")
+    let main = main_resource_path(&config)
         .ok_or("launcher lists no main resource")?
-        .path
-        .clone();
+        .to_string();
     let patch = fetch_patch_index(http, &main)
         .await
         .map_err(|e| format!("patch index: {e}"))?;
     let local = local_group_hashes(&state.config.output);
-    let mut dirs: Vec<String> = patch
-        .files
-        .iter()
-        .filter_map(|f| f.name.split_once('/').map(|(d, _)| d.to_ascii_uppercase()))
+    let dirs: Vec<String> = patch_directories(&patch)
+        .into_iter()
         .filter(|d| !local.contains(d))
         .collect();
-    dirs.sort();
-    dirs.dedup();
 
     let cache = audio_cache(state).join("remote");
     std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
     let mut packs = Vec::new();
     for dir in dirs {
-        let blc_url = format!("{main}/VFS/{dir}/{dir}.blc");
+        let blc_url = cdn_blc_url(&main, &dir);
         let raw = match http.get(&blc_url).send().await {
             Ok(r) if r.status().is_success() => r.bytes().await.map_err(|e| e.to_string())?,
             _ => continue,
@@ -241,7 +238,10 @@ async fn discover(state: &SharedState) -> Result<Vec<RemotePack>, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let url = format!("{main}/VFS/{dir}/{}.chk", f.chunk_md5.to_ascii_uppercase());
+            let url = cdn_vfs_url(
+                &main,
+                &format!("{dir}/{}.chk", f.chunk_md5.to_ascii_uppercase()),
+            );
             let (base, size) = (f.offset as u64, f.len as u64);
             let tag = format!("{name}-{}", f.chunk_md5.to_ascii_lowercase());
             let mut pack = RemotePack {

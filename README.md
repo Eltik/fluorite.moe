@@ -102,19 +102,21 @@ cargo run --release --bin endfield -- extract-file "CAB-abc123" --dir 7064D8E2
 
 #### `endfield decrypt`
 
-Extract every BLC-catalogued VFS directory (everything except the Unity bundle directories), decrypting ChaCha20 entries. Directories and file lists come from the CDN's `.blc` catalogs, so new directories are picked up automatically.
+Extract every BLC-catalogued VFS directory (everything except the Unity bundle directories), decrypting ChaCha20 entries. Directories and file lists come from the `.blc` catalogs, so new directories are picked up automatically: those in the base game archive, plus those only the launcher's patch index lists (the voice languages). A directory with files in the patch index is read through its hot-update catalog on the patch CDN (`<main resource>/VFS/<HASH>/<HASH>.blc`), so hot-updated chunks are included; its chunks come from the archive when it holds them and from the CDN otherwise (including chunks the patch index does not list, such as AudioEnglish's second stream package). CDN chunks are downloaded as parallel 32 MB range requests straight into a scratch file beside the output rather than held in memory (the voice packages are ~1.5 GB each), and a chunk that is one plain file is moved into place. A failed range request is retried up to four times, continuing from its last written byte; an interrupted run downloads the chunk again (its leftover `.<HASH>-<md5>.chk.part` is deleted when the directory is next extracted). A group's `blc_metadata.txt` is written only after every file extracted without errors.
 
 ```bash
 # Extract all BLC directories
 cargo run --release --bin endfield -- decrypt
 
-# A specific directory
+# A specific directory, by hash or group name
 cargo run --release --bin endfield -- decrypt --dir 42A8FCA6
+cargo run --release --bin endfield -- decrypt --dir AudioEnglish
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--dir <HASH>` | Extract a specific directory (default: all BLC directories) |
+| `--dir <HASH\|GROUP>` | Extract a specific directory, by hash or by a group name from the table below (default: all BLC directories) |
+| `--no-voice` | Skip the four voice-language groups |
 | `--output <PATH>` | Output directory (default: `./output/decrypted`) |
 | `--state <PATH>` | Update state file; only used to find the MemoryPack schema store beside it (default: `./data/update-state.json`) |
 
@@ -131,6 +133,9 @@ BLC directories (game 1.6):
 | `55FC21C6` | Video | CRI `.usm` videos (~7 GB) |
 | `A63D7E6A` / `F84BF5E6` / `C3442D43` / `23D53F5D` | IV / Terrain / Streaming / DynamicStreaming | Engine level data (~7 GB) |
 | `DAFE52C9` / `F151B649` | IFixPatchOut / HotfixAudio | Usually empty |
+| `E1E7D7CE` / `A31457D0` / `F668D4EE` / `E9D31017` | AudioChinese / AudioEnglish / AudioJapanese / AudioKorean | Voice lines: a `*_banks.pck` (~2 MB) and 1–2 stream `.pck` packages (~1.5–1.9 GB per language). Only in the patch index, not the base archive; stored unencrypted |
+
+Once a voice group is extracted to `output/decrypted/Audio<Language>/`, the audio API serves its clips from disk and stops streaming that language from the CDN.
 
 Output structure:
 ```
@@ -175,7 +180,7 @@ cargo run --release --bin endfield -- survey --scan-all
 
 #### `endfield update`
 
-Incrementally sync all assets (`extract --all --scan-all` + `decrypt`) to the latest game and hot-update version. Built to run from cron: when nothing changed upstream it exits in ~1s after two launcher API calls; otherwise it re-processes only the `.chk` files and encrypted directories whose CRC32/size or patch MD5s changed.
+Incrementally sync all assets (`extract --all --scan-all` + `decrypt`) to the latest game and hot-update version. Built to run from cron: when nothing changed upstream it exits in ~1s after two launcher API calls; otherwise it re-processes only the `.chk` files and encrypted directories whose CRC32/size or patch MD5s changed. A directory read through its CDN catalog (hot-updated, or only in the patch index like the voice languages) is tracked by that catalog's bytes plus its patch MD5s, since the catalog can name CDN chunks the patch index leaves out; such directories re-extract once after upgrading from a version that read the archive catalog.
 
 ```bash
 # Sync everything (first run is a full extraction)
@@ -193,7 +198,8 @@ cargo run --release --bin endfield -- update --check
 | `--check` | Report only; exit `10` if an update is available, `0` if up to date |
 | `--no-textures` | Skip texture extraction (those chunks are re-processed by a later run with textures) |
 | `--no-meshes` | Skip mesh export |
-| `--skip-dir <HASH,...>` | Leave these BLC directories alone; the version fingerprint is not recorded, so a later run without it fetches them |
+| `--skip-dir <HASH\|GROUP,...>` | Leave these BLC directories alone (hashes or group names such as `Video`); the version fingerprint is not recorded, so a later run without it fetches them |
+| `--no-voice` | Shorthand for `--skip-dir AudioChinese,AudioEnglish,AudioJapanese,AudioKorean` (~6.5 GB of voice packages), with the same fingerprint behaviour |
 | `--no-schema` | Don't regenerate the MemoryPack schema even if the client binary changed |
 
 Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`: version and `res_version`, chunk/sort/BLC counts (`chk_dirty`, `chk_ok`, `chk_failed`, `sort_*`, `blc_*`), asset counts from the chunk phase (`tex_extracted`, `tex_failed`, `mesh_exported`, `mesh_failed`), decode counts summed over the BLC directories it extracted (`lua_decrypted`, `memorypack_decoded`, `memorypack_failed`, and `memorypack_schemas`, which counts decoded files per schema), the game version of the newest MemoryPack schema in use (`schema_version`), `schema_regenerated` plus `schema_decoded`/`schema_failed` (JsonData totals after re-decoding) or `schema_error` when a regeneration was attempted, and `duration_secs`.
@@ -250,7 +256,7 @@ Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonD
 
 #### Fixing an existing output
 
-`backend/scripts/repair-assets.sh` brings output from older versions up to date: it runs `repair`, then `update` (re-extracting gamedata into the new layout, exporting meshes, extracting textures that went missing, and downloading the BLC directories). It skips the engine level-data directories unless you pass `--all`, and warns when free disk space looks too low. Rerun it after an interruption.
+`backend/scripts/repair-assets.sh` brings output from older versions up to date: it runs `repair`, then `update` (re-extracting gamedata into the new layout, exporting meshes, extracting textures that went missing, and downloading the BLC directories). It skips the engine level-data directories unless you pass `--all`, and warns when free disk space looks too low. The voice-language groups (~6.5 GB) are included; pass `--no-voice` to leave them out. Rerun it after an interruption.
 
 #### Scheduling
 
@@ -270,6 +276,130 @@ Interactive Hypergryph account login, OAuth2 flow, gacha history, and character 
 ```bash
 cargo run --release --bin auth-test
 ```
+
+## Web app
+
+The extracted output is served by two processes: `fluorite-api` (Rust, axum), a
+read-only HTTP API over the output directory, and the frontend (TanStack Start on
+Bun), which renders pages server-side and proxies the API so the site needs one
+public origin. `endfield update` keeps the output current underneath them.
+
+```
+                      ┌────────────── browser ──────────────┐
+                      │  pages, /assets/*  │  /api /files    │
+                      │                    │  /thumb /audio/*│
+                      └─────────┬──────────┴────────┬────────┘
+                                │ https (reverse proxy: TLS, gzip)
+                                ▼                   ▼
+                     ┌───────────────────────────────────────┐
+                     │ frontend  (Bun, .output/server)  :3000│
+                     │  SSR pages ── fetch ──┐               │
+                     │  same-origin proxy ───┤ (streams,     │
+                     └───────────────────────┼─Range, 304)───┘
+                                             ▼ FLUORITE_API_URL
+                     ┌───────────────────────────────────────┐
+                     │ fluorite-api  (Rust)   127.0.0.1:8787 │
+                     │  /api/* JSON, /files, /thumb, /audio  │
+                     └───────┬───────────────────────┬───────┘
+                   read-only │                       │ read/write
+                             ▼                       ▼
+          backend/output/  (~80 GB)         FLUORITE_CACHE_DIR
+          backend/data/update-state.json    (thumbs, audio transcodes)
+                             ▲
+                             │ writes (cron, every 15 min)
+                endfield update  (backend/scripts/auto-update.sh)
+```
+
+The API polls `<output>/update-log.jsonl` (every `FLUORITE_INDEX_POLL_SECS`) and
+rebuilds its search index when an update run appends to it, so neither server needs a
+restart when new game data lands.
+
+### Running it
+
+Requirements: the Rust toolchain (pinned in `backend/rust-toolchain.toml`), Bun
+>= 1.3.14 (older versions can't parse the bundled React server renderer), an output
+directory produced by `endfield update`, and `vgmstream-cli` + `ffmpeg` on `PATH` for
+audio playback.
+
+```bash
+# Development: API (release build) + Vite dev server with HMR on :3000.
+# Reuses an API already answering on :8787. Ctrl-C stops both.
+scripts/dev.sh
+
+# Production: builds what is missing or stale, then runs both. Site on :3000.
+PORT=3000 HOST=127.0.0.1 scripts/serve.sh
+scripts/serve.sh --rebuild     # force both builds
+
+# Or by hand
+(cd backend && FLUORITE_OUTPUT=$PWD/output cargo run --release --bin fluorite-api)
+(cd frontend && bun install && bun run build && PORT=3000 bun run start)
+```
+
+For a server, `scripts/systemd/` has example units: `fluorite-api.service`,
+`fluorite-web.service`, and `fluorite-update.service` + `.timer` (the systemd
+equivalent of the cron line under [Scheduling](#scheduling)). They assume a checkout
+at `/srv/fluorite.moe` and a `fluorite` user; adjust paths and build both parts once
+before enabling them. Put a reverse proxy (Caddy, nginx) in front of the web port for
+TLS, HSTS and compression of HTML; the API already compresses its JSON.
+
+### Configuration
+
+**fluorite-api** (see `backend/src/api/config.rs`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FLUORITE_API_ADDR` | `127.0.0.1:8787` | Listen address |
+| `FLUORITE_OUTPUT` | `./output`, else `<crate>/output` | Extraction output to serve (read-only) |
+| `FLUORITE_CACHE_DIR` | `<output>/.cache` | Thumbnail and audio cache (must be writable) |
+| `FLUORITE_STATE` | `<output>/../data/update-state.json` | Update state, for the version shown in `/api/status` |
+| `FLUORITE_INDEX_POLL_SECS` | `60` | How often to check `update-log.jsonl` and rebuild the search index |
+| `FLUORITE_AUDIO_REMOTE` | `1` | Read voice packages from the game CDN (`0` disables) |
+| `FLUORITE_AUDIO_DIRS` | unset | Extra directories of `.pck` files (path-list separated) |
+| `FLUORITE_VGMSTREAM` / `FLUORITE_FFMPEG` | found on `PATH` | Audio transcoder binaries |
+| `RUST_LOG` | `info` | Log filter |
+
+**frontend** (see `frontend/README.md`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` / `HOST` | `3000` / all interfaces | Listen address of the production server |
+| `FLUORITE_API_URL` | `http://127.0.0.1:8787` | Where the web server reaches the API (SSR and proxy) |
+| `FLUORITE_PUBLIC_API_URL` | same origin (prod), `FLUORITE_API_URL` (dev) | API base handed to browsers |
+| `FLUORITE_PROXY` | on | `0` disables the `/api`, `/files`, `/thumb`, `/audio/*` proxy |
+| `VITE_API_URL` | unset | Build-time fallback for both API URLs |
+
+Both API URLs are read at server start and passed to the browser in the page, so one
+build runs anywhere. By default browsers use the web origin and the proxy; to publish
+the API on its own origin instead (e.g. behind a CDN), set
+`FLUORITE_PUBLIC_API_URL=https://api.example` and `FLUORITE_PROXY=0`. The CSP follows
+that value automatically.
+
+**Ports and caching.** `:3000` web (public, via the reverse proxy), `:8787` API
+(loopback only unless the API is published separately). Hashed bundles under
+`/assets/` are `immutable` for a year; HTML is not cached. API responses carry their own
+`Cache-Control` and `ETag`s: files 1 hour, thumbnails 7 days, audio clips 1 day,
+answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy).
+
+### Operations
+
+- [ ] **Updates**: schedule `backend/scripts/auto-update.sh` every 15 minutes (cron or
+  `fluorite-update.timer`). The servers keep running; the API re-indexes on its own.
+- [ ] **Health**: schedule `backend/scripts/health-check.sh` daily with
+  `FLUORITE_ALERT_WEBHOOK` set, and probe the site itself, e.g.
+  `curl -fsS https://<site>/api/status` from your uptime monitor (checks web, proxy and
+  API in one request).
+- [ ] **Cache growth**: `FLUORITE_CACHE_DIR` holds generated thumbnails and transcoded
+  audio and has no size cap. Watch it with `du -sh`; to reclaim space, stop the API,
+  delete it, and start the API again (entries are regenerated on demand). Keep it off the output volume if that is
+  near full.
+- [ ] **Schema regeneration**: `update` regenerates the MemoryPack schema when the
+  client binary changes. If `health` warns about MemoryPack, run `endfield schema-gen`
+  (see [above](#endfield-schema-gen)).
+- [ ] **Deploying a new frontend**: `git pull && scripts/serve.sh` (or `bun run build`
+  then `systemctl restart fluorite-web`). A new API binary needs
+  `cargo build --release --bin fluorite-api` and a restart of `fluorite-api`.
+- [ ] **Disk**: the output is ~80 GB and grows with each game version; keep headroom
+  for `update` (see [Fixing an existing output](#fixing-an-existing-output)).
 
 ## Project Structure
 

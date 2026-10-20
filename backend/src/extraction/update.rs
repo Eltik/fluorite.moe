@@ -1,5 +1,6 @@
 //! Persistent state and change detection for the incremental update command.
-use crate::core::endfield::config::EndfieldGameConfig;
+use crate::core::endfield::config::{EndfieldGameConfig, PatchIndex};
+use crate::extraction::pipeline::patch_files;
 use crate::extraction::texture_layout::LAYOUT_VERSION;
 use crate::extraction::utils::append_to_path;
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,45 @@ const FLIPPED_LAYOUT_VERSION: u32 = 2;
 pub fn mark_textures_flipped(digest: &str) -> Option<String> {
     let base = digest.strip_suffix("+tex1")?;
     Some(format!("{base}+tex{FLIPPED_LAYOUT_VERSION}"))
+}
+
+/// Marks the part of a BLC digest that identifies a catalog read from the patch CDN.
+pub const CDN_CATALOG_TAG: &str = "cdn-blc";
+
+/// Identity of a raw catalog read from the patch CDN: FNV-1a 64 of its bytes plus its length.
+pub fn catalog_digest(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}-{}", bytes.len())
+}
+
+/// Digest of a BLC directory: the archive catalog's ZIP identity (`None` when only the patch
+/// index lists the directory), the CDN catalog's [`catalog_digest`] when it is read from
+/// the CDN (see `blc::uses_cdn_catalog`), and every patch file under it as `name:md5`, sorted.
+///
+/// The CDN catalog covers chunks the patch index leaves out; tagging it also makes
+/// directories extracted from the archive catalog alone re-extract once.
+pub fn blc_digest(
+    archive_catalog: Option<String>,
+    cdn_catalog: Option<String>,
+    patch: Option<&PatchIndex>,
+    dir: &str,
+) -> String {
+    let mut patched: Vec<String> = patch
+        .map(|index| {
+            patch_files(index, dir)
+                .map(|f| format!("{}:{}", f.name, f.md5))
+                .collect()
+        })
+        .unwrap_or_default();
+    patched.sort();
+    let mut parts: Vec<String> = archive_catalog.into_iter().collect();
+    parts.extend(cdn_catalog.map(|d| format!("{CDN_CATALOG_TAG}={d}")));
+    parts.extend(patched);
+    parts.join(";")
 }
 
 /// Whether an entry needs work, independent of I/O and suitable for tests.

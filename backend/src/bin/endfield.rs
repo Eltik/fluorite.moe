@@ -12,7 +12,7 @@
 //!   list          — list all VFS directories and files
 //!   scan          — scan for asset names/paths
 //!   survey        — survey all Unity objects, types, counts
-use backend::core::endfield::config::{PatchIndex, resolve_game_config};
+use backend::core::endfield::config::resolve_game_config;
 use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
 use backend::extraction::health;
@@ -95,9 +95,12 @@ enum Commands {
     },
     /// Extract BLC-catalogued VFS directories (tables, JSON data, Lua, audio, video, ...)
     Decrypt {
-        /// Specific directory hash to extract (default: every non-bundle directory)
+        /// Specific directory hash or group name to extract (default: every non-bundle directory)
         #[arg(long)]
         dir: Option<String>,
+        /// Skip the four voice-language groups (AudioChinese/English/Japanese/Korean)
+        #[arg(long)]
+        no_voice: bool,
         /// Output directory
         #[arg(long, default_value = "./output/decrypted")]
         output: String,
@@ -125,9 +128,13 @@ enum Commands {
         /// Do not export meshes as .glb
         #[arg(long)]
         no_meshes: bool,
-        /// Skip a BLC directory by hash (repeatable or comma-separated), e.g. 55FC21C6 for video
+        /// Skip a BLC directory by hash or group name (repeatable or comma-separated), e.g.
+        /// 55FC21C6 or Video
         #[arg(long, value_delimiter = ',')]
         skip_dir: Vec<String>,
+        /// Skip the four voice-language groups (AudioChinese/English/Japanese/Korean, ~1.5 GB each)
+        #[arg(long)]
+        no_voice: bool,
         /// Emit `@progress` lines for scripts/auto-update.sh to render
         #[arg(long)]
         progress: bool,
@@ -197,7 +204,12 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let client = Client::new();
+    // A CDN connection can stall without closing; the read timeout turns that into an error
+    // the download retry loop can recover from instead of hanging the run forever.
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .build()?;
 
     match cli.command {
         Commands::Info => cmd_info(&client).await,
@@ -225,9 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir,
             output,
         } => cmd_extract_file(&client, &chk_name, dir, &output).await,
-        Commands::Decrypt { dir, output, state } => {
-            cmd_decrypt(&client, dir, &output, Path::new(&state)).await
-        }
+        Commands::Decrypt {
+            dir,
+            no_voice,
+            output,
+            state,
+        } => cmd_decrypt(&client, dir, no_voice, &output, Path::new(&state)).await,
         Commands::Update {
             output,
             state,
@@ -236,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_textures,
             no_meshes,
             skip_dir,
+            no_voice,
             progress,
             no_schema,
         } => {
@@ -248,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     check,
                     no_textures,
                     no_meshes,
-                    skip_dirs: skip_dir,
+                    skip_dirs: skip_dir_hashes(&skip_dir, no_voice),
                     progress,
                     no_schema,
                 },
@@ -293,6 +309,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ═══════════════════════════════════════════════════════════
 // shared helpers
 // ═══════════════════════════════════════════════════════════
+
+/// `--skip-dir` values (hashes or group names) as uppercase hashes, plus the voice groups
+/// with `--no-voice`.
+fn skip_dir_hashes(skip_dir: &[String], no_voice: bool) -> Vec<String> {
+    let mut hashes: Vec<String> = skip_dir
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| pipeline::resolve_dir_name(name))
+        .collect();
+    if no_voice {
+        hashes.extend(
+            pipeline::VOICE_GROUPS
+                .iter()
+                .map(|(hash, _)| hash.to_string()),
+        );
+    }
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
 
 /// Print the version and archive size most subcommands open with.
 fn print_pipeline_summary(resolved: &ResolvedPipeline) {
@@ -343,7 +379,7 @@ async fn cmd_info(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     println!("Res version:  {}", config.res_version);
 
     for res in &config.resources {
-        println!("  Resource: {} v{}", res.name, res.version);
+        println!("  Resource: {} v{} {}", res.name, res.version, res.path);
     }
 
     if let Some(patch) = &resolved.patch_index {
@@ -1247,22 +1283,6 @@ impl BlcCounts {
     }
 }
 
-/// Digest of a BLC directory: its catalog's ZIP identity plus every patch file under it.
-fn blc_digest(catalog_digest: String, patch_index: Option<&PatchIndex>, dir: &str) -> String {
-    let mut parts = vec![catalog_digest];
-    if let Some(index) = patch_index {
-        let mut patch: Vec<String> = index
-            .files
-            .iter()
-            .filter(|f| f.name.starts_with(&format!("{dir}/")))
-            .map(|f| format!("{}:{}", f.name, f.md5))
-            .collect();
-        patch.sort();
-        parts.extend(patch);
-    }
-    parts.join(";")
-}
-
 /// Extract every changed BLC directory not in `skip_dirs` into `<output>/decrypted/<group>`.
 async fn extract_blc_directories(
     ctx: &UpdateContext<'_>,
@@ -1275,7 +1295,7 @@ async fn extract_blc_directories(
     let staging_parent = output.join("decrypted/.staging");
     let decrypted = output.join("decrypted");
     fs::create_dir_all(&staging_parent)?;
-    let upstream_dirs = pipeline::blc_directories(&resolved.cd);
+    let upstream_dirs = pipeline::blc_directories(&resolved.cd, resolved.patch_index.as_ref());
     state.blc_dirs.retain(|dir, _| upstream_dirs.contains(dir));
     let blc_dirs: Vec<&String> = upstream_dirs
         .iter()
@@ -1285,12 +1305,28 @@ async fn extract_blc_directories(
     for (i, dir) in blc_dirs.iter().enumerate() {
         let dir = dir.as_str();
         emit_progress(ctx.progress, "blc", i as u64, blc_total, dir);
-        let Some(entry) = resolved.cd.get(&pipeline::blc_path(dir)) else {
-            state.blc_dirs.remove(dir);
-            continue;
+        let archive_catalog = resolved
+            .cd
+            .get(&pipeline::blc_path(dir))
+            .map(|entry| update::zip_digest(entry.crc32, entry.uncompressed_size));
+        // Hot-updated and patch-only directories are read through their CDN catalog, which
+        // is fetched up front: it names chunks the patch index does not list.
+        let cdn_catalog = if blc::uses_cdn_catalog(resolved, dir) {
+            match blc::fetch_catalog(ctx.client, resolved, dir).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    println!("  {dir}: catalog: {error}");
+                    counts.dirty += 1;
+                    counts.failed += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
         };
-        let digest = blc_digest(
-            update::zip_digest(entry.crc32, entry.uncompressed_size),
+        let digest = update::blc_digest(
+            archive_catalog,
+            cdn_catalog.as_deref().map(update::catalog_digest),
             resolved.patch_index.as_ref(),
             dir,
         );
@@ -1303,7 +1339,23 @@ async fn extract_blc_directories(
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
         }
-        match blc::extract_directory_with(ctx.client, resolved, dir, &staging, ctx.schemas).await {
+        let extracted = match &cdn_catalog {
+            Some(catalog) => {
+                blc::extract_directory_from(
+                    ctx.client,
+                    resolved,
+                    dir,
+                    catalog,
+                    &staging,
+                    ctx.schemas,
+                )
+                .await
+            }
+            None => {
+                blc::extract_directory_with(ctx.client, resolved, dir, &staging, ctx.schemas).await
+            }
+        };
+        match extracted {
             Ok(result) if !result.errors.is_empty() => {
                 counts.add_decodes(&result);
                 // Keep the previous complete copy; the directory stays dirty and is retried.
@@ -1325,6 +1377,10 @@ async fn extract_blc_directories(
             }
             Err(error) => {
                 println!("  {dir}: {error}");
+                // Drop a partial group and any scratch chunk (up to 1.5 GB) right away.
+                if staging.exists() {
+                    fs::remove_dir_all(&staging)?;
+                }
                 counts.failed += 1;
             }
         }
@@ -2084,6 +2140,7 @@ async fn cmd_extract_file(
 async fn cmd_decrypt(
     client: &Client,
     dir_filter: Option<String>,
+    no_voice: bool,
     output: &str,
     state_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2096,11 +2153,14 @@ async fn cmd_decrypt(
     let output_path = Path::new(output);
     fs::create_dir_all(output_path)?;
 
-    let available = pipeline::blc_directories(&resolved.cd);
+    let available = pipeline::blc_directories(&resolved.cd, resolved.patch_index.as_ref());
+    let dir_filter = dir_filter.map(|d| pipeline::resolve_dir_name(&d));
+    let skipped = skip_dir_hashes(&[], no_voice);
     let dirs: Vec<&str> = available
         .iter()
         .map(String::as_str)
         .filter(|h| dir_filter.as_deref().is_none_or(|d| d == *h))
+        .filter(|h| !skipped.iter().any(|s| s == h))
         .collect();
 
     if dirs.is_empty() {

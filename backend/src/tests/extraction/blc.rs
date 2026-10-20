@@ -1,4 +1,7 @@
-use crate::extraction::blc::{BlcFileEntry, decrypt_file, parse_blc, relative_file_path};
+use crate::extraction::blc::{
+    BlcFileEntry, content_range_start, decrypt_file, entry_range, is_stale_part, parse_blc,
+    relative_file_path,
+};
 use crate::extraction::chacha20::{CHACHA_KEY, chacha20_crypt};
 use std::path::Path;
 
@@ -91,6 +94,25 @@ fn decrypts_files_with_catalog_version_nonce() {
 }
 
 #[test]
+fn entry_range_checks_against_chunk_length() {
+    let entry = |offset, len| BlcFileEntry {
+        file_name: "Data/x.pck".into(),
+        chunk_md5: String::new(),
+        offset,
+        len,
+        use_encrypt: false,
+        iv_seed: 0,
+    };
+    // A voice package fills its whole 1.5 GB chunk.
+    let big = 1_610_612_736u64;
+    assert_eq!(entry_range(&entry(0, big as i64), big), Some((0, big)));
+    assert_eq!(entry_range(&entry(4, 8), 12), Some((4, 8)));
+    assert_eq!(entry_range(&entry(4, 9), 12), None);
+    assert_eq!(entry_range(&entry(-1, 4), 12), None);
+    assert_eq!(entry_range(&entry(i64::MAX, i64::MAX), 16), None);
+}
+
+#[test]
 fn decrypt_file_rejects_negative_or_overflowing_ranges() {
     let chunk = [0u8; 16];
     for (offset, len) in [(-1, 4), (0, -1), (i64::MAX, i64::MAX), (8, i64::MAX)] {
@@ -125,4 +147,26 @@ fn relative_file_path_strips_data_prefix_and_traversal() {
     );
     assert_eq!(relative_file_path("../../etc/x:y"), Path::new("etc/x_y"));
     assert_eq!(relative_file_path("Data/"), Path::new("_unnamed"));
+}
+
+#[test]
+fn content_range_start_parses_the_first_byte() {
+    assert_eq!(
+        content_range_start("bytes 33554432-67108863/1610569115"),
+        Some(33554432)
+    );
+    assert_eq!(content_range_start("bytes 0-0/*"), Some(0));
+    assert_eq!(content_range_start("bytes 10-5/100"), None);
+    assert_eq!(content_range_start("bytes */100"), None);
+    assert_eq!(content_range_start("items 0-1/2"), None);
+}
+
+#[test]
+fn stale_parts_match_only_their_directory() {
+    assert!(is_stale_part(".A31457D0-da3fa56f.chk.part", "A31457D0"));
+    assert!(is_stale_part(".a31457d0-x.chk.part", "A31457D0"));
+    assert!(!is_stale_part(".E1E7D7CE-da3fa56f.chk.part", "A31457D0"));
+    assert!(!is_stale_part("A31457D0-da3fa56f.chk.part", "A31457D0"));
+    assert!(!is_stale_part(".A31457D0-da3fa56f.chk", "A31457D0"));
+    assert!(!is_stale_part(".A314", "A31457D0"));
 }

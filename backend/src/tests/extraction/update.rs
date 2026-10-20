@@ -112,3 +112,91 @@ fn old_state_files_load_without_a_schema_client() {
     let back: UpdateState = serde_json::from_str(&text).unwrap();
     assert_eq!(back.memorypack_client, "00000abc-42");
 }
+
+fn patch_index(files: &[(&str, &str)]) -> crate::core::endfield::config::PatchIndex {
+    crate::core::endfield::config::PatchIndex {
+        version: "1".into(),
+        files: files
+            .iter()
+            .map(|(name, md5)| crate::core::endfield::config::PatchFile {
+                name: (*name).into(),
+                md5: (*md5).into(),
+                size: 1,
+                diff_type: 0,
+                patch: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn blc_digest_of_archive_only_directory_is_its_zip_identity() {
+    let index = patch_index(&[("A31457D0/X.chk", "m")]);
+    assert_eq!(
+        update::blc_digest(Some("abc-1".into()), None, Some(&index), "42A8FCA6"),
+        "abc-1"
+    );
+    assert_eq!(
+        update::blc_digest(Some("abc-1".into()), None, None, "42A8FCA6"),
+        "abc-1"
+    );
+}
+
+#[test]
+fn blc_digest_of_patched_directory_tracks_catalog_and_patch_md5s_in_order() {
+    let a = patch_index(&[("42A8FCA6/B.chk", "2"), ("42A8FCA6/A.chk", "1")]);
+    let b = patch_index(&[("42A8FCA6/A.chk", "1"), ("42A8FCA6/B.chk", "2")]);
+    let digest = update::blc_digest(
+        Some("abc-1".into()),
+        Some("c1".into()),
+        Some(&a),
+        "42A8FCA6",
+    );
+    assert_eq!(digest, "abc-1;cdn-blc=c1;42A8FCA6/A.chk:1;42A8FCA6/B.chk:2");
+    assert_eq!(
+        digest,
+        update::blc_digest(
+            Some("abc-1".into()),
+            Some("c1".into()),
+            Some(&b),
+            "42A8FCA6"
+        )
+    );
+    // An archive-catalog digest of the same directory (older runs) differs, so it re-extracts.
+    assert_ne!(digest, "abc-1;42A8FCA6/A.chk:1;42A8FCA6/B.chk:2");
+}
+
+#[test]
+fn blc_digest_of_patch_only_directory_changes_with_its_chunks_or_catalog() {
+    let before = patch_index(&[("A31457D0/DA3F.chk", "1"), ("E1E7D7CE/10E5.chk", "x")]);
+    let after = patch_index(&[("A31457D0/DA3F.chk", "2"), ("E1E7D7CE/10E5.chk", "x")]);
+    let old = update::blc_digest(None, Some("c1".into()), Some(&before), "A31457D0");
+    assert_eq!(old, "cdn-blc=c1;A31457D0/DA3F.chk:1");
+    assert_ne!(
+        old,
+        update::blc_digest(None, Some("c1".into()), Some(&after), "A31457D0")
+    );
+    // A chunk only the catalog names changes the catalog, not the patch index.
+    assert_ne!(
+        old,
+        update::blc_digest(None, Some("c2".into()), Some(&before), "A31457D0")
+    );
+    // Another directory's chunk does not affect it.
+    assert_eq!(
+        update::blc_digest(None, Some("c".into()), Some(&before), "E1E7D7CE"),
+        update::blc_digest(None, Some("c".into()), Some(&after), "E1E7D7CE")
+    );
+}
+
+#[test]
+fn catalog_digest_depends_on_bytes_and_length() {
+    assert_eq!(
+        update::catalog_digest(b"abc"),
+        update::catalog_digest(b"abc")
+    );
+    assert_ne!(
+        update::catalog_digest(b"abc"),
+        update::catalog_digest(b"abd")
+    );
+    assert!(update::catalog_digest(b"").ends_with("-0"));
+}

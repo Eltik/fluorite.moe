@@ -10,6 +10,8 @@
 # Usage: scripts/repair-assets.sh [--all] [extra `endfield update` args]
 #   By default the engine level data (irradiance volumes, terrain, world streaming,
 #   ~7 GB of runtime binaries) is skipped; --all includes it.
+#   The voice-language groups (AudioChinese/English/Japanese/Korean, ~6.5 GB, patch CDN
+#   only) are included; pass --no-voice to leave them out.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -18,12 +20,19 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # IV, Terrain, Streaming, DynamicStreaming.
 LEVEL_DATA=A63D7E6A,F84BF5E6,C3442D43,23D53F5D
 skip=(--skip-dir "$LEVEL_DATA")
-need_gb=25
+need_gb=32
 if [ "${1:-}" = "--all" ]; then
   skip=()
-  need_gb=32
+  need_gb=39
   shift
 fi
+# Voice packages are ~6.5 GB of that.
+for arg in "$@"; do
+  if [ "$arg" = "--no-voice" ]; then
+    need_gb=$(( need_gb - 7 ))
+    break
+  fi
+done
 
 # New gamedata is written before the legacy copy is deleted, so expect a transient peak.
 mkdir -p ./output

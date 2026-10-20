@@ -1,7 +1,8 @@
 //! VFS download + extract pipeline shared by multiple binaries.
 use crate::core::endfield::{
     config::{
-        EndfieldGameConfig, PatchIndex, ResolveParams, fetch_patch_index, resolve_game_config,
+        EndfieldGameConfig, PatchFile, PatchIndex, ResolveParams, fetch_patch_index,
+        resolve_game_config,
     },
     constants::{app_code, channel, sub_channel},
 };
@@ -127,12 +128,114 @@ pub fn list_vfs_directories(cd: &ZipCentralDirectory) -> Vec<String> {
     dirs.into_iter().collect()
 }
 
-/// VFS directories catalogued by a `.blc` and extracted file-by-file (everything but bundles).
-pub fn blc_directories(cd: &ZipCentralDirectory) -> Vec<String> {
-    list_vfs_directories(cd)
-        .into_iter()
-        .filter(|dir| !VFS_DIRS.iter().any(|(bundle_dir, _)| bundle_dir == dir))
+/// VFS directories catalogued by a `.blc` and extracted file-by-file (everything but bundles):
+/// those in the archive plus those only the patch index lists (the voice languages).
+pub fn blc_directories(cd: &ZipCentralDirectory, patch: Option<&PatchIndex>) -> Vec<String> {
+    merge_blc_directories(&list_vfs_directories(cd), patch)
+}
+
+/// Archive directories plus patch-index directories, minus the bundle directories; sorted
+/// and deduplicated case-insensitively (uppercase hashes win).
+pub fn merge_blc_directories(archive_dirs: &[String], patch: Option<&PatchIndex>) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = archive_dirs
+        .iter()
+        .map(|d| d.to_ascii_uppercase())
+        .collect();
+    if let Some(patch) = patch {
+        dirs.extend(patch_directories(patch));
+    }
+    dirs.into_iter()
+        .filter(|dir| {
+            !VFS_DIRS
+                .iter()
+                .any(|(bundle, _)| bundle.eq_ignore_ascii_case(dir))
+        })
         .collect()
+}
+
+/// Directories (uppercase hashes) the patch index lists files under (`<DIR>/<MD5>.chk`).
+pub fn patch_directories(patch: &PatchIndex) -> BTreeSet<String> {
+    patch
+        .files
+        .iter()
+        .filter_map(|f| f.name.split_once('/').map(|(dir, _)| dir))
+        .filter(|dir| dir.len() == 8 && dir.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+/// Patch-index files under `dir` (case-insensitive).
+pub fn patch_files<'a>(
+    patch: &'a PatchIndex,
+    dir: &'a str,
+) -> impl Iterator<Item = &'a PatchFile> + 'a {
+    patch.files.iter().filter(move |f| {
+        f.name
+            .split_once('/')
+            .is_some_and(|(d, _)| d.eq_ignore_ascii_case(dir))
+    })
+}
+
+/// Voice-language groups: patch-index only, one `.pck` stream package of ~1.5 GB each.
+pub const VOICE_GROUPS: &[(&str, &str)] = &[
+    ("E1E7D7CE", "AudioChinese"),
+    ("A31457D0", "AudioEnglish"),
+    ("F668D4EE", "AudioJapanese"),
+    ("E9D31017", "AudioKorean"),
+];
+
+/// Known BLC groups by directory hash (game 1.6), so the CLI accepts group names.
+pub const KNOWN_BLC_GROUPS: &[(&str, &str)] = &[
+    ("42A8FCA6", "Table"),
+    ("775A31D1", "JsonData"),
+    ("19E3AE45", "Lua"),
+    ("D6E622F7", "ExtendData"),
+    ("3C9D9D2D", "InitialExtendData"),
+    ("1CDDBF1F", "BundleManifest"),
+    ("07A1BB91", "InitAudio"),
+    ("24ED34CF", "Audio"),
+    ("55FC21C6", "Video"),
+    ("A63D7E6A", "IV"),
+    ("F84BF5E6", "Terrain"),
+    ("C3442D43", "Streaming"),
+    ("23D53F5D", "DynamicStreaming"),
+    ("DAFE52C9", "IFixPatchOut"),
+    ("F151B649", "HotfixAudio"),
+    ("E1E7D7CE", "AudioChinese"),
+    ("A31457D0", "AudioEnglish"),
+    ("F668D4EE", "AudioJapanese"),
+    ("E9D31017", "AudioKorean"),
+];
+
+/// A directory hash or known group name (`AudioEnglish`, case-insensitive) as an uppercase hash.
+pub fn resolve_dir_name(name: &str) -> String {
+    let name = name.trim();
+    KNOWN_BLC_GROUPS
+        .iter()
+        .find(|(_, group)| group.eq_ignore_ascii_case(name))
+        .map_or_else(
+            || name.to_ascii_uppercase(),
+            |(hash, _)| (*hash).to_string(),
+        )
+}
+
+/// Path of the launcher's `main` resource, the root of the patch CDN.
+pub fn main_resource_path(config: &EndfieldGameConfig) -> Option<&str> {
+    config
+        .resources
+        .iter()
+        .find(|r| r.name == "main")
+        .map(|r| r.path.as_str())
+}
+
+/// CDN URL of a VFS file under the main resource, e.g. `A31457D0/A31457D0.blc`.
+pub fn cdn_vfs_url(main: &str, relative: &str) -> String {
+    format!("{}/VFS/{relative}", main.trim_end_matches('/'))
+}
+
+/// CDN URL of a directory's hot-update `.blc` catalog.
+pub fn cdn_blc_url(main: &str, dir: &str) -> String {
+    cdn_vfs_url(main, &format!("{dir}/{dir}.blc"))
 }
 
 /// Download a .chk file from the ZIP by name.
