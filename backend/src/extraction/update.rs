@@ -100,10 +100,14 @@ pub fn mark_textures_stale(digest: &str) -> String {
     format!("{}+texstale", digest_base(digest))
 }
 
+/// Texture layout that flipping `+tex1` PNGs in place produces.
+// Pinned rather than `LAYOUT_VERSION`: a later layout bump must not mark flipped files current.
+const FLIPPED_LAYOUT_VERSION: u32 = 2;
+
 /// Rewrite a `+tex1` digest to `+tex2` once that chunk's PNGs were flipped in place.
 pub fn mark_textures_flipped(digest: &str) -> Option<String> {
     let base = digest.strip_suffix("+tex1")?;
-    Some(format!("{base}+tex{LAYOUT_VERSION}"))
+    Some(format!("{base}+tex{FLIPPED_LAYOUT_VERSION}"))
 }
 
 /// Whether an entry needs work, independent of I/O and suitable for tests.

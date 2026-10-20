@@ -1,4 +1,4 @@
-use crate::extraction::blc::{decrypt_file, parse_blc, relative_file_path};
+use crate::extraction::blc::{BlcFileEntry, decrypt_file, parse_blc, relative_file_path};
 use crate::extraction::chacha20::{CHACHA_KEY, chacha20_crypt};
 use std::path::Path;
 
@@ -88,6 +88,25 @@ fn decrypts_files_with_catalog_version_nonce() {
         b"end"
     );
     assert!(decrypt_file(&chunk[..5], &blc.files[1], blc.version).is_none());
+}
+
+#[test]
+fn decrypt_file_rejects_negative_or_overflowing_ranges() {
+    let chunk = [0u8; 16];
+    for (offset, len) in [(-1, 4), (0, -1), (i64::MAX, i64::MAX), (8, i64::MAX)] {
+        let entry = BlcFileEntry {
+            file_name: "Data/x.bytes".into(),
+            chunk_md5: String::new(),
+            offset,
+            len,
+            use_encrypt: false,
+            iv_seed: 0,
+        };
+        assert!(
+            decrypt_file(&chunk, &entry, 3).is_none(),
+            "offset {offset} len {len}"
+        );
+    }
 }
 
 #[test]

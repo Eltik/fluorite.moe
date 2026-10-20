@@ -84,6 +84,8 @@ fn flipped_textures_become_current_but_stay_dirty() {
     assert!(!update::textures_current(None));
     let marked = update::mark_textures_flipped("ab-1+tex1").unwrap();
     assert!(update::textures_current(Some(&marked)));
+    // Flipping yields layout 2 specifically, whatever the current layout is.
+    assert_eq!(marked, "ab-1+tex2");
     // Gamedata/meshes still need the new extraction pass.
     assert_ne!(marked, update::chk_digest("ab-1", true, true));
     assert!(update::mark_textures_flipped(&marked).is_none());

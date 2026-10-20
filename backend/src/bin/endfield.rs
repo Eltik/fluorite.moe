@@ -385,7 +385,8 @@ async fn cmd_extract(
                 skip_existing_textures: false,
                 out_dirs: &out_dirs,
             };
-            process_chk_contents(&data, &options, &mut stats);
+            // Failures are already reported inside; `extract` has no state to keep consistent.
+            let _ = process_chk_contents(&data, &options, &mut stats);
         }
         println!();
     }
@@ -454,6 +455,23 @@ struct ChkExtractOptions<'a> {
     out_dirs: &'a OutputDirs,
 }
 
+/// Why [`process_chk_contents`] rejected a chunk.
+enum ChkFailure {
+    NotContainer,
+    NoSerializedFile,
+    WriteErrors(u64),
+}
+
+impl std::fmt::Display for ChkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChkFailure::NotContainer => write!(f, "not a valid VFS container"),
+            ChkFailure::NoSerializedFile => write!(f, "no SerializedFile could be parsed"),
+            ChkFailure::WriteErrors(count) => write!(f, "{count} file(s) could not be written"),
+        }
+    }
+}
+
 /// Process one downloaded `.chk`.
 ///
 /// Objects that fail to decode are skipped, but any output that cannot be written fails the
@@ -462,10 +480,10 @@ fn process_chk_contents(
     data: &[u8],
     options: &ChkExtractOptions<'_>,
     stats: &mut ExtractStats,
-) -> bool {
+) -> Result<(), ChkFailure> {
     let Some(chk) = extract_chk_contents(data) else {
         println!("    Not a valid VFS container, skipping");
-        return false;
+        return Err(ChkFailure::NotContainer);
     };
     println!(
         "    {} SerializedFile(s), {} .resS stream(s)",
@@ -543,13 +561,13 @@ fn process_chk_contents(
     write_errors += stats.gamedata.write_errors - write_errors_before;
     if write_errors > 0 {
         println!("    {write_errors} file(s) could not be written");
-        return false;
+        return Err(ChkFailure::WriteErrors(write_errors));
     }
     if parsed == 0 && !chk.sf_data.is_empty() {
         println!("    no SerializedFile could be parsed");
-        return false;
+        return Err(ChkFailure::NoSerializedFile);
     }
-    true
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -735,7 +753,9 @@ async fn cmd_update(
     emit_progress(progress, "resolve", 0, 0, "checking launcher");
     let config = resolve_game_config(client, &pipeline::default_resolve_params()).await?;
     let fingerprint = update::fingerprint(&config);
-    if state.fingerprint == fingerprint && !force {
+    let up_to_date = state.fingerprint == fingerprint;
+    // `--check` reports whether upstream changed; `--force` only affects a real run.
+    if up_to_date && (check || !force) {
         println!(
             "up to date ({} / res {})",
             config.version, config.res_version
@@ -912,7 +932,7 @@ async fn extract_dirty_chunks(
             state.chk.insert(name.clone(), stale);
             update::save_state(ctx.state_path, state)?;
         }
-        let ok = tokio::task::block_in_place(|| {
+        let result = tokio::task::block_in_place(|| {
             process_chk_contents(
                 &data,
                 &ChkExtractOptions {
@@ -924,14 +944,17 @@ async fn extract_dirty_chunks(
                 &mut stats,
             )
         });
-        if ok {
-            state.chk.insert(name, digest);
-            // Checkpoint per chk so an interrupted run resumes instead of starting over.
-            update::save_state(ctx.state_path, state)?;
-            counts.ok += 1;
-        } else {
-            println!("  {}: not a valid VFS container", name);
-            counts.failed += 1;
+        match result {
+            Ok(()) => {
+                state.chk.insert(name, digest);
+                // Checkpoint per chk so an interrupted run resumes instead of starting over.
+                update::save_state(ctx.state_path, state)?;
+                counts.ok += 1;
+            }
+            Err(failure) => {
+                println!("  {name}: {failure}");
+                counts.failed += 1;
+            }
         }
     }
     progress.finish();
@@ -1723,9 +1746,6 @@ async fn cmd_scan(client: &Client, scan_all: bool) -> Result<(), Box<dyn std::er
         println!("Patch version: {}", patch.version);
         println!("Chunk files: {}\n", patch.files.len());
     }
-
-    let output_dir = "./output";
-    fs::create_dir_all(output_dir)?;
 
     let mut manifests: Vec<ChkManifest> = Vec::new();
 

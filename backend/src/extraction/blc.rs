@@ -185,12 +185,11 @@ fn parse_layout(data: &[u8], layout: Layout) -> Result<BlcInfo, String> {
 
 /// Decrypt a single file from a chunk using its BLC entry metadata.
 pub fn decrypt_file(chunk_data: &[u8], entry: &BlcFileEntry, version: i32) -> Option<Vec<u8>> {
-    let offset = entry.offset as usize;
-    let len = entry.len as usize;
-    if offset + len > chunk_data.len() {
-        return None;
-    }
-    let file_data = &chunk_data[offset..offset + len];
+    // The catalog is untrusted: a negative or huge offset/len must not wrap.
+    let offset = usize::try_from(entry.offset).ok()?;
+    let len = usize::try_from(entry.len).ok()?;
+    let end = offset.checked_add(len)?;
+    let file_data = chunk_data.get(offset..end)?;
     if entry.use_encrypt {
         let mut nonce = [0u8; 12];
         nonce[0..4].copy_from_slice(&version.to_le_bytes());

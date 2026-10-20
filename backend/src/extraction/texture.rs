@@ -153,12 +153,10 @@ pub fn resolve_stream_data(obj: &Value, resources: &HashMap<String, Vec<u8>>) ->
                 .map(|(_, v)| v)
         })?;
 
-    let end = (offset + size).min(res_data.len());
-    if offset >= res_data.len() {
-        return None;
-    }
-
-    Some(res_data[offset..end].to_vec())
+    // A stream running past the end of its .resS is truncated: report it as missing
+    // rather than decoding partial bytes.
+    let end = offset.checked_add(size)?;
+    Some(res_data.get(offset..end)?.to_vec())
 }
 
 /// Get an integer field from a deserialized object.
