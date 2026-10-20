@@ -5,9 +5,10 @@
 use super::chacha20::{CHACHA_KEY, chacha20_crypt};
 use super::pipeline::{self, ResolvedPipeline};
 use super::sparkbuffer;
+use crate::extraction::utils::sanitize_filename;
 use reqwest::Client;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Parsed BLC catalog metadata.
 pub struct BlcInfo {
@@ -27,31 +28,69 @@ pub struct BlcFileEntry {
     pub iv_seed: i64,
 }
 
-/// All encrypted VFS directories.
-pub const ENCRYPTED_DIRS: &[&str] = &[
-    "DAFE52C9", // IFixPatchOut
-    "42A8FCA6", // Table (SparkBuffer)
-    "775A31D1", // JsonData
-    "19E3AE45", // Lua
-    "D6E622F7", // ExtendData
-    "1CDDBF1F", // BundleManifest
-    "3C9D9D2D", // InitialExtendData
-    "1EBAF5C6", // Audio English
-    "E1E7D7CE", // Audio Chinese
-];
-
-fn read_u16_str(data: &[u8], pos: &mut usize) -> String {
-    let len = u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
-    *pos += 2;
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).to_string();
-    *pos += len;
-    s
+/// Bounds-checked little-endian reader over a decrypted BLC catalog.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
 }
 
-fn read_md5(data: &[u8], pos: &mut usize) -> String {
-    let bytes = &data[*pos..*pos + 16];
-    *pos += 16;
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| format!("BLC truncated at offset {} (need {len} bytes)", self.pos))?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn skip(&mut self, len: usize) -> Result<(), String> {
+        self.take(len).map(|_| ())
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn i32(&mut self) -> Result<i32, String> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i64(&mut self) -> Result<i64, String> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        let len = self.u16()? as usize;
+        Ok(String::from_utf8_lossy(self.take(len)?).to_string())
+    }
+
+    fn md5(&mut self) -> Result<String, String> {
+        Ok(self
+            .take(16)?
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect())
+    }
+
+    fn count(&mut self) -> Result<usize, String> {
+        let n = self.i32()?;
+        usize::try_from(n).map_err(|_| format!("BLC negative count {n} at offset {}", self.pos - 4))
+    }
+}
+
+/// Catalog layout revision. `V5` adds a header field before the group name and an extra
+/// `i64` after each chunk/file block type.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    Legacy,
+    V5,
 }
 
 /// Decrypt and parse a BLC catalog file.
@@ -70,57 +109,56 @@ pub fn parse_blc(raw_blc: &[u8]) -> Result<BlcInfo, String> {
     let mut full = Vec::with_capacity(raw_blc.len());
     full.extend_from_slice(&raw_blc[..12]);
     full.extend_from_slice(&decrypted);
-    let data = &full;
 
-    let mut pos = 0;
-    let version = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-    pos += 4;
-    pos += 12; // skip remaining nonce + 4 unknown bytes
+    // The format revision sits at offset 12; try the layout it names first.
+    let revision = i32::from_le_bytes(full[12..16].try_into().unwrap());
+    let order = if revision >= 5 {
+        [Layout::V5, Layout::Legacy]
+    } else {
+        [Layout::Legacy, Layout::V5]
+    };
+    parse_layout(&full, order[0]).or_else(|first| parse_layout(&full, order[1]).map_err(|_| first))
+}
 
-    let group_cfg_name = read_u16_str(data, &mut pos);
+fn parse_layout(data: &[u8], layout: Layout) -> Result<BlcInfo, String> {
+    let v5 = layout == Layout::V5;
+    let mut r = Reader { data, pos: 0 };
+    let version = r.i32()?;
+    r.skip(if v5 { 16 } else { 12 })?;
 
-    let hash_val = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+    let group_cfg_name = r.string()?;
+    let hash_val = u32::from_be_bytes(r.take(4)?.try_into().unwrap());
     let group_cfg_hash = format!("{:08X}", hash_val);
-    pos += 8;
+    r.skip(4)?;
 
-    let _file_info_num = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-    pos += 4;
-    let _chunks_length = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-    pos += 8;
-    let _block_type = data[pos];
-    pos += 1;
-    let chunk_count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-    pos += 4;
+    let file_info_num = r.count()?;
+    let _chunks_length = r.i64()?;
+    let _block_type = r.u8()?;
+    let chunk_count = r.count()?;
 
     let mut all_files = Vec::new();
     for _ in 0..chunk_count {
-        let _chunk_md5_name = read_md5(data, &mut pos);
-        let _content_md5 = read_md5(data, &mut pos);
-        let _chunk_length = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let _chunk_block_type = data[pos];
-        pos += 1;
-        let file_count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+        let _chunk_md5_name = r.md5()?;
+        let _content_md5 = r.md5()?;
+        let _chunk_length = r.i64()?;
+        let _chunk_block_type = r.u8()?;
+        if v5 {
+            r.skip(8)?;
+        }
+        let file_count = r.count()?;
 
         for _ in 0..file_count {
-            let file_name = read_u16_str(data, &mut pos);
-            let _file_name_hash = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let chunk_md5 = read_md5(data, &mut pos);
-            let _file_data_md5 = read_md5(data, &mut pos);
-            let offset = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let len = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let _file_block_type = data[pos];
-            pos += 1;
-            let use_encrypt = data[pos] != 0;
-            pos += 1;
-            let mut iv_seed: i64 = 0;
-            if use_encrypt {
-                iv_seed = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                pos += 8;
+            let file_name = r.string()?;
+            let _file_name_hash = r.i64()?;
+            let chunk_md5 = r.md5()?;
+            let _file_data_md5 = r.md5()?;
+            let offset = r.i64()?;
+            let len = r.i64()?;
+            let _file_block_type = r.u8()?;
+            let use_encrypt = r.u8()? != 0;
+            let iv_seed = if use_encrypt { r.i64()? } else { 0 };
+            if v5 {
+                r.skip(8)?;
             }
             all_files.push(BlcFileEntry {
                 file_name,
@@ -131,6 +169,12 @@ pub fn parse_blc(raw_blc: &[u8]) -> Result<BlcInfo, String> {
                 iv_seed,
             });
         }
+    }
+    if v5 && all_files.len() != file_info_num {
+        return Err(format!(
+            "BLC lists {file_info_num} files but chunks hold {}",
+            all_files.len()
+        ));
     }
 
     Ok(BlcInfo {
@@ -163,13 +207,33 @@ pub fn decrypt_file(chunk_data: &[u8], entry: &BlcFileEntry, version: i32) -> Op
 pub struct DirExtractResult {
     pub dir_hash: String,
     pub group_name: String,
+    /// Directory the files were written to: `<output_dir>/<group name>`.
+    pub output: PathBuf,
     pub total_files: usize,
     pub extracted: usize,
     pub sparkbuffer_parsed: usize,
     pub errors: Vec<String>,
 }
 
-/// Extract all files from a single encrypted VFS directory.
+/// Group whose `.bytes` files are SparkBuffer tables worth converting to JSON.
+const SPARKBUFFER_GROUP: &str = "Table";
+
+/// Map a catalog file name (`Data/LuaScripts/Foo.lua`) to a safe relative output path.
+pub fn relative_file_path(file_name: &str) -> PathBuf {
+    let trimmed = file_name.strip_prefix("Data/").unwrap_or(file_name);
+    let path: PathBuf = trimmed
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .map(sanitize_filename)
+        .collect();
+    if path.as_os_str().is_empty() {
+        PathBuf::from("_unnamed")
+    } else {
+        path
+    }
+}
+
+/// Extract all files from a single BLC-catalogued VFS directory into `<output_dir>/<group>`.
 pub async fn extract_directory(
     client: &Client,
     resolved: &ResolvedPipeline,
@@ -183,7 +247,11 @@ pub async fn extract_directory(
     let blc_data = pipeline::download_chk(client, &resolved.cd, &blc_name).await?;
     let blc = parse_blc(&blc_data).map_err(|e| format!("BLC parse error: {e}"))?;
 
-    let dir_output = output_dir.join(dir_hash);
+    let mut group = sanitize_filename(&blc.group_cfg_name).replace(['/', '\\'], "_");
+    if group.is_empty() {
+        group = dir_hash.to_string();
+    }
+    let dir_output = output_dir.join(&group);
     std::fs::create_dir_all(&dir_output)?;
 
     // Save metadata
@@ -200,6 +268,7 @@ pub async fn extract_directory(
     let mut result = DirExtractResult {
         dir_hash: dir_hash.to_string(),
         group_name: blc.group_cfg_name.clone(),
+        output: dir_output.clone(),
         total_files: blc.files.len(),
         extracted: 0,
         sparkbuffer_parsed: 0,
@@ -268,17 +337,19 @@ pub async fn extract_directory(
                 continue;
             };
 
-            let safe_name = f.file_name.replace(['/', '\\'], "_");
-            let out_path = dir_output.join(&safe_name);
+            let relative = relative_file_path(&f.file_name);
+            let out_path = dir_output.join(&relative);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::write(&out_path, &decrypted)?;
             result.extracted += 1;
 
             // Parse SparkBuffer .bytes → JSON
-            if f.file_name.ends_with(".bytes") {
+            if blc.group_cfg_name == SPARKBUFFER_GROUP && f.file_name.ends_with(".bytes") {
                 match sparkbuffer::parse_sparkbuffer(&decrypted) {
                     Ok(json_val) => {
-                        let json_name = format!("{}.json", safe_name.trim_end_matches(".bytes"));
-                        let json_path = dir_output.join(&json_name);
+                        let json_path = out_path.with_extension("json");
                         let json_str = serde_json::to_string_pretty(&json_val).unwrap();
                         std::fs::write(&json_path, &json_str)?;
                         result.sparkbuffer_parsed += 1;

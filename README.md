@@ -61,9 +61,10 @@ cargo run --release --bin endfield -- extract --all --output ./my-output
 
 | Flag | Description |
 |------|-------------|
-| `--json` | Extract JSON and TextAsset files |
+| `--json` | Extract TextAssets (JSON, text, and binary files with their real extensions) |
 | `--textures` | Extract Texture2D as PNG images |
 | `--gamedata` | Extract MonoBehaviour objects as JSON |
+| `--meshes` | Export Mesh objects as glTF binary (`.glb`) |
 | `--all` | Extract all types (default if no flags given) |
 | `--dir <HASH>` | Target a specific VFS directory hash |
 | `--output <PATH>` | Output directory (default: `./output`) |
@@ -72,10 +73,11 @@ cargo run --release --bin endfield -- extract --all --output ./my-output
 Output structure:
 ```
 output/
-  gamedata/           # TextAssets: JSON configs, text files, binary data
-  gamedata/monobehaviour/
-    <TypeName>/       # MonoBehaviours grouped by script type
-      <ObjectName>.json
+  gamedata/           # TextAssets + MonoBehaviours, mirroring the game's asset paths
+    beyond/...        # e.g. beyond/dynamicassets/gameplay/guide/guide_group_crop_farm_1.json
+    <owner>/          # assets only referenced by a prefab sit in a folder named after it
+    _unsorted/        # no container entry; MonoBehaviours grouped by script type
+  meshes/             # Mesh as .glb (glTF 2.0), same layout as textures
   textures/           # Texture2D as PNG, mirroring the game's asset paths
     beyond/...        # from assets/beyond/... (e.g. beyond/initialassets/ui/sprites/login/)
     packages/...      # textures shipped in Unity packages
@@ -83,6 +85,8 @@ output/
     _unsorted/        # fallback when a bundle has no container entry (<name>__<pathid>.png)
     index.jsonl       # one line per texture: path, name, container path, placement, size, format
 ```
+
+TextAssets keep their real type: the extension comes from the container path (Unity's mandatory `.bytes` suffix is dropped, so `hero.skel.bytes` becomes `hero.skel`), then the asset name, then magic bytes (`.glb`, `.webp`, `.png`, `.ogg`, `.bnk`, ...), then JSON/text detection. Textures are flipped to top-down orientation (Unity stores rows bottom-up). Meshes are converted from Unity's left-handed space (X negated, winding reversed, V flipped); skinned meshes are exported in bind pose without bones.
 
 #### `endfield extract-file`
 
@@ -98,49 +102,44 @@ cargo run --release --bin endfield -- extract-file "CAB-abc123" --dir 7064D8E2
 
 #### `endfield decrypt`
 
-Decrypt all ChaCha20-encrypted VFS directories. These contain game data tables (SparkBuffer `.bytes`), JSON configs, Lua scripts, and other encrypted content.
+Extract every BLC-catalogued VFS directory (everything except the Unity bundle directories), decrypting ChaCha20 entries. Directories and file lists come from the CDN's `.blc` catalogs, so new directories are picked up automatically.
 
 ```bash
-# Decrypt all 9 encrypted directories
+# Extract all BLC directories
 cargo run --release --bin endfield -- decrypt
 
-# Decrypt a specific directory
+# A specific directory
 cargo run --release --bin endfield -- decrypt --dir 42A8FCA6
-
-# Custom output
-cargo run --release --bin endfield -- decrypt --output ./my-decrypted
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--dir <HASH>` | Decrypt a specific directory (default: all 9 encrypted dirs) |
+| `--dir <HASH>` | Extract a specific directory (default: all BLC directories) |
 | `--output <PATH>` | Output directory (default: `./output/decrypted`) |
 
-Encrypted VFS directories:
+BLC directories (game 1.6):
 
-| Hash | Contents |
-|------|----------|
-| `DAFE52C9` | IFixPatchOut |
-| `42A8FCA6` | Table (SparkBuffer game data) |
-| `775A31D1` | JsonData |
-| `19E3AE45` | Lua scripts |
-| `D6E622F7` | ExtendData |
-| `1CDDBF1F` | BundleManifest |
-| `3C9D9D2D` | InitialExtendData |
-| `1EBAF5C6` | Audio (English) |
-| `E1E7D7CE` | Audio (Chinese) |
+| Hash | Group | Contents |
+|------|-------|----------|
+| `42A8FCA6` | Table | SparkBuffer game data tables (parsed to JSON) |
+| `775A31D1` | JsonData | Level/AI configs (`.json` names, but a binary encoding) |
+| `19E3AE45` | Lua | Lua scripts (still app-encrypted, base64) |
+| `D6E622F7` / `3C9D9D2D` | ExtendData / InitialExtendData | Binary lookup data |
+| `1CDDBF1F` | BundleManifest | `manifest.hgmmap` |
+| `07A1BB91` / `24ED34CF` | InitAudio / Audio | Wwise `.pck` banks |
+| `55FC21C6` | Video | CRI `.usm` videos (~7 GB) |
+| `A63D7E6A` / `F84BF5E6` / `C3442D43` / `23D53F5D` | IV / Terrain / Streaming / DynamicStreaming | Engine level data (~7 GB) |
+| `DAFE52C9` / `F151B649` | IFixPatchOut / HotfixAudio | Usually empty |
 
 Output structure:
 ```
 output/decrypted/
-  42A8FCA6/              # One folder per directory hash
+  Table/                 # One folder per catalog group
     blc_metadata.txt     # BLC catalog info (group name, version, file count)
-    SomeTable.bytes      # Raw decrypted file
-    SomeTable.json       # SparkBuffer .bytes auto-parsed to JSON
-    ...
+    TableCfg/SomeTable.bytes  # Original path, minus the leading `Data/`
+    TableCfg/SomeTable.json   # SparkBuffer .bytes auto-parsed to JSON
+  Lua/LuaScripts/...
 ```
-
-SparkBuffer `.bytes` files are automatically parsed into human-readable JSON alongside the raw binary.
 
 #### `endfield list`
 
@@ -189,10 +188,22 @@ cargo run --release --bin endfield -- update --check
 | `--force` | Re-process everything regardless of state |
 | `--check` | Report only; exit `10` if an update is available, `0` if up to date |
 | `--no-textures` | Skip texture extraction (those chunks are re-processed by a later run with textures) |
+| `--no-meshes` | Skip mesh export |
+| `--skip-dir <HASH,...>` | Leave these BLC directories alone; the version fingerprint is not recorded, so a later run without it fetches them |
 
 Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`.
 
 When the texture layout changes, the next `update` sorts existing PNGs instead of re-extracting them. For each chunk that is unchanged upstream, it downloads the chunk and reads only its bundle metadata, then moves the old flat PNGs (`textures/<name>.png`) into the new folders. Nothing is decoded and no PNG is rewritten. Chunks that did change upstream are extracted normally. When a name matches several textures, the file's dimensions pick one; if they can't, it goes to `textures/_ambiguous/` with its candidate paths listed in `candidates.jsonl`. State is saved only after the sort finishes, so an interrupted run starts the sort again on the next run. Leftover top-level PNGs (textures no longer in the game) are deleted once every chunk succeeds.
+
+When the extraction output format changes (`EXTRACT_VERSION` in `update.rs`), every bundle chunk is re-downloaded and re-extracted. PNGs from unchanged chunks that already match the current texture layout are kept instead of decoded again. Once every chunk succeeds, the legacy flat gamedata (top-level files and `gamedata/monobehaviour/`) and `textures/_ambiguous/` are removed.
+
+#### `endfield repair`
+
+Flips PNGs extracted before the orientation fix in place, using each chunk's texture index, and marks those chunks as current in the state file. It needs no network access, and a per-chunk journal makes it safe to interrupt and rerun.
+
+#### Fixing an existing output
+
+`backend/scripts/repair-assets.sh` brings output from older versions up to date: it runs `repair`, then `update` (re-extracting gamedata into the new layout, exporting meshes, extracting textures that went missing, and downloading the BLC directories). It skips the engine level-data directories unless you pass `--all`, and warns when free disk space looks too low. Rerun it after an interruption.
 
 #### Scheduling
 
@@ -237,7 +248,9 @@ backend/
 │       ├── chacha20.rs         # ChaCha20 (RFC7539) cipher
 │       ├── crypto_constants.rs # Encryption keys and constants
 │       ├── fair_guard_utils.rs # FairGuard anti-cheat obfuscation helpers
+│       ├── gamedata.rs         # TextAsset/MonoBehaviour export by container path
 │       ├── lz4_inv.rs          # Custom LZ4 decompression
+│       ├── mesh.rs             # Unity Mesh → glTF binary (.glb)
 │       ├── pipeline.rs         # VFS download pipeline (resolve, list, download)
 │       ├── sparkbuffer.rs      # SparkBuffer binary table → JSON parser
 │       ├── texture.rs          # Texture2D extraction (BC7, ASTC, etc. → PNG)

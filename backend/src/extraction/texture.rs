@@ -1,5 +1,5 @@
 /// Texture2D extraction: decode compressed textures and export as PNG.
-use crate::extraction::texture_layout::{self, IndexEntry, Placement};
+use crate::extraction::texture_layout::{self, IndexEntry, Placement, PlannedTexture};
 use std::collections::HashMap;
 use std::path::Path;
 use unity_asset_binary::asset::SerializedFile;
@@ -202,25 +202,66 @@ fn get_int(obj: &unity_asset_binary::object::UnityObject, key: &str) -> i64 {
     obj.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
+fn index_entry(plan: &PlannedTexture, width: usize, height: usize, format: i64) -> IndexEntry {
+    let (container, placement) = match &plan.placement {
+        Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
+        Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
+        None => (None, "unsorted"),
+    };
+    IndexEntry {
+        path: plan.relative.to_string_lossy().replace('\\', "/"),
+        name: plan.name.clone(),
+        container,
+        placement,
+        width: width as u32,
+        height: height as u32,
+        format: texture_format_name(format),
+    }
+}
+
 /// Texture extraction counts and index entries produced for one SerializedFile.
 pub struct TextureExtractResult {
     pub extracted: u64,
+    /// Already on disk and skipped (only with `skip_existing`).
+    pub existing: u64,
     pub failed: u64,
+    /// PNGs that decoded but could not be written (included in `failed`).
+    pub write_errors: u64,
     pub unsupported: u64,
     pub no_data: u64,
     pub entries: Vec<IndexEntry>,
 }
 
+/// Convert decoded BGRA pixels to RGBA bytes, flipping rows top-to-bottom.
+///
+/// Unity stores texture rows bottom-up, so the first decoded row is the bottom of the image.
+pub fn bgra_to_rgba_flipped(pixels: &[u32], width: usize, height: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; width * height * 4];
+    for (y, row) in pixels.chunks_exact(width).take(height).enumerate() {
+        let out_row = &mut rgba[(height - 1 - y) * width * 4..(height - y) * width * 4];
+        for (out, &pixel) in out_row.as_chunks_mut::<4>().0.iter_mut().zip(row) {
+            let [b, g, r, a] = pixel.to_le_bytes();
+            out.copy_from_slice(&[r, g, b, a]);
+        }
+    }
+    rgba
+}
+
 /// Extract all Texture2D objects from a SerializedFile as PNG files.
+///
+/// With `skip_existing`, textures whose PNG is already on disk are indexed without re-decoding.
 pub fn extract_textures(
     sf: &SerializedFile,
     resources: &HashMap<String, Vec<u8>>,
     output_dir: &Path,
+    skip_existing: bool,
 ) -> TextureExtractResult {
     let mut extracted = 0u64;
     let mut failed = 0u64;
     let mut skipped_format = 0u64;
     let mut no_data = 0u64;
+    let mut existing = 0u64;
+    let mut write_errors = 0u64;
     let mut entries = Vec::new();
     let planned = texture_layout::plan_textures(sf);
     let planned_by_id: HashMap<_, _> = planned.iter().map(|plan| (plan.path_id, plan)).collect();
@@ -242,6 +283,13 @@ pub fn extract_textures(
         let format = get_int(&unity_obj, "m_TextureFormat");
 
         if width == 0 || height == 0 {
+            continue;
+        }
+
+        let path = output_dir.join(&plan.relative);
+        if skip_existing && path.is_file() {
+            existing += 1;
+            entries.push(index_entry(plan, width, height, format));
             continue;
         }
 
@@ -268,50 +316,32 @@ pub fn extract_textures(
         let mut rgba_buf = vec![0u32; width * height];
         match decode_texture(format, &compressed, width, height, &mut rgba_buf) {
             Ok(()) => {
-                // Convert u32 BGRA → u8 RGBA and save PNG
-                let mut rgba_bytes = vec![0u8; width * height * 4];
-                for (i, &pixel) in rgba_buf.iter().enumerate() {
-                    let b = (pixel & 0xFF) as u8;
-                    let g = ((pixel >> 8) & 0xFF) as u8;
-                    let r = ((pixel >> 16) & 0xFF) as u8;
-                    let a = ((pixel >> 24) & 0xFF) as u8;
-                    rgba_bytes[i * 4] = r;
-                    rgba_bytes[i * 4 + 1] = g;
-                    rgba_bytes[i * 4 + 2] = b;
-                    rgba_bytes[i * 4 + 3] = a;
-                }
-
-                let path = output_dir.join(&plan.relative);
+                let rgba_bytes = bgra_to_rgba_flipped(&rgba_buf, width, height);
                 if let Some(parent) = path.parent()
                     && let Err(error) = std::fs::create_dir_all(parent)
                 {
                     eprintln!("  FAIL create directory for {}: {}", name, error);
                     failed += 1;
+                    write_errors += 1;
                     continue;
                 }
-                match image::save_buffer(
-                    &path,
+                // Written beside the target and renamed so a crash never leaves a truncated
+                // PNG that a later run would keep as "already extracted".
+                let tmp = path.with_extension("png.tmp");
+                let saved = image::save_buffer_with_format(
+                    &tmp,
                     &rgba_bytes,
                     width as u32,
                     height as u32,
                     image::ColorType::Rgba8,
-                ) {
+                    image::ImageFormat::Png,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|()| std::fs::rename(&tmp, &path).map_err(|error| error.to_string()));
+                match saved {
                     Ok(()) => {
                         extracted += 1;
-                        let (container, placement) = match &plan.placement {
-                            Some(Placement::Direct(path)) => (Some(path.clone()), "direct"),
-                            Some(Placement::Dependency(path)) => (Some(path.clone()), "dependency"),
-                            None => (None, "unsorted"),
-                        };
-                        entries.push(IndexEntry {
-                            path: plan.relative.to_string_lossy().replace('\\', "/"),
-                            name: name.clone(),
-                            container,
-                            placement,
-                            width: width as u32,
-                            height: height as u32,
-                            format: texture_format_name(format),
-                        });
+                        entries.push(index_entry(plan, width, height, format));
                         if extracted <= 20 || extracted.is_multiple_of(100) {
                             println!(
                                 "  [{}] {} ({}x{}, {}) → {}",
@@ -327,6 +357,7 @@ pub fn extract_textures(
                     Err(e) => {
                         eprintln!("  FAIL save {}: {}", name, e);
                         failed += 1;
+                        write_errors += 1;
                     }
                 }
             }
@@ -346,7 +377,9 @@ pub fn extract_textures(
 
     TextureExtractResult {
         extracted,
+        existing,
         failed,
+        write_errors,
         unsupported: skipped_format,
         no_data,
         entries,

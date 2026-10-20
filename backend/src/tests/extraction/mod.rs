@@ -1,7 +1,11 @@
+mod blc;
 mod chacha20;
 mod fair_guard_utils;
+mod gamedata;
 mod lz4_inv;
+mod mesh;
 mod sparkbuffer;
+mod texture;
 mod texture_layout;
 mod texture_sort;
 mod unity_extract;

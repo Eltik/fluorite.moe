@@ -1,5 +1,5 @@
 /// Texture output layout derived from Unity AssetBundle container metadata.
-use crate::extraction::utils::sanitize_filename;
+use crate::extraction::utils::{fit_filename, sanitize_filename};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use unity_asset_binary::asset::SerializedFile;
 use unity_asset_binary::object::ObjectHandle;
 
-pub const LAYOUT_VERSION: u32 = 1;
+/// Bump when existing PNGs on disk become stale. 2: rows flipped to top-down orientation.
+pub const LAYOUT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Placement {
@@ -141,9 +142,20 @@ pub fn relative_path(placement: Option<&Placement>, name: &str, path_id: i64) ->
         stem = format!("obj_{path_id}");
     }
 
-    let Some(placement) = placement else {
-        return PathBuf::from("_unsorted").join(format!("{stem}__{path_id}.png"));
+    let Some(mut result) = placement_dir(placement) else {
+        return PathBuf::from("_unsorted")
+            .join(fit_filename(&format!("{stem}__{path_id}.png"), path_id));
     };
+    result.push(fit_filename(&format!("{stem}.png"), path_id));
+    result
+}
+
+/// Output directory for an object with this placement, or `None` when it has no container.
+///
+/// Direct assets sit beside their container path; dependencies get a folder named after the
+/// container they were loaded with (e.g. `prefab_name/`).
+pub fn placement_dir(placement: Option<&Placement>) -> Option<PathBuf> {
+    let placement = placement?;
     let container = match placement {
         Placement::Direct(path) | Placement::Dependency(path) => {
             path.strip_prefix("assets/").unwrap_or(path)
@@ -159,13 +171,11 @@ pub fn relative_path(placement: Option<&Placement>, name: &str, path_id: i64) ->
         .map(sanitize_filename)
         .filter(|component| !component.is_empty())
         .collect();
-    let mut result = if components.is_empty() {
+    Some(if components.is_empty() {
         PathBuf::from("_root")
     } else {
         components.iter().collect()
-    };
-    result.push(format!("{stem}.png"));
-    result
+    })
 }
 
 fn without_extension(path: &str) -> &str {
@@ -281,6 +291,59 @@ pub fn remove_legacy_flat_textures(tex_dir: &Path) -> io::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// Path of one chunk's texture index (`<tex_dir>/.index/<chk>.jsonl`).
+pub fn chk_index_path(tex_dir: &Path, chk_name: &str) -> PathBuf {
+    tex_dir.join(".index").join(index_filename(chk_name))
+}
+
+/// Why a PNG could not be flipped.
+#[derive(Debug)]
+pub enum FlipError {
+    /// The file exists but is not a readable image (e.g. truncated by a crash).
+    Corrupt(image::ImageError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for FlipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlipError::Corrupt(error) => write!(f, "unreadable image: {error}"),
+            FlipError::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Write an upside-down copy of a PNG beside it and return the copy's path.
+///
+/// The caller renames it over the original once the flip is recorded, so a crash can never
+/// leave a file flipped without a record of it.
+pub fn write_flipped_png(path: &Path) -> Result<PathBuf, FlipError> {
+    let image = image::open(path).map_err(|error| match error {
+        // A truncated file surfaces as an I/O end-of-file while decoding.
+        image::ImageError::IoError(io)
+            if !matches!(
+                io.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) =>
+        {
+            FlipError::Io(io)
+        }
+        error => FlipError::Corrupt(error),
+    })?;
+    let tmp = path.with_extension("png.tmp");
+    image
+        .flipv()
+        .save_with_format(&tmp, image::ImageFormat::Png)
+        .map_err(|error| FlipError::Io(io::Error::other(error)))?;
+    Ok(tmp)
+}
+
+/// Flip a PNG upside down in place, replacing it atomically.
+pub fn flip_png_in_place(path: &Path) -> Result<(), FlipError> {
+    let tmp = write_flipped_png(path)?;
+    fs::rename(tmp, path).map_err(FlipError::Io)
 }
 
 fn index_filename(chk_name: &str) -> String {

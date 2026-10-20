@@ -114,3 +114,26 @@ pub fn hex_dump_offset(data: &[u8], base_offset: usize, max_bytes: usize) {
 pub fn sanitize_filename(name: &str) -> String {
     name.replace(['\\', ':', '*', '?', '"', '<', '>', '|'], "_")
 }
+
+/// Longest file name written, leaving room for a `.tmp` suffix under the usual 255-byte limit.
+pub const MAX_FILENAME_BYTES: usize = 200;
+
+/// Shorten an over-long file name, keeping its extension and appending `__<path_id>` so the
+/// result stays unique and stable (e.g. Unity's `Asset(Clone)(Clone)...` names).
+pub fn fit_filename(file_name: &str, path_id: i64) -> String {
+    if file_name.len() <= MAX_FILENAME_BYTES {
+        return file_name.to_string();
+    }
+    let (stem, ext) = match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => (stem, format!(".{ext}")),
+        _ => (file_name, String::new()),
+    };
+    let suffix = format!("__{path_id}{ext}");
+    let mut end = MAX_FILENAME_BYTES
+        .saturating_sub(suffix.len())
+        .min(stem.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &stem[..end])
+}

@@ -88,3 +88,17 @@ fn hex_dump_string_non_printable_shown_as_dot() {
     let result = hex_dump_string(&data, 16);
     assert!(result.contains("..."));
 }
+
+#[test]
+fn fit_filename_caps_length_and_keeps_extension() {
+    use crate::extraction::utils::{MAX_FILENAME_BYTES, fit_filename};
+    assert_eq!(fit_filename("short.json", 7), "short.json");
+    let long = format!("Asset{}.json", "(Clone)".repeat(60));
+    let fitted = fit_filename(&long, -42);
+    assert!(fitted.len() <= MAX_FILENAME_BYTES);
+    assert!(fitted.ends_with("__-42.json"));
+    assert_eq!(fitted, fit_filename(&long, -42));
+    // Never splits a multi-byte character.
+    let wide = "名".repeat(100);
+    assert!(fit_filename(&wide, 1).len() <= MAX_FILENAME_BYTES);
+}

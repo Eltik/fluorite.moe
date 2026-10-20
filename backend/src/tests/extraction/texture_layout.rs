@@ -110,3 +110,41 @@ fn chunk_indexes_are_pruned_and_rebuilt() {
     assert!(!index.contains("two.png"));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn placement_dir_matches_texture_layout() {
+    assert_eq!(
+        texture_layout::placement_dir(Some(&Placement::Direct("assets/beyond/ui/a.json".into()))),
+        Some(PathBuf::from("beyond/ui"))
+    );
+    assert_eq!(
+        texture_layout::placement_dir(Some(&Placement::Dependency(
+            "assets/beyond/fx/hit.prefab".into()
+        ))),
+        Some(PathBuf::from("beyond/fx/hit"))
+    );
+    assert_eq!(
+        texture_layout::placement_dir(Some(&Placement::Direct("a.json".into()))),
+        Some(PathBuf::from("_root"))
+    );
+    assert_eq!(texture_layout::placement_dir(None), None);
+}
+
+#[test]
+fn flip_png_in_place_reverses_rows() {
+    let dir = temp_dir("flip");
+    let path = dir.join("t.png");
+    image::save_buffer(
+        &path,
+        &[255, 0, 0, 255, 0, 0, 255, 255],
+        1,
+        2,
+        image::ColorType::Rgba8,
+    )
+    .unwrap();
+    texture_layout::flip_png_in_place(&path).unwrap();
+    let flipped = image::open(&path).unwrap().to_rgba8();
+    assert_eq!(flipped.as_raw(), &[0, 0, 255, 255, 255, 0, 0, 255]);
+    assert!(!path.with_extension("png.tmp").exists());
+    fs::remove_dir_all(dir).unwrap();
+}

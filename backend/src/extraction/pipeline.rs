@@ -119,6 +119,14 @@ pub fn list_vfs_directories(cd: &ZipCentralDirectory) -> Vec<String> {
     dirs.into_iter().collect()
 }
 
+/// VFS directories catalogued by a `.blc` and extracted file-by-file (everything but bundles).
+pub fn blc_directories(cd: &ZipCentralDirectory) -> Vec<String> {
+    list_vfs_directories(cd)
+        .into_iter()
+        .filter(|dir| !VFS_DIRS.iter().any(|(bundle_dir, _)| bundle_dir == dir))
+        .collect()
+}
+
 /// Download a .chk file from the ZIP by name.
 pub async fn download_chk(
     client: &Client,
