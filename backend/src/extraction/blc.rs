@@ -4,6 +4,7 @@
 //! their offsets, sizes, encryption flags, and IV seeds.
 use super::chacha20::{CHACHA_KEY, chacha20_crypt};
 use super::lua;
+use super::memorypack;
 use super::pipeline::{self, ResolvedPipeline, VFS_ROOT};
 use super::sparkbuffer;
 use crate::extraction::utils::{flat_filename, sanitize_filename, to_hex};
@@ -211,11 +212,25 @@ pub struct DirExtractResult {
     pub sparkbuffer_parsed: usize,
     /// Lua scripts written as decrypted source.
     pub lua_decrypted: usize,
+    /// MemoryPack files rewritten as JSON (originals kept as `.mpk`).
+    pub memorypack_decoded: usize,
+    /// MemoryPack files no schema type decodes; kept as stored, and not an error.
+    pub memorypack_failed: usize,
     pub errors: Vec<String>,
 }
 
 /// Group whose `.bytes` files are SparkBuffer tables worth converting to JSON.
 const SPARKBUFFER_GROUP: &str = "Table";
+
+/// Group name recorded in a `blc_metadata.txt` (its first line is `Group: <name> (<hash>)`).
+pub fn metadata_group(metadata: &str) -> Option<&str> {
+    metadata
+        .lines()
+        .next()?
+        .strip_prefix("Group: ")?
+        .split_once(" (")
+        .map(|(group, _)| group)
+}
 
 /// Map a catalog file name (`Data/LuaScripts/Foo.lua`) to a safe relative output path.
 pub fn relative_file_path(file_name: &str) -> PathBuf {
@@ -296,6 +311,8 @@ pub async fn extract_directory(
         extracted: 0,
         sparkbuffer_parsed: 0,
         lua_decrypted: 0,
+        memorypack_decoded: 0,
+        memorypack_failed: 0,
         errors: Vec::new(),
     };
 
@@ -304,6 +321,7 @@ pub async fn extract_directory(
     }
 
     // Group files by chunk MD5
+    let memorypack = blc.group_cfg_name == memorypack::JSON_DATA_GROUP;
     let mut chunks_needed: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, f) in blc.files.iter().enumerate() {
         chunks_needed
@@ -346,6 +364,17 @@ pub async fn extract_directory(
                 .then(|| lua::decrypt_lua(&decrypted))
                 .flatten();
             std::fs::write(&out_path, lua.as_deref().unwrap_or(&decrypted))?;
+            // A source left by an earlier run into the same folder would be decoded instead.
+            if memorypack && out_path.extension().is_some_and(|ext| ext == "json") {
+                match std::fs::remove_file(out_path.with_extension("mpk")) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        result
+                            .errors
+                            .push(format!("{}: stale .mpk: {e}", f.file_name));
+                    }
+                    _ => {}
+                }
+            }
             result.extracted += 1;
             result.lua_decrypted += usize::from(lua.is_some());
 
@@ -365,6 +394,27 @@ pub async fn extract_directory(
                     }
                 }
             }
+        }
+    }
+
+    if memorypack {
+        match memorypack::decode_tree(&dir_output) {
+            Ok(decoded) => {
+                result.memorypack_decoded = decoded.decoded as usize;
+                result.memorypack_failed = decoded.failed as usize;
+                if decoded.write_errors > 0 {
+                    result.errors.push(format!(
+                        "MemoryPack: could not write {} decoded files",
+                        decoded.write_errors
+                    ));
+                }
+            }
+            // An unreadable string pool (e.g. a new client format) leaves the files as stored;
+            // blocking the group would only re-download it on every update.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!("  MemoryPack decode skipped: {e}");
+            }
+            Err(e) => result.errors.push(format!("MemoryPack decode: {e}")),
         }
     }
 

@@ -4,6 +4,7 @@ mod fair_guard_utils;
 mod gamedata;
 mod lua;
 mod lz4_inv;
+mod memorypack;
 mod mesh;
 mod sparkbuffer;
 mod texture;

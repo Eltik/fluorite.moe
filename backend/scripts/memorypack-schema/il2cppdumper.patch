@@ -1,0 +1,33 @@
+diff --git a/Il2CppDumper/Il2Cpp/MetadataClass.cs b/Il2CppDumper/Il2Cpp/MetadataClass.cs
+index a05dc7e..6481832 100644
+--- a/Il2CppDumper/Il2Cpp/MetadataClass.cs
++++ b/Il2CppDumper/Il2Cpp/MetadataClass.cs
+@@ -203,6 +203,7 @@ namespace Il2CppDumper
+         public int interfacesStart;
+         public int vtableStart;
+         public int interfaceOffsetsStart;
++        public int endfieldExtraIndex; // Endfield: extra 4-byte field before the counts (92-byte typedefs)
+ 
+         public ushort method_count;
+         public ushort property_count;
+diff --git a/Il2CppDumper/Program.cs b/Il2CppDumper/Program.cs
+index e09ab83..f6b0f56 100644
+--- a/Il2CppDumper/Program.cs
++++ b/Il2CppDumper/Program.cs
+@@ -207,7 +207,15 @@ namespace Il2CppDumper
+             Console.WriteLine("Searching...");
+             try
+             {
+-                var flag = il2Cpp.PlusSearch(metadata.methodDefs.Count(x => x.methodIndex >= 0), metadata.typeDefs.Length, metadata.imageDefs.Length);
++                var forcedCode = Environment.GetEnvironmentVariable("IL2CPP_CODEREG");
++                var forcedMeta = Environment.GetEnvironmentVariable("IL2CPP_METAREG");
++                var flag = false;
++                if (forcedCode != null && forcedMeta != null)
++                {
++                    il2Cpp.Init(Convert.ToUInt64(forcedCode, 16), Convert.ToUInt64(forcedMeta, 16));
++                    flag = true;
++                }
++                if (!flag) flag = il2Cpp.PlusSearch(metadata.methodDefs.Count(x => x.methodIndex >= 0), metadata.typeDefs.Length, metadata.imageDefs.Length);
+                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                 {
+                     if (!flag && il2Cpp is PE)

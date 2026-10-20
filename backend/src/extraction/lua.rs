@@ -77,12 +77,7 @@ pub fn decrypt_lua(content: &[u8]) -> Option<Vec<u8>> {
 
 /// Whether a `blc_metadata.txt` belongs to the Lua group (its first line is `Group: Lua (<hash>)`).
 pub fn is_lua_metadata(metadata: &str) -> bool {
-    metadata
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("Group: "))
-        .and_then(|rest| rest.split_once(" ("))
-        .is_some_and(|(group, _)| group == LUA_GROUP)
+    super::blc::metadata_group(metadata) == Some(LUA_GROUP)
 }
 
 /// Totals from [`decrypt_tree`].

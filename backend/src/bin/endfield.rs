@@ -14,6 +14,7 @@ use backend::core::endfield::config::{PatchIndex, resolve_game_config};
 use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
 use backend::extraction::lua;
+use backend::extraction::memorypack;
 use backend::extraction::mesh;
 use backend::extraction::pipeline::{self, ResolvedPipeline, VFS_DIRS};
 use backend::extraction::texture;
@@ -1246,7 +1247,8 @@ fn install_blc_group(
 // repair — fix textures extracted before the orientation fix
 // ═══════════════════════════════════════════════════════════
 
-/// Decrypt Lua scripts left encrypted by older runs, then flip every PNG recorded for chunks
+/// Decrypt Lua scripts left encrypted by older runs and decode JsonData MemoryPack files
+/// (re-decoding from their `.mpk` sources), then flip every PNG recorded for chunks
 /// still marked `+tex1` and mark them current.
 ///
 /// A per-chunk journal (`.index/<chk>.flipped`) records finished files so an interrupted run
@@ -1257,6 +1259,7 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
         return Ok(());
     };
     repair_lua(&output.join("decrypted"))?;
+    repair_json_data(&output.join("decrypted"))?;
     let mut state = update::load_state(state_path)?;
     let tex_dir = output.join("textures");
     let stale: Vec<String> = state
@@ -1331,17 +1334,8 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
 /// Decrypt Lua scripts that an older extractor left encrypted, in every Lua group under
 /// `decrypted`.
 fn repair_lua(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let Ok(groups) = fs::read_dir(decrypted) else {
-        return Ok(());
-    };
     let mut totals = lua::TreeDecryptResult::default();
-    for group in groups {
-        let group = group?.path();
-        let is_lua = fs::read_to_string(group.join("blc_metadata.txt"))
-            .is_ok_and(|metadata| lua::is_lua_metadata(&metadata));
-        if !is_lua {
-            continue;
-        }
+    for group in blc_group_dirs(decrypted, lua::LUA_GROUP)? {
         let result = lua::decrypt_tree(&group)?;
         totals.decrypted += result.decrypted;
         totals.write_errors += result.write_errors;
@@ -1356,6 +1350,56 @@ fn repair_lua(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err("repair could not write some Lua scripts; rerun to retry".into());
     }
     Ok(())
+}
+
+/// Decode MemoryPack files in every JsonData group under `decrypted` that an older extractor
+/// left binary, or re-decode them from their `.mpk` sources after a schema update.
+fn repair_json_data(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut totals = memorypack::TreeDecodeResult::default();
+    for group in blc_group_dirs(decrypted, memorypack::JSON_DATA_GROUP)? {
+        let result = match memorypack::decode_tree(&group) {
+            Ok(result) => result,
+            // An unreadable string pool means the files stay as stored, as in extraction.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!(
+                    "repair: JsonData decode skipped in {}: {error}",
+                    group.display()
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        totals.decoded += result.decoded;
+        totals.failed += result.failed;
+        totals.write_errors += result.write_errors;
+    }
+    if totals != memorypack::TreeDecodeResult::default() {
+        println!(
+            "repair: decoded {} JsonData files ({} not decodable), failed {}",
+            totals.decoded, totals.failed, totals.write_errors
+        );
+    }
+    if totals.write_errors > 0 {
+        return Err("repair could not write some JsonData files; rerun to retry".into());
+    }
+    Ok(())
+}
+
+/// Folders under `decrypted` whose `blc_metadata.txt` names BLC group `name`.
+fn blc_group_dirs(decrypted: &Path, name: &str) -> std::io::Result<Vec<PathBuf>> {
+    let Ok(groups) = fs::read_dir(decrypted) else {
+        return Ok(Vec::new());
+    };
+    let mut dirs = Vec::new();
+    for group in groups {
+        let group = group?.path();
+        let matches = fs::read_to_string(group.join("blc_metadata.txt"))
+            .is_ok_and(|metadata| blc::metadata_group(&metadata) == Some(name));
+        if matches {
+            dirs.push(group);
+        }
+    }
+    Ok(dirs)
 }
 
 /// Texture paths listed in a chunk index and not yet journaled as done, or `None` when the
@@ -1610,6 +1654,8 @@ async fn cmd_decrypt(
     let mut total_extracted = 0usize;
     let mut total_sparkbuffer = 0usize;
     let mut total_lua = 0usize;
+    let mut total_memorypack = 0usize;
+    let mut total_memorypack_failed = 0usize;
 
     for dir_hash in &dirs {
         println!("{}", "=".repeat(60));
@@ -1618,13 +1664,15 @@ async fn cmd_decrypt(
         match blc::extract_directory(client, &resolved, dir_hash, output_path).await {
             Ok(result) => {
                 println!(
-                    "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON, {} Lua decrypted",
+                    "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON, {} Lua decrypted, {} MemoryPack→JSON ({} not decodable)",
                     result.group_name,
                     result.dir_hash,
                     result.extracted,
                     result.total_files,
                     result.sparkbuffer_parsed,
                     result.lua_decrypted,
+                    result.memorypack_decoded,
+                    result.memorypack_failed,
                 );
                 if !result.errors.is_empty() {
                     println!("  {} errors:", result.errors.len());
@@ -1638,6 +1686,8 @@ async fn cmd_decrypt(
                 total_extracted += result.extracted;
                 total_sparkbuffer += result.sparkbuffer_parsed;
                 total_lua += result.lua_decrypted;
+                total_memorypack += result.memorypack_decoded;
+                total_memorypack_failed += result.memorypack_failed;
             }
             Err(e) => {
                 println!("  Error: {}", e);
@@ -1650,6 +1700,10 @@ async fn cmd_decrypt(
     println!("  Files extracted: {}", total_extracted);
     println!("  SparkBuffer→JSON: {}", total_sparkbuffer);
     println!("  Lua decrypted: {}", total_lua);
+    println!(
+        "  MemoryPack→JSON: {} ({} not decodable)",
+        total_memorypack, total_memorypack_failed
+    );
     println!("  Output: {}", output);
     println!("\n=== Done ===");
     Ok(())

@@ -5,6 +5,7 @@ pub mod fair_guard_utils;
 pub mod gamedata;
 pub mod lua;
 pub mod lz4_inv;
+pub mod memorypack;
 pub mod mesh;
 pub mod pipeline;
 pub mod sparkbuffer;
