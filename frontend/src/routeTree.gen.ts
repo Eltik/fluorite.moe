@@ -10,33 +10,124 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as StudioRouteImport } from './routes/studio'
+import { Route as TablesRouteImport } from './routes/tables'
+import { Route as TexturesRouteImport } from './routes/textures'
+import { Route as BrowseRootRouteImport } from './routes/browse.$root'
+import { Route as CatalogKindRouteImport } from './routes/catalog.$kind'
+import { Route as TablesIndexRouteImport } from './routes/tables.index'
+import { Route as TablesNameRouteImport } from './routes/tables.$name'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const StudioRoute = StudioRouteImport.update({
+  id: '/studio',
+  path: '/studio',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TablesRoute = TablesRouteImport.update({
+  id: '/tables',
+  path: '/tables',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TexturesRoute = TexturesRouteImport.update({
+  id: '/textures',
+  path: '/textures',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BrowseRootRoute = BrowseRootRouteImport.update({
+  id: '/browse/$root',
+  path: '/browse/$root',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CatalogKindRoute = CatalogKindRouteImport.update({
+  id: '/catalog/$kind',
+  path: '/catalog/$kind',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TablesIndexRoute = TablesIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => TablesRoute,
+} as any)
+const TablesNameRoute = TablesNameRouteImport.update({
+  id: '/$name',
+  path: '/$name',
+  getParentRoute: () => TablesRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/studio': typeof StudioRoute
+  '/tables': typeof TablesRouteWithChildren
+  '/textures': typeof TexturesRoute
+  '/browse/$root': typeof BrowseRootRoute
+  '/catalog/$kind': typeof CatalogKindRoute
+  '/tables/$name': typeof TablesNameRoute
+  '/tables/': typeof TablesIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/studio': typeof StudioRoute
+  '/textures': typeof TexturesRoute
+  '/browse/$root': typeof BrowseRootRoute
+  '/catalog/$kind': typeof CatalogKindRoute
+  '/tables/$name': typeof TablesNameRoute
+  '/tables': typeof TablesIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/studio': typeof StudioRoute
+  '/tables': typeof TablesRouteWithChildren
+  '/textures': typeof TexturesRoute
+  '/browse/$root': typeof BrowseRootRoute
+  '/catalog/$kind': typeof CatalogKindRoute
+  '/tables/$name': typeof TablesNameRoute
+  '/tables/': typeof TablesIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths:
+    | '/'
+    | '/studio'
+    | '/tables'
+    | '/textures'
+    | '/browse/$root'
+    | '/catalog/$kind'
+    | '/tables/$name'
+    | '/tables/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to:
+    | '/'
+    | '/studio'
+    | '/textures'
+    | '/browse/$root'
+    | '/catalog/$kind'
+    | '/tables/$name'
+    | '/tables'
+  id:
+    | '__root__'
+    | '/'
+    | '/studio'
+    | '/tables'
+    | '/textures'
+    | '/browse/$root'
+    | '/catalog/$kind'
+    | '/tables/$name'
+    | '/tables/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  StudioRoute: typeof StudioRoute
+  TablesRoute: typeof TablesRouteWithChildren
+  TexturesRoute: typeof TexturesRoute
+  BrowseRootRoute: typeof BrowseRootRoute
+  CatalogKindRoute: typeof CatalogKindRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +139,78 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/studio': {
+      id: '/studio'
+      path: '/studio'
+      fullPath: '/studio'
+      preLoaderRoute: typeof StudioRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tables': {
+      id: '/tables'
+      path: '/tables'
+      fullPath: '/tables'
+      preLoaderRoute: typeof TablesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/textures': {
+      id: '/textures'
+      path: '/textures'
+      fullPath: '/textures'
+      preLoaderRoute: typeof TexturesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/browse/$root': {
+      id: '/browse/$root'
+      path: '/browse/$root'
+      fullPath: '/browse/$root'
+      preLoaderRoute: typeof BrowseRootRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/catalog/$kind': {
+      id: '/catalog/$kind'
+      path: '/catalog/$kind'
+      fullPath: '/catalog/$kind'
+      preLoaderRoute: typeof CatalogKindRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tables/': {
+      id: '/tables/'
+      path: '/'
+      fullPath: '/tables/'
+      preLoaderRoute: typeof TablesIndexRouteImport
+      parentRoute: typeof TablesRoute
+    }
+    '/tables/$name': {
+      id: '/tables/$name'
+      path: '/$name'
+      fullPath: '/tables/$name'
+      preLoaderRoute: typeof TablesNameRouteImport
+      parentRoute: typeof TablesRoute
+    }
   }
 }
 
+interface TablesRouteChildren {
+  TablesNameRoute: typeof TablesNameRoute
+  TablesIndexRoute: typeof TablesIndexRoute
+}
+
+const TablesRouteChildren: TablesRouteChildren = {
+  TablesNameRoute: TablesNameRoute,
+  TablesIndexRoute: TablesIndexRoute,
+}
+
+const TablesRouteWithChildren =
+  TablesRoute._addFileChildren(TablesRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  StudioRoute: StudioRoute,
+  TablesRoute: TablesRouteWithChildren,
+  TexturesRoute: TexturesRoute,
+  BrowseRootRoute: BrowseRootRoute,
+  CatalogKindRoute: CatalogKindRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

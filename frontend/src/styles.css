@@ -254,6 +254,34 @@ body {
     font-family: var(--font-mono);
   }
   html {
-    @apply font-sans font-mono;
+    @apply font-sans antialiased;
   }
+  :focus-visible {
+    @apply outline-ring;
+  }
+}
+
+/* Checkerboard backdrop for images with alpha. */
+@utility bg-checker {
+  background-color: var(--background);
+  background-image:
+    linear-gradient(45deg, var(--muted) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--muted) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--muted) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--muted) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+/* Shiki dual-theme tokens: light colors inline, dark via CSS variable. */
+.dark .shiki-token {
+  color: var(--shiki-dark) !important;
 }
