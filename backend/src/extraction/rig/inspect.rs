@@ -172,14 +172,26 @@ pub fn animation_survey(
                 .pointer("/m_MuscleClip/m_Clip/data/m_ConstantClip/data")
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
-            let storage = match (acl > 0, dense_curves > 0 || streamed_words > 2 || constants > 0) {
+            let storage = match (
+                acl > 0,
+                dense_curves > 0 || streamed_words > 2 || constants > 0,
+            ) {
                 (true, false) => "acl-only",
                 (true, true) => "acl+mecanim",
                 (false, true) => "mecanim-only",
                 (false, false) => "empty",
             };
             *storage_kinds
-                .entry(format!("{storage} ({})", if name.to_ascii_lowercase().starts_with("a_actor") { "actor" } else if name.to_ascii_lowercase().starts_with("a_monster") { "monster" } else { "other" }))
+                .entry(format!(
+                    "{storage} ({})",
+                    if name.to_ascii_lowercase().starts_with("a_actor") {
+                        "actor"
+                    } else if name.to_ascii_lowercase().starts_with("a_monster") {
+                        "monster"
+                    } else {
+                        "other"
+                    }
+                ))
                 .or_default() += 1;
             if acl > 0 {
                 acl_clips += 1;

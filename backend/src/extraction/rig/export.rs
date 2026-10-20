@@ -761,7 +761,8 @@ impl<'a> Exporter<'a> {
         if sources.is_empty() {
             return Vec::new();
         }
-        let hashes = anim::node_path_hashes(&self.builder.nodes, self.animator_node.unwrap_or(root_node));
+        let hashes =
+            anim::node_path_hashes(&self.builder.nodes, self.animator_node.unwrap_or(root_node));
         let mut out = Vec::new();
         for (cab, path_id) in sources {
             let Some(file) = self.src.get(&cab) else {
@@ -777,10 +778,16 @@ impl<'a> Exporter<'a> {
             match anim::decode_clip(&clip) {
                 Ok(decoded) => {
                     let mut animations = std::mem::take(&mut self.builder.animations);
-                    let stats = anim::add_animation(&mut self.builder, &mut animations, &decoded, &hashes);
+                    let stats =
+                        anim::add_animation(&mut self.builder, &mut animations, &decoded, &hashes);
                     self.builder.animations = animations;
                     if stats.unmatched_tracks > 0 {
-                        self.warn(format!("clip {}: {} of {} tracks match no node", stats.name, stats.unmatched_tracks, stats.unmatched_tracks + stats.matched_tracks));
+                        self.warn(format!(
+                            "clip {}: {} of {} tracks match no node",
+                            stats.name,
+                            stats.unmatched_tracks,
+                            stats.unmatched_tracks + stats.matched_tracks
+                        ));
                     }
                     out.push(stats);
                 }
