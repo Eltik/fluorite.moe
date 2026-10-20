@@ -86,7 +86,7 @@ output/
     index.jsonl       # one line per texture: path, name, container path, placement, size, format
 ```
 
-TextAssets keep their real type: the extension comes from the container path (Unity's mandatory `.bytes` suffix is dropped, so `hero.skel.bytes` becomes `hero.skel`), then the asset name, then magic bytes (`.glb`, `.webp`, `.png`, `.ogg`, `.bnk`, ...), then JSON/text detection. Textures are flipped to top-down orientation (Unity stores rows bottom-up). Meshes are converted from Unity's left-handed space (X negated, winding reversed, V flipped); skinned meshes are exported in bind pose without bones.
+TextAssets keep their real type: the extension comes from the container path (Unity's mandatory `.bytes` suffix is dropped, so `hero.skel.bytes` becomes `hero.skel`), then the asset name, then magic bytes (`.glb`, `.webp`, `.png`, `.ogg`, `.bnk`, ...), then JSON/text detection. Textures are flipped to top-down orientation (Unity stores rows bottom-up). Meshes are converted from Unity's left-handed space (X negated, winding reversed, V flipped); skinned meshes are exported in bind pose without bones (use [`endfield-models`](#endfield-models) for rigged models). Meshes stored as Unity `CompressedMesh` (bit-packed vertices, normals, tangents, UVs, colors, skin weights and indices) are decoded too; Endfield also marks some meshes as compressed whose vertices are in the regular vertex data, so the payload decides, not the flag.
 
 #### `endfield extract-file`
 
@@ -269,6 +269,58 @@ Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonD
 
 `backend/scripts/health-check.sh` rebuilds the binary if needed and runs `endfield health` (arguments pass through, e.g. `--max-age-hours 30`). When the result isn't OK, it posts a macOS notification (when `osascript` is available) and, if `FLUORITE_ALERT_WEBHOOK` is set, POSTs `{"content": ..., "text": ...}` to it, which works for both Discord and Slack incoming webhooks. It exits with the health exit code. Both scripts build with the toolchain pinned in `backend/rust-toolchain.toml`.
 
+### endfield-models
+
+Exports rigged, skinned GLBs (skeleton, skin weights, materials with embedded textures) for operators, NPCs, enemies and weapons. `endfield extract --meshes` only writes bind-pose geometry per mesh; this tool follows each entity prefab through its renderers, materials and avatar to build one self-contained model. Output goes to `output/models/<kind>/<id>.glb` (`<kind>` is `operator`, `npc`, `enemy` or `weapon`) plus `output/models/index.json`, which the API reads as the `models` root. Entries from earlier runs with a different `--filter` are kept in `index.json`.
+
+**The scan store.** A prefab, its meshes, materials and textures live in different bundles of different ~1 GB chunks, most of it texture pixels. `scan` downloads each chunk once and keeps only what rig export needs: the SerializedFiles (a few MB per chunk), the resource streams of bundles holding meshes, and a per-chunk index. Exports then resolve cross-bundle references from the store without downloading anything. The store defaults to `<output>/.store` (`sf/`, `res/`, `index/`). `export` scans missing chunks on its own unless `--no-auto-scan` is set. Textures come from the existing extraction output (`--data-root`, default `./output`), so run `endfield extract --textures` first.
+
+```bash
+# Download chunks once into the store (default: every bundle chunk not yet scanned)
+cargo run --release --bin endfield-models -- scan --store output/models/.store --jobs 3
+
+# Export operators; --filter is a substring of the prefab container path
+cargo run --release --bin endfield-models -- export \
+  --filter postmodels/characters --output output/models
+
+# Add idle animations. Keywords are comma-separated and tried in order; the first
+# that matches any clip wins. --max-anims caps clips per entity (default 4)
+cargo run --release --features acl --bin endfield-models -- export \
+  --filter postmodels/characters --output output/models \
+  --anims uiteam_idle,dialog_single_idle,idle --max-anims 2
+
+# Delete stored files the store's relevance rules no longer keep
+cargo run --release --bin endfield-models -- prune --store output/models/.store
+
+# Summarize objects and container paths of a chunk (--chk is repeatable)
+cargo run --release --bin endfield-models -- inspect --chk <HASH> --filter postmodels
+
+# Summarize AnimationClip / Animator data in a store
+cargo run --release --bin endfield-models -- anim-survey --store output/models/.store
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `chunks` | List the bundle `.chk` files with their sizes |
+| `scan` | Download chunks into the store (`--chk`, `--jobs`, `--cache-dir`) |
+| `export` | Write GLBs for prefabs matching `--filter` (see below) |
+| `prune` | Delete stored files the relevance rules no longer keep, and print the space freed |
+| `inspect` | Summarize Unity objects and container paths of chunks |
+| `anim-survey` | Summarize clips and animators in a store, as JSON |
+| `dump` | Print objects of a stored SerializedFile as JSON (debugging) |
+
+Useful `export` flags: `--filter` (required) picks prefabs by container path, e.g. `postmodels/characters` (operators and NPCs), `postmodels/enemies`, `prefabs/weapons`; `--id` (repeatable) limits to entity ids containing a string; `--all-textures` embeds every referenced texture instead of base color and normal maps; `--images auto|png|webp`; `--max-texture-size`; `--all-lods`; `--source-dir` reads pre-extracted files instead of the store.
+
+**Animations.** Endfield clips are ACL-compressed, so `--anims` needs the decompressor, which is compiled from C++ only with the `acl` feature and needs a C++17 compiler:
+
+```bash
+cargo build --release --features acl --bin endfield-models
+```
+
+ACL v2.1 (and RTM) is vendored in `backend/vendor/acl` under the MIT license (`LICENSE-acl`, `LICENSE-rtm`); `VERSION.txt` records the pinned commits. Default builds need no C++ and export models without clips. Clips are found by container path (`.../<code>/animations/**/*<keyword>*.fbx`, where `<code>` is the entity id's last `_` segment, e.g. `chr_0005_chen` is `chen`).
+
+**In the catalog.** The API links a rigged GLB as `model.rigged` (path relative to the `models` root, served at `/files/models/...`) on the catalog detail of operators, enemies and weapons; the Studio loads it when present. The lookup matches the id against the GLB file names listed in `index.json`, then tries `<kind>/<id>.glb` (also the singular and `characters/`). If neither exists it falls back to a variant prefab of the id: templates such as `eny_0054_hsmino` only have `eny_0054_hsmino1` or `eny_0054_hsmino_chrdg`, and some weapons only `<id>_refined`. A digit suffix counts only after a letter (`wpn_x_0009` never matches `wpn_x_00091`); digit variants win over `_` variants, then the shortest name. Without `index.json`, no model is linked. The API re-reads the index when its mtime changes.
+
 ### auth-test
 
 Interactive Hypergryph account login, OAuth2 flow, gacha history, and character roster via the web API.
@@ -355,6 +407,7 @@ TLS, HSTS and compression of HTML; the API already compresses its JSON.
 | `FLUORITE_INDEX_POLL_SECS` | `60` | How often to check `update-log.jsonl` and rebuild the search index |
 | `FLUORITE_AUDIO_REMOTE` | `1` | Read voice packages from the game CDN (`0` disables) |
 | `FLUORITE_AUDIO_DIRS` | unset | Extra directories of `.pck` files (path-list separated) |
+| `FLUORITE_AUDIO_CACHE_MB` | `5120` (5 GB) | Cap of the transcoded clip cache; swept hourly, oldest clips first |
 | `FLUORITE_VGMSTREAM` / `FLUORITE_FFMPEG` | found on `PATH` | Audio transcoder binaries |
 | `RUST_LOG` | `info` | Log filter |
 
@@ -388,10 +441,11 @@ answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy)
   `FLUORITE_ALERT_WEBHOOK` set, and probe the site itself, e.g.
   `curl -fsS https://<site>/api/status` from your uptime monitor (checks web, proxy and
   API in one request).
-- [ ] **Cache growth**: `FLUORITE_CACHE_DIR` holds generated thumbnails and transcoded
-  audio and has no size cap. Watch it with `du -sh`; to reclaim space, stop the API,
-  delete it, and start the API again (entries are regenerated on demand). Keep it off the output volume if that is
-  near full.
+- [ ] **Cache growth**: `FLUORITE_CACHE_DIR` holds thumbnails (no size cap) and
+  transcoded audio clips (capped by `FLUORITE_AUDIO_CACHE_MB`, 5 GB by default, swept
+  hourly). Watch it with `du -sh`; to reclaim space, stop the API, delete it, and start
+  the API again (entries are regenerated on demand). Keep it off the output volume if
+  that is near full.
 - [ ] **Schema regeneration**: `update` regenerates the MemoryPack schema when the
   client binary changes. If `health` warns about MemoryPack, run `endfield schema-gen`
   (see [above](#endfield-schema-gen)).
@@ -411,6 +465,7 @@ backend/
 │   ├── main.rs
 │   ├── bin/
 │   │   ├── endfield.rs         # Unified extraction CLI
+│   │   ├── endfield-models.rs  # Rigged GLB exporter (scan store, ACL animations)
 │   │   └── auth_test.rs        # Account/gacha/roster tool
 │   ├── core/
 │   │   ├── endfield/

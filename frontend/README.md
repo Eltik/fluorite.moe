@@ -14,7 +14,7 @@ this app fit together in production.
 | `bun install` | Install dependencies |
 | `bun run dev` | Vite dev server with HMR on `:3000` (SSR included) |
 | `bun run build` | Production build into `.output/` (Nitro, `bun` preset) |
-| `bun run start` | Serve the build: `bun .output/server/index.mjs` (needs Bun >= 1.3.14) |
+| `bun run start` | Serve the build: `bun .output/server/index.mjs` (needs Bun >= 1.3.14, run `bun upgrade` if older) |
 | `bun run check` | Biome lint + format check (`bun run format` / `lint` individually) |
 | `bunx tsc --noEmit` | Type-check |
 | `bun run generate-routes` | Regenerate `src/routeTree.gen.ts` (the dev server and build do this too) |
@@ -80,18 +80,32 @@ src/
 dev/mock-api.ts    dev-only API stand-in
 ```
 
+`scripts/serve.sh` refuses to start on an older Bun: earlier versions can't parse React's
+server renderer once bundled, so the production server fails. Run `bun upgrade`.
+
 ### Routes
 
 | Path | Page |
 |---|---|
 | `/` | Home: status, featured operators, recent files |
 | `/catalog`, `/catalog/$kind`, `/catalog/$kind/$id` | Entity catalog: kinds, filtered grid, detail page |
-| `/studio`, `/studio/$kind/$id` | Full-bleed 3D model viewer |
+| `/studio`, `/studio/$kind/$id` | Full-bleed 3D model viewer, with animation playback for rigged GLBs that embed clips |
 | `/story`, `/story/$dialogId` | Story dialogue index and reader |
 | `/audio` | Audio packages, entries and voice lines |
 | `/tables`, `/tables/$name` | Game tables as a data grid or JSON |
 | `/textures` | Texture gallery |
 | `/browse/$root` | File explorer over an output root (`textures`, `meshes`, `gamedata`, `jsondata`, `lua`, ...) |
+
+### Studio animation
+
+The Studio prefers the catalog's rigged GLB (`model.rigged`, from the API's `models` root)
+and falls back to the static mesh parts. Clips embedded in the GLB (exported with
+`endfield-models --anims`) are driven by `studio/animation.ts`, a thin three.js
+`AnimationMixer` wrapper. It selects the first clip, paused, unless `?clip=<name>` names
+one (which autoplays); picking a clip updates `?clip=`. The transport bar offers
+play/pause, a seek slider, frame stepping, speed (0.25x to 2x) and loop/play-once.
+Shortcuts: `Space` play/pause, `Left`/`Right` step a frame, `R` restart. Models without
+clips show the transport bar disabled ("Animations aren't exported yet").
 
 ## Conventions
 
