@@ -3,6 +3,7 @@
 //! BLC files are per-directory metadata catalogs listing all .chk files,
 //! their offsets, sizes, encryption flags, and IV seeds.
 use super::chacha20::{CHACHA_KEY, chacha20_crypt};
+use super::lua;
 use super::pipeline::{self, ResolvedPipeline, VFS_ROOT};
 use super::sparkbuffer;
 use crate::extraction::utils::{flat_filename, sanitize_filename, to_hex};
@@ -209,6 +210,8 @@ pub struct DirExtractResult {
     pub total_files: usize,
     pub extracted: usize,
     pub sparkbuffer_parsed: usize,
+    /// Lua scripts written as decrypted source.
+    pub lua_decrypted: usize,
     pub errors: Vec<String>,
 }
 
@@ -293,6 +296,7 @@ pub async fn extract_directory(
         total_files: blc.files.len(),
         extracted: 0,
         sparkbuffer_parsed: 0,
+        lua_decrypted: 0,
         errors: Vec::new(),
     };
 
@@ -338,8 +342,13 @@ pub async fn extract_directory(
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&out_path, &decrypted)?;
+            // Scripts that don't decrypt are kept as stored rather than failing the group.
+            let lua = (blc.group_cfg_name == lua::LUA_GROUP && f.file_name.ends_with(".lua"))
+                .then(|| lua::decrypt_lua(&decrypted))
+                .flatten();
+            std::fs::write(&out_path, lua.as_deref().unwrap_or(&decrypted))?;
             result.extracted += 1;
+            result.lua_decrypted += usize::from(lua.is_some());
 
             // Parse SparkBuffer .bytes → JSON
             if blc.group_cfg_name == SPARKBUFFER_GROUP && f.file_name.ends_with(".bytes") {

@@ -123,7 +123,7 @@ BLC directories (game 1.6):
 |------|-------|----------|
 | `42A8FCA6` | Table | SparkBuffer game data tables (parsed to JSON) |
 | `775A31D1` | JsonData | Level/AI configs (`.json` names, but a binary encoding) |
-| `19E3AE45` | Lua | Lua scripts (still app-encrypted, base64) |
+| `19E3AE45` | Lua | Lua scripts (base64 + XXTEA in the game files; written as decrypted source) |
 | `D6E622F7` / `3C9D9D2D` | ExtendData / InitialExtendData | Binary lookup data |
 | `1CDDBF1F` | BundleManifest | `manifest.hgmmap` |
 | `07A1BB91` / `24ED34CF` | InitAudio / Audio | Wwise `.pck` banks |
@@ -199,7 +199,7 @@ When the extraction output format changes (`EXTRACT_VERSION` in `update.rs`), ev
 
 #### `endfield repair`
 
-Flips PNGs extracted before the orientation fix in place, using each chunk's texture index, and marks those chunks as current in the state file. It needs no network access, and a per-chunk journal makes it safe to interrupt and rerun.
+Decrypts Lua scripts that older versions wrote still encrypted, then flips PNGs extracted before the orientation fix in place, using each chunk's texture index, and marks those chunks as current in the state file. It needs no network access, and a per-chunk journal makes it safe to interrupt and rerun.
 
 #### Fixing an existing output
 
@@ -249,6 +249,7 @@ backend/
 │       ├── crypto_constants.rs # Encryption keys and constants
 │       ├── fair_guard_utils.rs # FairGuard anti-cheat obfuscation helpers
 │       ├── gamedata.rs         # TextAsset/MonoBehaviour export by container path
+│       ├── lua.rs              # Lua script decryption (base64 + XXTEA)
 │       ├── lz4_inv.rs          # Custom LZ4 decompression
 │       ├── mesh.rs             # Unity Mesh → glTF binary (.glb)
 │       ├── pipeline.rs         # VFS download pipeline (resolve, list, download)
@@ -288,6 +289,7 @@ backend/
 
 - **pipeline** is the shared download pipeline that resolves game config to ZIP central directory to chunk download, used by all extraction commands.
 - **zip_range** handles HTTP range-request based extraction from the game's split ZIP archive (multiple `.zip` parts on CDN).
+- **lua** decrypts the `Lua` group's scripts: each is base64 text wrapping an XXTEA payload whose last word is the plaintext length.
 - **lz4_inv** is a custom LZ4 decompression variant used by some game assets.
 - **fair_guard_utils** provides helpers for handling FairGuard anti-cheat obfuscated data.
 - **utils** contains shared utilities: `format_bytes()`, `hex_dump()`, `sanitize_filename()`.

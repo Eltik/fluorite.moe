@@ -73,3 +73,6 @@ pub const NODES_COUNT_FINAL_XOR: u32 = 0xE4C1D9F2;
 pub const NODE_A_XOR: u32 = 0x8E06A9F8;
 pub const NODE_FLAGS_XOR: u32 = 0xF13927C4;
 pub const NODE_NAME_XOR: u8 = 0x97;
+
+/// XXTEA key for the base64-wrapped scripts in the `Lua` VFS group (an ASCII hex string).
+pub const LUA_XXTEA_KEY: [u8; 16] = *b"d41d8cd98f00b204";

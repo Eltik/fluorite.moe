@@ -13,6 +13,7 @@
 use backend::core::endfield::config::{PatchIndex, resolve_game_config};
 use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
+use backend::extraction::lua;
 use backend::extraction::mesh;
 use backend::extraction::pipeline::{self, ResolvedPipeline, VFS_DIRS};
 use backend::extraction::texture;
@@ -1222,7 +1223,8 @@ fn install_blc_group(
 // repair — fix textures extracted before the orientation fix
 // ═══════════════════════════════════════════════════════════
 
-/// Flip every PNG recorded for chunks still marked `+tex1`, then mark them current.
+/// Decrypt Lua scripts left encrypted by older runs, then flip every PNG recorded for chunks
+/// still marked `+tex1` and mark them current.
 ///
 /// A per-chunk journal (`.index/<chk>.flipped`) records finished files so an interrupted run
 /// resumes without flipping anything twice.
@@ -1231,6 +1233,7 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
         println!("another update is running");
         return Ok(());
     };
+    repair_lua(&output.join("decrypted"))?;
     let mut state = update::load_state(state_path)?;
     let tex_dir = output.join("textures");
     let stale: Vec<String> = state
@@ -1298,6 +1301,36 @@ fn cmd_repair(output: &Path, state_path: &Path) -> Result<(), Box<dyn std::error
     );
     if failed_total > 0 {
         return Err("repair had failures; rerun to retry".into());
+    }
+    Ok(())
+}
+
+/// Decrypt Lua scripts that an older extractor left encrypted, in every Lua group under
+/// `decrypted`.
+fn repair_lua(decrypted: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Ok(groups) = fs::read_dir(decrypted) else {
+        return Ok(());
+    };
+    let mut totals = lua::TreeDecryptResult::default();
+    for group in groups {
+        let group = group?.path();
+        let is_lua = fs::read_to_string(group.join("blc_metadata.txt"))
+            .is_ok_and(|metadata| lua::is_lua_metadata(&metadata));
+        if !is_lua {
+            continue;
+        }
+        let result = lua::decrypt_tree(&group)?;
+        totals.decrypted += result.decrypted;
+        totals.write_errors += result.write_errors;
+    }
+    if totals.decrypted > 0 || totals.write_errors > 0 {
+        println!(
+            "repair: decrypted {} Lua scripts, failed {}",
+            totals.decrypted, totals.write_errors
+        );
+    }
+    if totals.write_errors > 0 {
+        return Err("repair could not write some Lua scripts; rerun to retry".into());
     }
     Ok(())
 }
@@ -1553,6 +1586,7 @@ async fn cmd_decrypt(
 
     let mut total_extracted = 0usize;
     let mut total_sparkbuffer = 0usize;
+    let mut total_lua = 0usize;
 
     for dir_hash in &dirs {
         println!("{}", "=".repeat(60));
@@ -1561,12 +1595,13 @@ async fn cmd_decrypt(
         match blc::extract_directory(client, &resolved, dir_hash, output_path).await {
             Ok(result) => {
                 println!(
-                    "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON",
+                    "  {} ({}): {}/{} files extracted, {} SparkBuffer→JSON, {} Lua decrypted",
                     result.group_name,
                     result.dir_hash,
                     result.extracted,
                     result.total_files,
                     result.sparkbuffer_parsed,
+                    result.lua_decrypted,
                 );
                 if !result.errors.is_empty() {
                     println!("  {} errors:", result.errors.len());
@@ -1579,6 +1614,7 @@ async fn cmd_decrypt(
                 }
                 total_extracted += result.extracted;
                 total_sparkbuffer += result.sparkbuffer_parsed;
+                total_lua += result.lua_decrypted;
             }
             Err(e) => {
                 println!("  Error: {}", e);
@@ -1590,6 +1626,7 @@ async fn cmd_decrypt(
     println!("  Directories: {}", dirs.len());
     println!("  Files extracted: {}", total_extracted);
     println!("  SparkBuffer→JSON: {}", total_sparkbuffer);
+    println!("  Lua decrypted: {}", total_lua);
     println!("  Output: {}", output);
     println!("\n=== Done ===");
     Ok(())
