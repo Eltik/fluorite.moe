@@ -11,7 +11,8 @@
 //!
 //! Discovery keeps small packages (the `*_banks.pck`, ~2 MB) as local copies and only the
 //! header of the 1.6 GB stream packages, all under `<cache>/audio/remote/`. The result is
-//! saved to `<cache>/audio/remote.json` so a restart works before the CDN answers.
+//! saved to `<cache>/audio/remote.json` so a restart works before the CDN answers. Copies
+//! and headers of chunks that are no longer listed are deleted after a complete refresh.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -133,7 +134,9 @@ impl RemoteState {
     }
 }
 
-/// GET `len` bytes of `url` from `start`.
+/// GET `len` bytes of `url` from `start`. A server that ignores the range answers 200 with
+/// the whole chunk (1.6 GB for stream packages): that is only accepted from offset 0, and
+/// the body is read no further than `len` bytes, then the connection is dropped.
 pub async fn fetch_range(
     http: &reqwest::Client,
     url: &str,
@@ -143,7 +146,7 @@ pub async fn fetch_range(
     if len == 0 {
         return Ok(Vec::new());
     }
-    let resp = http
+    let mut resp = http
         .get(url)
         .header(
             reqwest::header::RANGE,
@@ -153,17 +156,66 @@ pub async fn fetch_range(
         .await
         .map_err(|e| format!("{url}: {e}"))?;
     let status = resp.status();
-    if !(status == reqwest::StatusCode::PARTIAL_CONTENT || (status.is_success() && start == 0)) {
+    if !(status == reqwest::StatusCode::PARTIAL_CONTENT
+        || (status == reqwest::StatusCode::OK && start == 0))
+    {
         return Err(format!("{url}: HTTP {status}"));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("{url}: {e}"))?;
-    if (bytes.len() as u64) < len {
-        return Err(format!(
-            "{url}: short read ({} of {len} bytes)",
-            bytes.len()
-        ));
+    let mut buf = Vec::with_capacity(len.min(COPY_LIMIT) as usize);
+    while (buf.len() as u64) < len {
+        match resp.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => break,
+        }
     }
-    Ok(bytes[..len as usize].to_vec())
+    if (buf.len() as u64) < len {
+        return Err(format!("{url}: short read ({} of {len} bytes)", buf.len()));
+    }
+    buf.truncate(len as usize);
+    Ok(buf)
+}
+
+/// A CDN-supplied chunk md5, checked before it goes into a URL or file name.
+pub fn is_md5(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A CDN-supplied directory or package name usable as one URL / file-name component.
+pub fn is_safe_component(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['/', '\\']) && !s.contains("..")
+}
+
+/// Delete the package copies and headers in `dir` that are not named in `keep`. Blocking;
+/// returns how many were removed.
+pub fn prune_cached(dir: &Path, keep: &HashSet<String>) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let cached = name.ends_with(".pck") || name.ends_with(".hdr");
+        if cached
+            && !name.starts_with('.')
+            && !keep.contains(&name)
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// [`write_atomic`] on the blocking pool.
+async fn write_blocking(dest: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || write_atomic(&dest, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+async fn is_file(p: &Path) -> bool {
+    tokio::fs::metadata(p).await.is_ok_and(|m| m.is_file())
 }
 
 /// Fetch and decipher one entry of a remote package.
@@ -205,20 +257,38 @@ async fn discover(state: &SharedState) -> Result<Vec<RemotePack>, String> {
     let patch = fetch_patch_index(http, &main)
         .await
         .map_err(|e| format!("patch index: {e}"))?;
-    let local = local_group_hashes(&state.config.output);
+    let output = state.config.output.clone();
+    let local = tokio::task::spawn_blocking(move || local_group_hashes(&output))
+        .await
+        .map_err(|e| e.to_string())?;
     let dirs: Vec<String> = patch_directories(&patch)
         .into_iter()
         .filter(|d| !local.contains(d))
+        .filter(|d| {
+            let ok = is_safe_component(d);
+            if !ok {
+                tracing::warn!("audio remote: invalid directory {d:?}, skipped");
+            }
+            ok
+        })
         .collect();
 
     let cache = audio_cache(state).join("remote");
-    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&cache)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut packs = Vec::new();
+    // File names still in use; pruning waits for a refresh that saw every catalog.
+    let mut keep = HashSet::new();
+    let mut complete = true;
     for dir in dirs {
         let blc_url = cdn_blc_url(&main, &dir);
         let raw = match http.get(&blc_url).send().await {
             Ok(r) if r.status().is_success() => r.bytes().await.map_err(|e| e.to_string())?,
-            _ => continue,
+            _ => {
+                complete = false;
+                continue;
+            }
         };
         let Ok(blc) = parse_blc(&raw) else {
             continue;
@@ -238,6 +308,14 @@ async fn discover(state: &SharedState) -> Result<Vec<RemotePack>, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            if !is_md5(&f.chunk_md5) || !is_safe_component(&name) {
+                tracing::warn!(
+                    "audio remote: invalid entry {:?} (chunk {:?}), skipped",
+                    f.file_name,
+                    f.chunk_md5
+                );
+                continue;
+            }
             let url = cdn_vfs_url(
                 &main,
                 &format!("{dir}/{}.chk", f.chunk_md5.to_ascii_uppercase()),
@@ -255,22 +333,32 @@ async fn discover(state: &SharedState) -> Result<Vec<RemotePack>, String> {
             };
             if size <= COPY_LIMIT {
                 let dest = cache.join(format!("{tag}.pck"));
-                if !dest.is_file() {
+                if !is_file(&dest).await {
                     let bytes = fetch_range(http, &url, base, size).await?;
-                    write_atomic(&dest, &bytes).map_err(|e| e.to_string())?;
+                    write_blocking(dest.clone(), bytes).await?;
                 }
+                keep.insert(format!("{tag}.pck"));
                 pack.local_copy = Some(dest);
             } else {
                 let dest = cache.join(format!("{tag}.hdr"));
-                if !dest.is_file() {
+                if !is_file(&dest).await {
                     let first = fetch_range(http, &url, base, 8).await?;
                     let len = header_len(&first)?;
                     let head = fetch_range(http, &url, base, len).await?;
-                    write_atomic(&dest, &head).map_err(|e| e.to_string())?;
+                    write_blocking(dest.clone(), head).await?;
                 }
+                keep.insert(format!("{tag}.hdr"));
                 pack.header = Some(dest);
             }
             packs.push(pack);
+        }
+    }
+    if complete {
+        let removed = tokio::task::spawn_blocking(move || prune_cached(&cache, &keep))
+            .await
+            .unwrap_or(0);
+        if removed > 0 {
+            tracing::info!("audio remote: removed {removed} superseded package files");
         }
     }
     Ok(packs)
@@ -290,7 +378,7 @@ pub async fn refresh(state: &SharedState) {
                 groups.join(", ")
             );
             if let Ok(bytes) = serde_json::to_vec_pretty(&packs) {
-                let _ = write_atomic(&audio_cache(state).join("remote.json"), &bytes);
+                let _ = write_blocking(audio_cache(state).join("remote.json"), bytes).await;
             }
             let mut s = remote.status.lock().unwrap_or_else(|e| e.into_inner());
             s.refreshed_at = Some(unix_secs(SystemTime::now()));

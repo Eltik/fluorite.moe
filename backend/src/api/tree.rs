@@ -1,4 +1,8 @@
 //! Directory listings (`GET /api/tree/{root}`) with a small mtime-validated cache.
+//!
+//! A subdirectory's `children` count comes from a bare `read_dir` (no `stat`, no sort)
+//! memoized by directory mtime, so wide trees (`gamedata/monobehaviour`: ~540 folders of
+//! up to thousands of files) neither stat every file nor churn the listing cache.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -9,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::Json;
 use axum::extract::{Path as UrlPath, Query, State};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
@@ -132,6 +137,76 @@ impl ListingCache {
     }
 }
 
+/// Number of entries [`read_listing`] would return for `dir`, from names and `d_type`
+/// alone: nothing is `stat`ed or sorted.
+pub fn count_children(dir: &Path) -> std::io::Result<usize> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let visible = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !is_hidden(name));
+        if visible
+            && entry
+                .file_type()
+                .is_ok_and(|ft| ft.is_dir() || ft.is_file())
+        {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Child counts keyed by directory, valid while the directory's mtime is unchanged.
+/// Cleared wholesale when full; refilling costs one `read_dir` per directory.
+pub struct ChildCounts {
+    capacity: usize,
+    map: Mutex<HashMap<PathBuf, (SystemTime, usize)>>,
+}
+
+impl ChildCounts {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Blocking: one `stat` when cached, plus a [`count_children`] when stale.
+    pub fn get(&self, dir: &Path) -> std::io::Result<usize> {
+        let mtime = std::fs::metadata(dir)?.modified()?;
+        if let Some(&(m, n)) = self.map.lock().unwrap_or_else(|p| p.into_inner()).get(dir)
+            && m == mtime
+        {
+            return Ok(n);
+        }
+        let n = count_children(dir)?;
+        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if map.len() >= self.capacity {
+            map.clear();
+        }
+        map.insert(dir.to_path_buf(), (mtime, n));
+        Ok(n)
+    }
+}
+
+/// Tree-endpoint state: child counts and a cap on concurrent listings (each one is a
+/// blocking task that may read hundreds of directories).
+pub struct TreeState {
+    pub counts: ChildCounts,
+    permits: Arc<Semaphore>,
+}
+
+impl TreeState {
+    pub fn new(concurrency: usize) -> Self {
+        Self {
+            counts: ChildCounts::new(8192),
+            permits: Arc::new(Semaphore::new(concurrency.max(1))),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TreeQuery {
     #[serde(default)]
@@ -174,9 +249,18 @@ pub async fn tree(
     let rel = sanitize(&q.path)?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset;
+    // Held by the blocking task, so a client that disconnects still counts until it ends.
+    let permit = state
+        .tree
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let st = state.clone();
 
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let dir = resolve(&root.dir(&st.config.output), &rel)?;
         if !dir.is_dir() {
             return Err(ApiError::bad_request("not a directory"));
@@ -196,7 +280,7 @@ pub async fn tree(
                     format!("{rel}/{}", e.name)
                 };
                 if e.is_dir {
-                    let children = st.listings.get(&dir.join(&e.name)).map(|l| l.len()).ok();
+                    let children = st.tree.counts.get(&dir.join(&e.name)).ok();
                     TreeEntry {
                         name: e.name.clone(),
                         path,

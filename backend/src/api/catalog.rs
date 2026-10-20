@@ -338,7 +338,7 @@ pub struct Catalog {
     bases: Memo<Kind, Vec<BaseItem>>,
     lists: Memo<(Kind, String, Gender), ResolvedList>,
     markup: Memo<(), Markup>,
-    meshes: Memo<(), MeshIndex>,
+    meshes: std::sync::Mutex<Option<(MeshStamp, Arc<MeshIndex>)>>,
     rig: std::sync::Mutex<Option<(Option<SystemTime>, Arc<RigIndex>)>>,
     pub story: crate::api::story::StoryCache,
 }
@@ -356,7 +356,7 @@ impl Catalog {
             bases: Memo::new(16, Some(Duration::from_secs(300))),
             lists: Memo::new(48, None),
             markup: Memo::new(1, Some(Duration::from_secs(300))),
-            meshes: Memo::new(1, Some(Duration::from_secs(120))),
+            meshes: std::sync::Mutex::new(None),
             rig: std::sync::Mutex::new(None),
             story: crate::api::story::StoryCache::new(),
         }
@@ -367,23 +367,43 @@ pub fn tables_dir(state: &SharedState) -> PathBuf {
     Root::Tables.dir(&state.config.output)
 }
 
-/// Mesh index (rebuilt every couple of minutes) and rigged-model index (by mtime).
+/// When the mesh index was last valid: mtimes of `update-log.jsonl` (every extraction
+/// appends to it) and of the meshes root.
+type MeshStamp = [Option<SystemTime>; 2];
+
+/// Mesh index (rebuilt when [`MeshStamp`] changes) and rigged-model index (by the mtime of
+/// `models/index.json`).
 pub async fn env(state: &SharedState) -> ApiResult<Env> {
     let output = state.config.output.clone();
     let cat = &state.catalog;
-    let meshes = match cat.meshes.get(&(), &[]) {
+    let watched = [
+        state.config.update_log(),
+        Root::Meshes.dir(&output),
+        Root::Models.dir(&output).join("index.json"),
+    ];
+    let [log, meshes_dir, rig_index] =
+        blocking(move || watched.map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
+            .await?;
+    let mesh_stamp = [log, meshes_dir];
+    let cached = cat
+        .meshes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(s, _)| *s == mesh_stamp)
+        .map(|(_, m)| m.clone());
+    let meshes = match cached {
         Some(m) => m,
         None => {
             let dir = Root::Meshes.dir(&output);
             let started = Instant::now();
             let m = Arc::new(blocking(move || MeshIndex::build(&dir)).await?);
             tracing::debug!("mesh index built in {} ms", started.elapsed().as_millis());
-            cat.meshes.put((), Vec::new(), m.clone());
+            *cat.meshes.lock().unwrap_or_else(|e| e.into_inner()) = Some((mesh_stamp, m.clone()));
             m
         }
     };
-    let index = Root::Models.dir(&output).join("index.json");
-    let stamp = blocking(move || std::fs::metadata(&index).and_then(|m| m.modified()).ok()).await?;
+    let stamp = rig_index;
     let cached = cat
         .rig
         .lock()
@@ -493,7 +513,9 @@ async fn base(state: &SharedState, kind: Kind) -> ApiResult<Arc<Vec<BaseItem>>> 
         ($m:ident) => {{
             let t = $m::Tables::load(&cat.tables, &dir).await?;
             let mut deps = t.deps();
+            // `hasModel` reads both indexes.
             deps.push(dep(&env.meshes));
+            deps.push(dep(&env.rig));
             if let Some(b) = cat.bases.get(&kind, &deps) {
                 return Ok(b);
             }

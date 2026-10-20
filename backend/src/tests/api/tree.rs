@@ -1,7 +1,7 @@
 use axum::http::StatusCode;
 
 use super::{Fixture, body_json, get};
-use crate::api::tree::read_listing;
+use crate::api::tree::{ChildCounts, count_children, read_listing};
 
 #[test]
 fn listing_sorts_dirs_first_and_hides() {
@@ -84,4 +84,22 @@ async fn tree_listing_refreshes_when_directory_changes() {
     std::fs::write(fx.output().join("decrypted/Lua/LuaScripts/new.lua"), b"x").unwrap();
     let v = body_json(get(&app, "/api/tree/lua").await).await;
     assert_eq!(v["total"], 2);
+}
+
+#[test]
+fn child_counts_match_listing_and_follow_mtime() {
+    let fx = Fixture::new();
+    let ui = fx.output().join("textures/ui");
+    assert_eq!(
+        count_children(&ui).unwrap(),
+        read_listing(&ui).unwrap().len()
+    );
+    let counts = ChildCounts::new(4);
+    let sub = ui.join("sub");
+    assert_eq!(counts.get(&sub).unwrap(), 1);
+    // Ensure the directory mtime differs even on coarse-timestamp filesystems.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(sub.join("two.png"), b"x").unwrap();
+    std::fs::write(sub.join(".hidden.png"), b"x").unwrap();
+    assert_eq!(counts.get(&sub).unwrap(), 2);
 }

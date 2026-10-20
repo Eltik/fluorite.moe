@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
@@ -25,6 +25,10 @@ use super::paths::{Root, extension, is_hidden};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
+/// Deeper pages are refused: every page re-ranks all matches up to `offset + limit`.
+pub const MAX_OFFSET: usize = 10_000;
+/// Searches running at once; more wait for a permit.
+const MAX_CONCURRENT: usize = 4;
 /// Tokens beyond this are ignored (matches are tracked in a `u32` bitmask).
 const MAX_TOKENS: usize = 16;
 
@@ -386,8 +390,9 @@ impl SearchIndex {
         }
     }
 
-    /// Multi-token AND search; segments are scanned in parallel. Returns
-    /// `(total matches, requested page)`.
+    /// Multi-token AND search, scanning the segments one after another on the calling
+    /// thread. Returns `(total matches, requested page)`. The endpoint uses
+    /// [`SearchIndex::search_parallel`].
     pub fn search(
         &self,
         query: &str,
@@ -401,28 +406,65 @@ impl SearchIndex {
             return (0, Vec::new());
         }
         let q = Prepared::new(tokens);
-        // (tier, path length, segment, entry)
-        let mut matches: Vec<(Tier, u32, u32, u32)> = std::thread::scope(|s| {
-            let handles: Vec<_> = self
-                .segments
-                .iter()
-                .enumerate()
-                .map(|(si, seg)| {
-                    let q = &q;
-                    s.spawn(move || {
-                        seg.scan(q, root, ext)
-                            .into_iter()
-                            .map(|(t, len, i)| (t, len, si as u32, i))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        let matches = (0..self.segments.len())
+            .flat_map(|si| self.scan_segment(si, &q, root, ext))
+            .collect();
+        self.page(matches, offset, limit)
+    }
 
+    /// [`SearchIndex::search`] with one task per segment on Tokio's blocking pool (reused
+    /// threads, no per-request spawning).
+    pub async fn search_parallel(
+        self: Arc<Self>,
+        query: &str,
+        root: Option<Root>,
+        ext: Option<String>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<Hit>), tokio::task::JoinError> {
+        let tokens = tokenize(query);
+        if tokens.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let q = Arc::new(Prepared::new(tokens));
+        let ext = ext.map(Arc::<str>::from);
+        let tasks: Vec<_> = (0..self.segments.len())
+            .map(|si| {
+                let (index, q, ext) = (self.clone(), q.clone(), ext.clone());
+                tokio::task::spawn_blocking(move || {
+                    index.scan_segment(si, &q, root, ext.as_deref())
+                })
+            })
+            .collect();
+        let mut matches = Vec::new();
+        for t in tasks {
+            matches.extend(t.await?);
+        }
+        tokio::task::spawn_blocking(move || self.page(matches, offset, limit)).await
+    }
+
+    /// Matches of one segment as `(tier, path length, segment, entry)`.
+    fn scan_segment(
+        &self,
+        si: usize,
+        q: &Prepared,
+        root: Option<Root>,
+        ext: Option<&str>,
+    ) -> Vec<(Tier, u32, u32, u32)> {
+        self.segments[si]
+            .scan(q, root, ext)
+            .into_iter()
+            .map(|(t, len, i)| (t, len, si as u32, i))
+            .collect()
+    }
+
+    /// Rank `matches` and materialize `offset..offset + limit`.
+    fn page(
+        &self,
+        mut matches: Vec<(Tier, u32, u32, u32)>,
+        offset: usize,
+        limit: usize,
+    ) -> (usize, Vec<Hit>) {
         let total = matches.len();
         let end = offset.saturating_add(limit).min(total);
         if offset >= end {
@@ -450,6 +492,8 @@ impl SearchIndex {
 pub struct IndexHandle {
     current: RwLock<Option<Arc<SearchIndex>>>,
     ready: watch::Sender<bool>,
+    /// Concurrent searches; each one fans out over every core.
+    permits: Arc<Semaphore>,
 }
 
 impl Default for IndexHandle {
@@ -463,6 +507,7 @@ impl IndexHandle {
         Self {
             current: RwLock::new(None),
             ready: watch::channel(false).0,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         }
     }
 
@@ -513,20 +558,37 @@ async fn rebuild(state: &SharedState, reason: &str) {
     }
 }
 
-/// Build the index now, then rebuild whenever `update-log.jsonl` changes (polled).
+/// Build the index now, then rebuild whenever `update-log.jsonl` or `models/index.json`
+/// changes (polled; the model exporter writes the latter without logging an update).
 pub fn spawn_maintenance(state: SharedState) {
     tokio::spawn(async move {
-        let log = state.config.update_log();
-        let mut seen = mtime(&log);
+        let watched = [
+            state.config.update_log(),
+            Root::Models.dir(&state.config.output).join("index.json"),
+        ];
+        let stamp = || {
+            let w = watched.clone();
+            async move {
+                tokio::task::spawn_blocking(move || w.map(|p| mtime(&p)))
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+        let mut seen = stamp().await;
         rebuild(&state, "startup").await;
         let mut tick = tokio::time::interval(state.config.index_poll);
         tick.tick().await;
         loop {
             tick.tick().await;
-            let now = mtime(&log);
+            let now = stamp().await;
             if now != seen {
+                let reason = if now[0] != seen[0] {
+                    "update-log changed"
+                } else {
+                    "models index changed"
+                };
                 seen = now;
-                rebuild(&state, "update-log changed").await;
+                rebuild(&state, reason).await;
             }
         }
     });
@@ -567,13 +629,30 @@ pub async fn search(
         .filter(|e| !e.is_empty())
         .map(|e| e.trim_start_matches('.').to_string());
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    if q.offset > MAX_OFFSET {
+        return Err(ApiError::bad_request(format!(
+            "offset must be at most {MAX_OFFSET}; narrow the query instead"
+        )));
+    }
     let index = state.index.wait().await;
+    let permit = state
+        .index
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Detached so a client that disconnects keeps its permit until the scan ends.
     let query = q.q.clone();
     let offset = q.offset;
-    let (total, items) = tokio::task::spawn_blocking(move || {
-        index.search(&query, root, ext.as_deref(), offset, limit)
+    let (total, items) = tokio::spawn(async move {
+        let _permit = permit;
+        index
+            .search_parallel(&query, root, ext, offset, limit)
+            .await
     })
     .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(SearchResponse {
         query: q.q,

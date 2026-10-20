@@ -2,9 +2,12 @@
 //! Ogg (default, 64 kb/s, source channel layout) or AAC in MP4 (`m4a`, for Safari).
 //!
 //! Results are cached under `<cache>/audio/<pack>/<id>-<key>.<ext>` (the key covers the
-//! entry's offset and size, so an update that changes the media changes the file), written
-//! atomically, produced behind a semaphore, and deduplicated: concurrent requests for the
-//! same file wait on one per-file lock and then serve the finished file.
+//! entry's offset and size and the identity of the package it is read from, so an update
+//! that changes the media changes the file), written atomically, produced behind a
+//! semaphore, and deduplicated: the first request starts a detached task and every
+//! concurrent request for the same file awaits its result, so a client that disconnects
+//! mid-transcode neither aborts the work nor leaks its temp files. [`sweep_clips`] keeps
+//! the cache under `FLUORITE_AUDIO_CACHE_MB`.
 //!
 //! Tools come from `FLUORITE_VGMSTREAM` / `FLUORITE_FFMPEG` or the usual install
 //! locations; when one is missing the endpoint answers 501. Payloads vgmstream cannot
@@ -15,12 +18,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 use super::super::SharedState;
 use super::super::error::{ApiError, ApiResult};
@@ -30,6 +33,8 @@ use crate::extraction::audio::{IndexEntry, PckEntry};
 
 const CLIP_CACHE: &str = "public, max-age=86400";
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Temp files this old are left over from a crash and swept.
+const STALE_TEMP: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -84,9 +89,13 @@ fn find_tool(env: &str, names: &[&str]) -> Option<PathBuf> {
     None
 }
 
+/// Result of a transcode job, `None` until it finishes.
+type Outcome = watch::Receiver<Option<ApiResult<()>>>;
+
 pub struct Transcoder {
     permits: Arc<Semaphore>,
-    inflight: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// Running jobs by destination file.
+    inflight: std::sync::Mutex<HashMap<PathBuf, Outcome>>,
     tools: OnceLock<Tools>,
 }
 
@@ -114,19 +123,48 @@ impl Transcoder {
         })
     }
 
-    fn lock_for(&self, key: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    /// Number of jobs still running.
+    pub fn inflight(&self) -> usize {
         self.inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key.to_path_buf())
-            .or_default()
-            .clone()
+            .len()
     }
+}
 
-    fn release(&self, key: &Path) {
-        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if map.get(key).is_some_and(|l| Arc::strong_count(l) == 1) {
-            map.remove(key);
+/// Removes a job from `inflight` when its task ends, panics included.
+struct InflightEntry {
+    state: SharedState,
+    dest: PathBuf,
+}
+
+impl Drop for InflightEntry {
+    fn drop(&mut self) {
+        self.state
+            .audio
+            .transcoder
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.dest);
+    }
+}
+
+/// Temp files of one transcode, deleted (on the blocking pool when there is a runtime)
+/// when dropped, so errors, timeouts and panics clean up too.
+pub struct TempFiles(pub Vec<PathBuf>);
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.0);
+        let remove = move || {
+            for p in &paths {
+                let _ = std::fs::remove_file(p);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => drop(rt.spawn_blocking(remove)),
+            Err(_) => remove(),
         }
     }
 }
@@ -158,11 +196,41 @@ fn temp_beside(dest: &Path) -> PathBuf {
     ))
 }
 
-/// Cache file of an entry in `format`.
-pub fn cache_path(cache: &Path, pack: &str, entry: &IndexEntry, format: Format) -> PathBuf {
+/// Identity of the package an entry is read from: size and mtime of a local file, the
+/// chunk URL (named by the chunk's md5) and offset of a remote one.
+pub async fn source_stamp(source: &Source) -> u64 {
+    let mut h = Fnv::new();
+    match source {
+        Source::Local(f) => {
+            let mtime = tokio::fs::metadata(&f.path)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            h.add(&f.len.to_le_bytes());
+            h.add(&mtime.to_le_bytes());
+        }
+        Source::Remote { url, base } => {
+            h.add(url.as_bytes());
+            h.add(&base.to_le_bytes());
+        }
+    }
+    h.0
+}
+
+/// Cache file of an entry in `format`; `stamp` is the package's [`source_stamp`].
+pub fn cache_path(
+    cache: &Path,
+    pack: &str,
+    entry: &IndexEntry,
+    stamp: u64,
+    format: Format,
+) -> PathBuf {
     let mut h = Fnv::new();
     h.add(&entry.offset.to_le_bytes());
     h.add(&entry.size.to_le_bytes());
+    h.add(&stamp.to_le_bytes());
     cache
         .join(pack)
         .join(format!("{}-{:08x}.{}", entry.id, h.0 as u32, format.ext()))
@@ -253,11 +321,7 @@ async fn produce(
     let wem = temp_beside(dest).with_extension("wem");
     let wav = temp_beside(dest).with_extension("wav");
     let out = temp_beside(dest).with_extension(format.ext());
-    let cleanup = |paths: &[&Path]| {
-        for p in paths {
-            let _ = std::fs::remove_file(p);
-        }
-    };
+    let _temps = TempFiles(vec![wem.clone(), wav.clone(), out.clone()]);
     let result = async {
         tokio::fs::write(&wem, &data)
             .await
@@ -311,7 +375,6 @@ async fn produce(
             .map_err(|e| ApiError::io(e, "audio cache"))
     }
     .await;
-    cleanup(&[&wem, &wav, &out]);
     if result.is_ok() {
         tracing::info!(
             "transcoded {} ({} bytes {}) to {} in {} ms (read {} ms)",
@@ -326,6 +389,69 @@ async fn produce(
     result
 }
 
+/// Produce `dest` unless it appeared while waiting for a permit.
+async fn job(
+    state: &SharedState,
+    entry: &IndexEntry,
+    source: &Source,
+    format: Format,
+    dest: &Path,
+) -> ApiResult<()> {
+    let t = &state.audio.transcoder;
+    let _permit = t
+        .permits
+        .acquire()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if tokio::fs::metadata(dest).await.is_ok() {
+        return Ok(());
+    }
+    let tools = t.tools().clone();
+    produce(state, entry, source, format, dest, &tools).await
+}
+
+/// Make sure `dest` exists: join the running job for it or start one. The job runs in its
+/// own task, so it finishes (and is cached) even when every waiting client goes away.
+pub async fn ensure(
+    state: &SharedState,
+    entry: &IndexEntry,
+    source: Source,
+    format: Format,
+    dest: &Path,
+) -> ApiResult<()> {
+    let mut outcome = {
+        let mut map = state
+            .audio
+            .transcoder
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match map.get(dest) {
+            Some(rx) => rx.clone(),
+            None => {
+                let (tx, rx) = watch::channel(None);
+                map.insert(dest.to_path_buf(), rx.clone());
+                let entry_guard = InflightEntry {
+                    state: state.clone(),
+                    dest: dest.to_path_buf(),
+                };
+                let entry = entry.clone();
+                tokio::spawn(async move {
+                    let g = entry_guard;
+                    let result = job(&g.state, &entry, &source, format, &g.dest).await;
+                    tx.send_replace(Some(result));
+                });
+                rx
+            }
+        }
+    };
+    let done = outcome
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|_| ApiError::internal("transcode task failed"))?;
+    done.clone().unwrap_or(Ok(()))
+}
+
 /// Serve an entry in `format`, transcoding it first unless cached.
 pub async fn serve(
     state: &SharedState,
@@ -335,28 +461,66 @@ pub async fn serve(
     format: Format,
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
-    let dest = cache_path(&audio_cache(state), pack, entry, format);
+    let stamp = source_stamp(&source).await;
+    let dest = cache_path(&audio_cache(state), pack, entry, stamp, format);
     if tokio::fs::metadata(&dest).await.is_err() {
-        let t = &state.audio.transcoder;
-        let tools = t.tools().clone();
-        let lock = t.lock_for(&dest);
-        let result = async {
-            let _one = lock.lock().await;
-            if tokio::fs::metadata(&dest).await.is_ok() {
-                return Ok(());
-            }
-            let _permit = t
-                .permits
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            produce(state, entry, &source, format, &dest, &tools).await
-        }
-        .await;
-        drop(lock);
-        t.release(&dest);
-        result?;
+        ensure(state, entry, source, format, &dest).await?;
     }
     serve_file(&dest, headers, CLIP_CACHE).await
+}
+
+/// Delete the least recently used clips (later of atime and mtime) in the per-pack folders
+/// of `audio_cache` until they total at most `max_bytes`, plus temp files older than
+/// [`STALE_TEMP`]. `remote/` and the index files are left alone. Blocking; returns
+/// `(files removed, bytes freed)`.
+pub fn sweep_clips(audio_cache: &Path, max_bytes: u64) -> (usize, u64) {
+    let now = SystemTime::now();
+    let mut clips: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total = 0u64;
+    let (mut removed, mut freed) = (0, 0);
+    let Ok(packs) = std::fs::read_dir(audio_cache) else {
+        return (0, 0);
+    };
+    for pack in packs.flatten() {
+        if pack.file_name() == "remote" || !pack.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(pack.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let Ok(meta) = f.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            let used = meta.accessed().map_or(mtime, |a| a.max(mtime));
+            if f.file_name().to_string_lossy().starts_with('.') {
+                // In-progress temp files; only crash leftovers are removed.
+                if now.duration_since(mtime).is_ok_and(|age| age > STALE_TEMP)
+                    && std::fs::remove_file(f.path()).is_ok()
+                {
+                    removed += 1;
+                    freed += meta.len();
+                }
+                continue;
+            }
+            total += meta.len();
+            clips.push((used, meta.len(), f.path()));
+        }
+    }
+    if total > max_bytes {
+        clips.sort_unstable();
+        for (_, len, path) in clips {
+            if total <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= len;
+                removed += 1;
+                freed += len;
+            }
+        }
+    }
+    (removed, freed)
 }

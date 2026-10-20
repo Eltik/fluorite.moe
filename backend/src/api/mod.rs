@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::{HeaderName, HeaderValue, Method, header};
+use axum::extract::Request;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{DefaultPredicate, Predicate};
@@ -39,6 +42,7 @@ pub struct AppState {
     pub config: Config,
     pub index: search::IndexHandle,
     pub listings: tree::ListingCache,
+    pub tree: tree::TreeState,
     pub i18n: i18n::I18nCache,
     pub thumbs: thumbs::ThumbLimiter,
     pub catalog: catalog::Catalog,
@@ -55,6 +59,7 @@ impl AppState {
             config,
             index: search::IndexHandle::new(),
             listings: tree::ListingCache::new(512, Duration::from_secs(30)),
+            tree: tree::TreeState::new(threads.min(8)),
             // Requested language plus the EN/CN fallbacks stay resident together.
             i18n: i18n::I18nCache::new(5),
             thumbs: thumbs::ThumbLimiter::new(threads),
@@ -62,6 +67,33 @@ impl AppState {
             audio: audio::AudioState::new(),
         })
     }
+}
+
+/// Compressed bodies are not byte-identical to the file a strong ETag was derived from
+/// (`/api/tables/{name}` goes through [`files::serve_file`]), so their validator is made
+/// weak. Conditional GETs still match (If-None-Match compares weakly), If-Range does not
+/// (it needs a strong match, and compressed responses are never partial anyway). A 304
+/// echoes the weak form when that is what the client holds.
+async fn weaken_compressed_etag(req: Request, next: Next) -> Response {
+    let holds_weak = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().starts_with("W/"));
+    let mut res = next.run(req).await;
+    let weaken = res.headers().contains_key(header::CONTENT_ENCODING)
+        || (res.status() == StatusCode::NOT_MODIFIED && holds_weak);
+    if weaken
+        && let Some(tag) = res
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+        && !tag.starts_with("W/")
+        && let Ok(weak) = HeaderValue::from_str(&format!("W/{tag}"))
+    {
+        res.headers_mut().insert(header::ETAG, weak);
+    }
+    res
 }
 
 /// The full application router (API + file/thumbnail serving) with middleware.
@@ -72,11 +104,11 @@ pub fn router(state: SharedState) -> Router {
             .gzip(true)
             .br(true)
             .compress_when(DefaultPredicate::new().and(
-                |status: axum::http::StatusCode,
+                |status: StatusCode,
                  _: axum::http::Version,
                  headers: &axum::http::HeaderMap,
                  _: &axum::http::Extensions| {
-                    status != axum::http::StatusCode::PARTIAL_CONTENT
+                    status != StatusCode::PARTIAL_CONTENT
                         && !headers.contains_key(header::CONTENT_RANGE)
                 },
             ));
@@ -97,12 +129,19 @@ pub fn router(state: SharedState) -> Router {
         .route("/audio", get(audio::summary))
         .route("/audio/entries", get(audio::entries))
         .route("/voice/{char_id}", get(audio::voice))
-        .layer(compress);
+        .layer(compress)
+        .layer(middleware::from_fn(weaken_compressed_etag));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::HEAD, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::RANGE, header::IF_NONE_MATCH])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::RANGE,
+            header::IF_NONE_MATCH,
+            header::IF_RANGE,
+            header::IF_MODIFIED_SINCE,
+        ])
         .expose_headers([
             header::CONTENT_RANGE,
             header::ACCEPT_RANGES,

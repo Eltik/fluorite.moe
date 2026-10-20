@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
 use super::files::serve_file;
-use super::paths::{Root, extension, resolve, sanitize};
+use super::paths::{Root, extension, resolve_async, sanitize};
 
 pub const SIZES: [u32; 3] = [128, 256, 512];
 const DEFAULT_SIZE: u32 = 256;
@@ -159,7 +159,7 @@ pub async fn thumb(
             "thumbnails are only available for PNG textures",
         ));
     }
-    let src = resolve(&Root::Textures.dir(&state.config.output), &rel)?;
+    let src = resolve_async(Root::Textures.dir(&state.config.output), rel.clone()).await?;
     let meta = tokio::fs::metadata(&src)
         .await
         .map_err(|e| ApiError::io(e, "texture"))?;

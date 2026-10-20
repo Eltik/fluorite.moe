@@ -535,12 +535,33 @@ fn build(state: &SharedState, plan: Plan) -> ApiResult<Loaded> {
     })
 }
 
-/// Discover remote packages (unless disabled) and warm the index, in the background.
+/// How often the clip cache is swept down to `FLUORITE_AUDIO_CACHE_MB`.
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
+
+/// Discover remote packages (unless disabled), warm the index, and keep the clip cache
+/// under its cap, in the background.
 pub fn spawn_maintenance(state: SharedState) {
+    let s = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SWEEP_EVERY);
+        loop {
+            tick.tick().await;
+            let (dir, max) = (audio_cache(&s), s.config.audio_cache_max);
+            match tokio::task::spawn_blocking(move || transcode::sweep_clips(&dir, max)).await {
+                Ok((0, _)) => {}
+                Ok((n, bytes)) => tracing::info!(
+                    "audio cache: swept {n} clips ({:.1} MiB)",
+                    bytes as f64 / (1024.0 * 1024.0)
+                ),
+                Err(e) => tracing::warn!("audio cache sweep: {e}"),
+            }
+        }
+    });
     tokio::spawn(async move {
         // Serve from the last known remote list right away; the CDN check takes a while.
         if state.config.audio_remote {
-            state.audio.remote.load_saved(&audio_cache(&state));
+            let s = state.clone();
+            let _ = blocking(move || s.audio.remote.load_saved(&audio_cache(&s))).await;
         }
         if let Err(e) = loaded(&state).await {
             tracing::warn!("audio index: {}", e.message);

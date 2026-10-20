@@ -15,6 +15,7 @@ use std::time::Duration;
 /// | `FLUORITE_INDEX_POLL_SECS` | `60` |
 /// | `FLUORITE_AUDIO_REMOTE` | `1` (read voice packages from the game CDN; `0` disables) |
 /// | `FLUORITE_AUDIO_DIRS` | extra directories of `.pck` files (path-list separated) |
+/// | `FLUORITE_AUDIO_CACHE_MB` | `5120` (transcoded clips beyond this are swept, oldest first) |
 #[derive(Debug, Clone)]
 pub struct Config {
     pub addr: SocketAddr,
@@ -24,6 +25,8 @@ pub struct Config {
     pub index_poll: Duration,
     pub audio_remote: bool,
     pub audio_dirs: Vec<PathBuf>,
+    /// Size cap of the transcoded clip cache, in bytes.
+    pub audio_cache_max: u64,
 }
 
 impl Config {
@@ -37,6 +40,7 @@ impl Config {
             index_poll: Duration::from_secs(60),
             audio_remote: true,
             audio_dirs: Vec::new(),
+            audio_cache_max: 5 << 30,
             output,
         }
     }
@@ -78,6 +82,12 @@ impl Config {
         }
         if let Some(v) = var("FLUORITE_AUDIO_DIRS") {
             config.audio_dirs = std::env::split_paths(&v).collect();
+        }
+        if let Some(v) = var("FLUORITE_AUDIO_CACHE_MB") {
+            let mb: u64 = v
+                .parse()
+                .map_err(|e| format!("FLUORITE_AUDIO_CACHE_MB={v:?}: {e}"))?;
+            config.audio_cache_max = mb.saturating_mul(1 << 20);
         }
         Ok(config)
     }

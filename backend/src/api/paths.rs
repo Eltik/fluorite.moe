@@ -129,6 +129,13 @@ pub fn resolve(root_dir: &Path, rel: &str) -> ApiResult<PathBuf> {
     Ok(real)
 }
 
+/// [`resolve`] on the blocking pool (canonicalizing stats every path component).
+pub async fn resolve_async(root_dir: PathBuf, rel: String) -> ApiResult<PathBuf> {
+    tokio::task::spawn_blocking(move || resolve(&root_dir, &rel))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
 /// Extension of a file name as written (`""` when none); compare case-insensitively.
 pub fn extension(name: &str) -> &str {
     match name.rfind('.') {

@@ -2,7 +2,7 @@ use axum::http::StatusCode;
 
 use super::{Fixture, body_json, get};
 use crate::api::paths::Root;
-use crate::api::search::{SearchIndex, tokenize};
+use crate::api::search::{MAX_OFFSET, SearchIndex, tokenize};
 
 #[test]
 fn tokenize_lowercases_and_splits() {
@@ -128,4 +128,59 @@ async fn index_rebuilds_when_update_log_changes() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("index was not rebuilt after update-log.jsonl changed");
+}
+
+#[tokio::test]
+async fn parallel_search_matches_sequential() {
+    let fx = Fixture::new();
+    let index = std::sync::Arc::new(SearchIndex::build(&fx.output()));
+    for (q, root, ext) in [
+        ("png", None, None),
+        ("pelica", Some(Root::Meshes), None),
+        ("ui/pel", None, Some("png")),
+        ("nothing at all", None, None),
+    ] {
+        let seq = index.search(q, root, ext, 1, 3);
+        let par = index
+            .clone()
+            .search_parallel(q, root, ext.map(String::from), 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(seq, par, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn search_offset_is_capped() {
+    let fx = Fixture::new();
+    let app = fx.app();
+    let ok = format!("/api/search?q=png&offset={MAX_OFFSET}");
+    assert_eq!(get(&app, &ok).await.status(), StatusCode::OK);
+    let deep = format!("/api/search?q=png&offset={}", MAX_OFFSET + 1);
+    let res = get(&app, &deep).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(res).await["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn index_rebuilds_when_models_index_changes() {
+    let fx = Fixture::new();
+    let mut config = fx.config();
+    config.index_poll = std::time::Duration::from_millis(50);
+    let state = crate::api::AppState::new(config);
+    crate::api::search::spawn_maintenance(state.clone());
+    assert_eq!(state.index.wait().await.count(Root::Models), 0);
+
+    let models = fx.output().join("models");
+    std::fs::create_dir_all(models.join("operators")).unwrap();
+    std::fs::write(models.join("operators/chr_0004_pelica.glb"), b"glTF").unwrap();
+    std::fs::write(models.join("index.json"), b"{}").unwrap();
+
+    for _ in 0..100 {
+        if state.index.get().unwrap().count(Root::Models) == 2 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("index was not rebuilt after models/index.json changed");
 }

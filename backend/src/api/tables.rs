@@ -9,7 +9,7 @@ use serde::Serialize;
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
 use super::files::{DEFAULT_CACHE, serve_file};
-use super::paths::{Root, resolve, sanitize};
+use super::paths::{Root, resolve, resolve_async, sanitize};
 
 #[derive(Debug, Serialize)]
 pub struct TableInfo {
@@ -62,7 +62,8 @@ pub async fn table(
     } else {
         format!("{name}.json")
     };
-    let abs = resolve(&Root::Tables.dir(&state.config.output), &file)
+    let abs = resolve_async(Root::Tables.dir(&state.config.output), file.clone())
+        .await
         .map_err(|_| ApiError::not_found(format!("table {file:?} not found")))?;
     serve_file(&abs, &headers, DEFAULT_CACHE).await
 }

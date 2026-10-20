@@ -219,3 +219,66 @@ async fn status_and_catalog_without_tables() {
     let res = get(&app, "/api/nope").await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn compressed_tables_carry_a_weak_etag() {
+    let fx = Fixture::new();
+    let rows: Vec<String> = (0..500).map(|i| i.to_string()).collect();
+    std::fs::write(
+        fx.output().join("decrypted/Table/TableCfg/Big.json"),
+        format!("{{\"rows\":[{}]}}", rows.join(",")),
+    )
+    .unwrap();
+    let app = fx.app();
+    let req = |enc: Option<&str>, inm: Option<&str>| {
+        let mut r = Request::get("/api/tables/Big");
+        if let Some(e) = enc {
+            r = r.header(header::ACCEPT_ENCODING, e);
+        }
+        if let Some(t) = inm {
+            r = r.header(header::IF_NONE_MATCH, t);
+        }
+        r.body(Body::empty()).unwrap()
+    };
+
+    let plain = send(&app, req(None, None)).await;
+    assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+    let strong = plain.headers()[header::ETAG].to_str().unwrap().to_string();
+    assert!(!strong.starts_with("W/"));
+
+    let gz = send(&app, req(Some("gzip"), None)).await;
+    assert_eq!(gz.headers()[header::CONTENT_ENCODING], "gzip");
+    let weak = gz.headers()[header::ETAG].to_str().unwrap().to_string();
+    assert_eq!(weak, format!("W/{strong}"));
+
+    // Revalidation works with either form and echoes the one the client holds.
+    let res = send(&app, req(Some("gzip"), Some(&weak))).await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(res.headers()[header::ETAG], weak.as_str());
+    let res = send(&app, req(None, Some(&strong))).await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(res.headers()[header::ETAG], strong.as_str());
+}
+
+#[tokio::test]
+async fn cors_allows_conditional_headers() {
+    let fx = Fixture::new();
+    let app = fx.app();
+    let req = Request::options("/files/meshes/chars/pelica.glb")
+        .header(header::ORIGIN, "https://example.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "range,if-range,if-modified-since",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let res = send(&app, req).await;
+    let allowed = res.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    for h in ["range", "if-range", "if-modified-since", "if-none-match"] {
+        assert!(allowed.contains(h), "{h} missing from {allowed}");
+    }
+}

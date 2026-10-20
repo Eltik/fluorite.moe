@@ -2,11 +2,21 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde_json::json;
 
+use std::collections::HashSet;
+use std::fs::FileTimes;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
 use super::catalog::catalog_fixture;
 use super::{Fixture, body_bytes, body_json, get, send};
-use crate::api::audio::transcode::Transcoder;
-use crate::api::audio::{lang_code, lang_name};
-use crate::extraction::audio::{EntryKind, PackageFile, build_package, dialog_key, external_id};
+use crate::api::audio::remote::{fetch_range, is_md5, is_safe_component, prune_cached};
+use crate::api::audio::transcode::{
+    Format, TempFiles, Transcoder, cache_path, source_stamp, sweep_clips,
+};
+use crate::api::audio::{Source, lang_code, lang_name, loaded};
+use crate::extraction::audio::{
+    EntryKind, PackageFile, PckFile, build_package, dialog_key, external_id,
+};
 use crate::tests::extraction::audio::{bank_bytes, pcm_wav};
 
 const CHEN_PATH: &str = "v1d0/Characters/chr_0005_chen/chr_0005_chen_chrbark_squad_01.wem";
@@ -280,4 +290,224 @@ async fn clips_transcode_and_cache() {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()[header::CONTENT_TYPE], "audio/mp4");
     }
+}
+
+#[test]
+fn temp_files_are_removed_on_drop() {
+    let dir = std::env::temp_dir().join(format!("fluorite-temps-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join(".a.wem"), dir.join(".a.wav"));
+    std::fs::write(&a, b"x").unwrap();
+    std::fs::write(&b, b"x").unwrap();
+    drop(TempFiles(vec![
+        a.clone(),
+        b.clone(),
+        dir.join("never-created.ogg"),
+    ]));
+    assert!(!a.exists() && !b.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clip_sweep_drops_least_recently_used_first() {
+    let fx = Fixture::new();
+    let cache = fx.dir.join("cache/audio");
+    let now = SystemTime::now();
+    let put = |rel: &str, len: usize, age_secs: u64| {
+        let p = cache.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, vec![0u8; len]).unwrap();
+        let t = now - Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_times(FileTimes::new().set_accessed(t).set_modified(t))
+            .unwrap();
+        p
+    };
+    let oldest = put("pack_a/1-00000000.ogg", 100, 300);
+    let middle = put("pack_b/2-00000000.ogg", 100, 200);
+    let newest = put("pack_a/3-00000000.ogg", 100, 100);
+    let stale_temp = put("pack_a/.4.ogg.1.2.wav", 10, 7200);
+    let fresh_temp = put("pack_a/.5.ogg.1.3.wav", 10, 1);
+    let remote = put("remote/default_english_stream_0-abc.hdr", 1000, 9000);
+    let index = put("index-0123.json", 1000, 9000);
+
+    // Under the cap: only the crash leftover goes.
+    assert_eq!(sweep_clips(&cache, 1000), (1, 10));
+    assert!(!stale_temp.exists() && fresh_temp.exists());
+
+    assert_eq!(sweep_clips(&cache, 250), (1, 100));
+    assert!(!oldest.exists() && middle.exists() && newest.exists());
+    assert_eq!(sweep_clips(&cache, 0), (2, 200));
+    assert!(fresh_temp.exists() && remote.exists() && index.exists());
+}
+
+#[tokio::test]
+async fn clip_cache_key_tracks_the_package() {
+    let fx = audio_fixture();
+    let pck = fx
+        .output()
+        .join("decrypted/InitAudio/Audio/PCK/Windows/Initial/test_stream.pck");
+    let source = Source::Local(Arc::new(PckFile::open(&pck).unwrap()));
+    let before = source_stamp(&source).await;
+    std::fs::File::options()
+        .append(true)
+        .open(&pck)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    let after = source_stamp(&source).await;
+    assert_ne!(before, after);
+
+    let remote = |url: &str| Source::Remote {
+        url: url.into(),
+        base: 0,
+    };
+    assert_ne!(
+        source_stamp(&remote("https://cdn/VFS/X/AAAA.chk")).await,
+        source_stamp(&remote("https://cdn/VFS/X/BBBB.chk")).await
+    );
+
+    let l = loaded(&fx_state(&fx)).await.unwrap();
+    let (_, entry) = l.entry("test_stream", 1001).unwrap();
+    let cache = fx.dir.join("cache/audio");
+    assert_ne!(
+        cache_path(&cache, "test_stream", entry, before, Format::Ogg),
+        cache_path(&cache, "test_stream", entry, after, Format::Ogg)
+    );
+}
+
+fn fx_state(fx: &Fixture) -> crate::api::SharedState {
+    crate::api::AppState::new(fx.config())
+}
+
+#[tokio::test]
+async fn abandoned_clip_request_still_finishes() {
+    let fx = audio_fixture();
+    let state = fx_state(&fx);
+    let app = crate::api::router(state.clone());
+    // Hang up as soon as the transcode has started; the job keeps running in its own task.
+    let started = async {
+        while state.audio.transcoder.inflight() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        _ = get(&app, "/audio/test_stream/1001.wav") => {
+            // Answered before the job was seen (tools missing, or too fast to observe).
+            return;
+        }
+        () = started => {}
+    }
+    let dir = fx.dir.join("cache/audio/test_stream");
+    for _ in 0..500 {
+        if state.audio.transcoder.inflight() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(state.audio.transcoder.inflight(), 0);
+    // Temp files go on the blocking pool; give it a moment.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(names.iter().all(|n| !n.starts_with('.')), "{names:?}");
+    if Transcoder::new().tools().vgmstream.is_some() {
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].ends_with(".wav"));
+    }
+}
+
+#[test]
+fn remote_names_are_validated() {
+    assert!(is_md5("0123456789abcdefABCDEF0123456789"));
+    assert!(!is_md5("0123456789abcdef0123456789abcde"));
+    assert!(!is_md5("../3456789abcdef0123456789abcdef"));
+    assert!(!is_md5("g123456789abcdef0123456789abcdef"));
+    assert!(is_safe_component("default_english_stream_0"));
+    assert!(is_safe_component("8F3B2C"));
+    for bad in ["", "a/b", "a\\b", "..", "x..y"] {
+        assert!(!is_safe_component(bad), "{bad:?}");
+    }
+}
+
+#[test]
+fn superseded_remote_files_are_pruned() {
+    let fx = Fixture::new();
+    let dir = fx.dir.join("cache/audio/remote");
+    std::fs::create_dir_all(&dir).unwrap();
+    for n in [
+        "banks-aaaa.pck",
+        "banks-bbbb.pck",
+        "stream_0-cccc.hdr",
+        "stream_0-dddd.hdr",
+        ".banks-eeee.pck.1.2.tmp",
+        "notes.txt",
+    ] {
+        std::fs::write(dir.join(n), b"x").unwrap();
+    }
+    let keep: HashSet<String> = ["banks-bbbb.pck", "stream_0-dddd.hdr"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(prune_cached(&dir, &keep), 2);
+    let mut left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            ".banks-eeee.pck.1.2.tmp",
+            "banks-bbbb.pck",
+            "notes.txt",
+            "stream_0-dddd.hdr"
+        ]
+    );
+}
+
+/// One connection answering 200 with a body far longer than any range asked for.
+async fn ignores_ranges(body_len: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/chunk", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n");
+                let _ = socket.write_all(head.as_bytes()).await;
+                let block = vec![7u8; 64 * 1024];
+                let mut sent = 0;
+                while sent < body_len {
+                    let n = block.len().min(body_len - sent);
+                    if socket.write_all(&block[..n]).await.is_err() {
+                        return;
+                    }
+                    sent += n;
+                }
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn fetch_range_bounds_a_200_response() {
+    let url = ignores_ranges(64 << 20).await;
+    let http = reqwest::Client::new();
+    let bytes = fetch_range(&http, &url, 0, 10).await.unwrap();
+    assert_eq!(bytes, vec![7u8; 10]);
+    // A whole-body answer to a range that does not start at 0 is unusable.
+    assert!(fetch_range(&http, &url, 5, 10).await.is_err());
 }

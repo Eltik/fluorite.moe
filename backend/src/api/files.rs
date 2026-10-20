@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
-use super::paths::{Root, extension, resolve, sanitize};
+use super::paths::{Root, extension, resolve_async, sanitize};
 
 pub const DEFAULT_CACHE: &str = "public, max-age=3600";
 const STREAM_CHUNK: usize = 64 * 1024;
@@ -29,7 +29,7 @@ pub async fn file(
     if rel.is_empty() {
         return Err(ApiError::bad_request("missing file path"));
     }
-    let abs = resolve(&root.dir(&state.config.output), &rel)?;
+    let abs = resolve_async(root.dir(&state.config.output), rel).await?;
     serve_file(&abs, &headers, DEFAULT_CACHE).await
 }
 
