@@ -4,6 +4,7 @@ mod lz4_inv;
 mod sparkbuffer;
 mod unity_extract;
 mod unityfs_header;
+mod update;
 mod utils;
 mod vfs_aes;
 mod vfs_decrypt;

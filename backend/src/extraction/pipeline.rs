@@ -8,6 +8,7 @@ use crate::core::endfield::{
 use crate::core::hypergryph::launcher::Platform;
 use crate::extraction::zip_range::{SplitArchivePart, ZipCentralDirectory};
 use reqwest::Client;
+use std::sync::Arc;
 
 /// Known VFS directories.
 pub const VFS_DIRS: &[(&str, &str)] = &[("7064D8E2", "bundles/configs"), ("0CE8FA57", "textures")];
@@ -27,7 +28,8 @@ pub fn default_resolve_params() -> ResolveParams<'static> {
 /// Resolved game configuration with ZIP central directory ready for extraction.
 pub struct ResolvedPipeline {
     pub config: EndfieldGameConfig,
-    pub cd: ZipCentralDirectory,
+    /// Shared so concurrent download tasks can hold it across `tokio::spawn`.
+    pub cd: Arc<ZipCentralDirectory>,
     pub patch_index: Option<PatchIndex>,
 }
 
@@ -39,6 +41,15 @@ pub async fn resolve_pipeline(
     let params = default_resolve_params();
     let config = resolve_game_config(client, &params).await?;
 
+    resolve_pipeline_from_config(client, config, fetch_patch).await
+}
+
+/// Resolve ZIP and optional patch index from an already fetched game configuration.
+pub async fn resolve_pipeline_from_config(
+    client: &Client,
+    config: EndfieldGameConfig,
+    fetch_patch: bool,
+) -> Result<ResolvedPipeline, Box<dyn std::error::Error>> {
     let parts: Vec<SplitArchivePart> = config
         .packs
         .iter()
@@ -61,7 +72,7 @@ pub async fn resolve_pipeline(
 
     Ok(ResolvedPipeline {
         config,
-        cd,
+        cd: Arc::new(cd),
         patch_index,
     })
 }

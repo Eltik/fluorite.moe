@@ -8,6 +8,7 @@ pub mod sparkbuffer;
 pub mod texture;
 pub mod unity_extract;
 pub mod unityfs_header;
+pub mod update;
 pub mod utils;
 pub mod vfs_aes;
 pub mod vfs_decrypt;

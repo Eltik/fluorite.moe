@@ -14,11 +14,18 @@ use backend::extraction::texture;
 use backend::extraction::unity_extract::{
     ChkContents, class_name, extract_chk_contents, get_script_type_name, parse_text_asset,
 };
+use backend::extraction::update;
 use backend::extraction::utils::{format_bytes, hex_dump, sanitize_filename};
 use backend::extraction::vfs_decrypt;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
+use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 use unity_asset_binary::asset::SerializedFileParser;
 use unity_asset_binary::object::ObjectHandle;
 
@@ -77,6 +84,27 @@ enum Commands {
         #[arg(long, default_value = "./output/decrypted")]
         output: String,
     },
+    /// Incrementally extract assets and decrypted data changed upstream
+    Update {
+        /// Output directory
+        #[arg(long, default_value = "./output")]
+        output: String,
+        /// Persistent update state file
+        #[arg(long, default_value = "./data/update-state.json")]
+        state: String,
+        /// Re-process all entries
+        #[arg(long)]
+        force: bool,
+        /// Check for an update without downloading or changing state
+        #[arg(long)]
+        check: bool,
+        /// Do not extract Texture2D PNGs
+        #[arg(long)]
+        no_textures: bool,
+        /// Emit `@progress` lines for scripts/auto-update.sh to render
+        #[arg(long)]
+        progress: bool,
+    },
     /// List all VFS directories and files in the CDN archive
     List,
     /// Scan for asset names/paths
@@ -131,6 +159,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output,
         } => cmd_extract_file(&client, &chk_name, dir, &output).await,
         Commands::Decrypt { dir, output } => cmd_decrypt(&client, dir, &output).await,
+        Commands::Update {
+            output,
+            state,
+            force,
+            check,
+            no_textures,
+            progress,
+        } => {
+            cmd_update(
+                &client,
+                Path::new(&output),
+                Path::new(&state),
+                force,
+                check,
+                no_textures,
+                progress,
+            )
+            .await
+        }
         Commands::List => cmd_list(&client).await,
         Commands::Scan { scan_all } => cmd_scan(&client, scan_all).await,
         Commands::Survey { scan_all } => cmd_survey(&client, scan_all).await,
@@ -232,16 +279,7 @@ async fn cmd_extract(
         std::fs::create_dir_all(&tex_dir)?;
     }
 
-    let mut total_text_assets = 0u64;
-    let mut total_json = 0u64;
-    let mut total_text = 0u64;
-    let mut total_bin = 0u64;
-    let mut total_mono = 0u64;
-    let mut total_tex_extracted = 0u64;
-    let mut total_tex_failed = 0u64;
-    let mut mono_type_counts: HashMap<String, u64> = HashMap::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut seen_mono: HashSet<String> = HashSet::new();
+    let mut stats = ExtractStats::default();
 
     for (dir, desc) in &dirs {
         println!("--- {} ({}) ---", dir, desc);
@@ -272,113 +310,15 @@ async fn cmd_extract(
                 }
             };
 
-            let Some(chk) = extract_chk_contents(&data) else {
-                println!("    Not a valid VFS container, skipping");
-                continue;
+            let options = ChkExtractOptions {
+                do_json,
+                do_tex,
+                do_gamedata,
+                gamedata_dir: &gamedata_dir,
+                mono_dir: &mono_dir,
+                tex_dir: &tex_dir,
             };
-
-            println!(
-                "    {} SerializedFile(s), {} .resS stream(s)",
-                chk.sf_data.len(),
-                chk.resources.len()
-            );
-
-            // JSON/TextAsset extraction
-            if do_json {
-                for sf_bytes in &chk.sf_data {
-                    let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
-                        Ok(sf) => sf,
-                        Err(_) => continue,
-                    };
-                    for obj in sf.objects_of_type(49) {
-                        if let Ok(bytes) = sf.object_bytes(obj)
-                            && let Some((ta_name, content)) = parse_text_asset(bytes)
-                        {
-                            if !seen_names.insert(ta_name.clone()) {
-                                continue;
-                            }
-                            total_text_assets += 1;
-                            if let Some(file_type) =
-                                save_text_asset(&gamedata_dir, &ta_name, &content)
-                            {
-                                match file_type {
-                                    "JSON" => total_json += 1,
-                                    "TEXT" => total_text += 1,
-                                    "BIN" => total_bin += 1,
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // MonoBehaviour extraction
-            if do_gamedata {
-                for sf_bytes in &chk.sf_data {
-                    let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
-                        Ok(sf) => sf,
-                        Err(_) => continue,
-                    };
-                    if !sf.enable_type_tree {
-                        continue;
-                    }
-                    for obj in sf.objects_of_type(114) {
-                        let type_name = get_script_type_name(&sf, obj);
-                        let handle = ObjectHandle::new(&sf, obj);
-
-                        let obj_name = handle
-                            .peek_name()
-                            .ok()
-                            .flatten()
-                            .filter(|n| !n.is_empty())
-                            .map_or_else(
-                                || format!("obj_{}", obj.path_id),
-                                |n| sanitize_filename(&n),
-                            );
-
-                        let unity_obj = match handle.read() {
-                            Ok(o) => o,
-                            Err(_) => continue,
-                        };
-
-                        let props = unity_obj.class.properties();
-                        let json_str = match serde_json::to_string_pretty(props) {
-                            Ok(j) => j,
-                            Err(_) => continue,
-                        };
-
-                        let safe_type = sanitize_filename(&type_name);
-                        let key = format!("{}/{}", safe_type, obj_name);
-                        if !seen_mono.insert(key) {
-                            continue;
-                        }
-
-                        let type_dir = format!("{}/{}", mono_dir, safe_type);
-                        let _ = std::fs::create_dir_all(&type_dir);
-                        let path = format!("{}/{}.json", type_dir, obj_name);
-                        if std::fs::write(&path, &json_str).is_ok() {
-                            total_mono += 1;
-                            *mono_type_counts.entry(safe_type).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-
-            // Texture extraction
-            if do_tex {
-                let tex_path = std::path::Path::new(&tex_dir);
-                for sf_bytes in &chk.sf_data {
-                    let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
-                        Ok(sf) => sf,
-                        Err(_) => continue,
-                    };
-                    let (ext, fail, _, _) =
-                        texture::extract_textures(&sf, &chk.resources, tex_path);
-                    total_tex_extracted += ext;
-                    total_tex_failed += fail;
-                }
-            }
+            process_chk_contents(&data, &options, &mut stats);
         }
         println!();
     }
@@ -387,13 +327,13 @@ async fn cmd_extract(
     if do_json {
         println!(
             "  TextAssets: {} (JSON: {}, Text: {}, Bin: {})",
-            total_text_assets, total_json, total_text, total_bin
+            stats.total_text_assets, stats.total_json, stats.total_text, stats.total_bin
         );
     }
     if do_gamedata {
-        println!("  MonoBehaviours: {}", total_mono);
-        if !mono_type_counts.is_empty() {
-            let mut types: Vec<_> = mono_type_counts.iter().collect();
+        println!("  MonoBehaviours: {}", stats.total_mono);
+        if !stats.mono_type_counts.is_empty() {
+            let mut types: Vec<_> = stats.mono_type_counts.iter().collect();
             types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
             for (type_name, count) in types.iter().take(20) {
                 println!("    {}: {}", type_name, count);
@@ -403,12 +343,133 @@ async fn cmd_extract(
     if do_tex {
         println!(
             "  Textures extracted: {}, failed: {}",
-            total_tex_extracted, total_tex_failed
+            stats.total_tex_extracted, stats.total_tex_failed
         );
     }
     println!("  Output: {}", output);
     println!("\n=== Done ===");
     Ok(())
+}
+
+#[derive(Default)]
+struct ExtractStats {
+    total_text_assets: u64,
+    total_json: u64,
+    total_text: u64,
+    total_bin: u64,
+    total_mono: u64,
+    total_tex_extracted: u64,
+    total_tex_failed: u64,
+    mono_type_counts: HashMap<String, u64>,
+    seen_names: HashSet<String>,
+    seen_mono: HashSet<String>,
+}
+
+struct ChkExtractOptions<'a> {
+    do_json: bool,
+    do_tex: bool,
+    do_gamedata: bool,
+    gamedata_dir: &'a str,
+    mono_dir: &'a str,
+    tex_dir: &'a str,
+}
+
+/// Process one downloaded `.chk`. A valid container is successful even if individual objects fail.
+fn process_chk_contents(
+    data: &[u8],
+    options: &ChkExtractOptions<'_>,
+    stats: &mut ExtractStats,
+) -> bool {
+    let Some(chk) = extract_chk_contents(data) else {
+        println!("    Not a valid VFS container, skipping");
+        return false;
+    };
+    println!(
+        "    {} SerializedFile(s), {} .resS stream(s)",
+        chk.sf_data.len(),
+        chk.resources.len()
+    );
+    if options.do_json {
+        for sf_bytes in &chk.sf_data {
+            let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
+                Ok(sf) => sf,
+                Err(_) => continue,
+            };
+            for obj in sf.objects_of_type(49) {
+                if let Ok(bytes) = sf.object_bytes(obj)
+                    && let Some((name, content)) = parse_text_asset(bytes)
+                {
+                    if !stats.seen_names.insert(name.clone()) {
+                        continue;
+                    }
+                    stats.total_text_assets += 1;
+                    if let Some(kind) = save_text_asset(options.gamedata_dir, &name, &content) {
+                        match kind {
+                            "JSON" => stats.total_json += 1,
+                            "TEXT" => stats.total_text += 1,
+                            "BIN" => stats.total_bin += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if options.do_gamedata {
+        for sf_bytes in &chk.sf_data {
+            let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
+                Ok(sf) => sf,
+                Err(_) => continue,
+            };
+            if !sf.enable_type_tree {
+                continue;
+            }
+            for obj in sf.objects_of_type(114) {
+                let type_name = get_script_type_name(&sf, obj);
+                let handle = ObjectHandle::new(&sf, obj);
+                let obj_name = handle
+                    .peek_name()
+                    .ok()
+                    .flatten()
+                    .filter(|n| !n.is_empty())
+                    .map_or_else(|| format!("obj_{}", obj.path_id), |n| sanitize_filename(&n));
+                let unity_obj = match handle.read() {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                };
+                let json = match serde_json::to_string_pretty(unity_obj.class.properties()) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                let safe_type = sanitize_filename(&type_name);
+                if !stats
+                    .seen_mono
+                    .insert(format!("{}/{}", safe_type, obj_name))
+                {
+                    continue;
+                }
+                let type_dir = format!("{}/{}", options.mono_dir, safe_type);
+                let _ = std::fs::create_dir_all(&type_dir);
+                if std::fs::write(format!("{}/{}.json", type_dir, obj_name), json).is_ok() {
+                    stats.total_mono += 1;
+                    *stats.mono_type_counts.entry(safe_type).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    if options.do_tex {
+        let path = Path::new(options.tex_dir);
+        for sf_bytes in &chk.sf_data {
+            let sf = match SerializedFileParser::from_bytes(sf_bytes.clone()) {
+                Ok(sf) => sf,
+                Err(_) => continue,
+            };
+            let (ok, failed, _, _) = texture::extract_textures(&sf, &chk.resources, path);
+            stats.total_tex_extracted += ok;
+            stats.total_tex_failed += failed;
+        }
+    }
+    true
 }
 
 /// Save a TextAsset to disk. Returns the file type label.
@@ -444,6 +505,249 @@ fn save_text_asset(output_dir: &str, name: &str, content: &[u8]) -> Option<&'sta
         return Some("BIN");
     }
     None
+}
+
+// ═══════════════════════════════════════════════════════════
+// update — incremental cron-friendly extraction
+// ═══════════════════════════════════════════════════════════
+
+/// Machine-readable progress line: `@progress <phase> <done> <total> <label>`.
+/// A total of 0 means the phase has no known size yet.
+fn emit_progress(enabled: bool, phase: &str, done: u64, total: u64, label: &str) {
+    if enabled {
+        println!("@progress {phase} {done} {total} {label}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_update(
+    client: &Client,
+    output: &Path,
+    state_path: &Path,
+    force: bool,
+    check: bool,
+    no_textures: bool,
+    progress: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut lock_name = state_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = std::path::PathBuf::from(lock_name);
+    let lock = File::create(lock_path)?;
+    if let Err(error) = lock.try_lock() {
+        match error {
+            std::fs::TryLockError::WouldBlock => {
+                println!("another update is running");
+                return Ok(());
+            }
+            std::fs::TryLockError::Error(error) => return Err(error.into()),
+        }
+    }
+
+    let mut state = update::load_state(state_path)?;
+    emit_progress(progress, "resolve", 0, 0, "checking launcher");
+    let config = backend::core::endfield::config::resolve_game_config(
+        client,
+        &pipeline::default_resolve_params(),
+    )
+    .await?;
+    let fingerprint = update::fingerprint(&config);
+    let current = state.fingerprint == fingerprint;
+    if current && !force {
+        println!(
+            "up to date ({} / res {})",
+            config.version, config.res_version
+        );
+        return Ok(());
+    }
+    if check {
+        println!(
+            "update available ({} / res {})",
+            config.version, config.res_version
+        );
+        std::process::exit(10);
+    }
+
+    emit_progress(progress, "resolve", 0, 0, "reading archive index");
+    let resolved = pipeline::resolve_pipeline_from_config(client, config, true).await?;
+    let mut chk_dirty = 0u64;
+    let mut chk_ok = 0u64;
+    let mut chk_failed = 0u64;
+    let mut blc_dirty = 0u64;
+    let mut blc_ok = 0u64;
+    let mut blc_failed = 0u64;
+    let mut stats = ExtractStats::default();
+    let gamedata_dir = output.join("gamedata");
+    let mono_dir = gamedata_dir.join("monobehaviour");
+    let tex_dir = output.join("textures");
+    std::fs::create_dir_all(&gamedata_dir)?;
+    std::fs::create_dir_all(&mono_dir)?;
+    if !no_textures {
+        std::fs::create_dir_all(&tex_dir)?;
+    }
+    let gamedata = gamedata_dir.to_string_lossy().to_string();
+    let mono = mono_dir.to_string_lossy().to_string();
+    let textures = tex_dir.to_string_lossy().to_string();
+
+    let mut existing_chks = HashSet::new();
+    let mut dirty = Vec::new();
+    for (dir, _) in VFS_DIRS {
+        for (name, _) in pipeline::list_chk_files(&resolved.cd, dir) {
+            let entry = resolved.cd.get(&name).expect("listed ZIP entry missing");
+            let mut digest = update::zip_digest(entry.crc32, entry.uncompressed_size);
+            if no_textures {
+                // Tagged so a later run with textures sees these chks as dirty.
+                digest.push_str("+notex");
+            }
+            existing_chks.insert(name.clone());
+            if update::is_dirty(&state.chk, &name, &digest, force) {
+                chk_dirty += 1;
+                dirty.push((name, digest));
+            }
+        }
+    }
+    state.chk.retain(|name, _| existing_chks.contains(name));
+    dirty.sort_by(|a, b| a.0.cmp(&b.0));
+    // Downloads run as spawned tasks (at most 4 in flight) so they keep progressing while
+    // the current chk is being decoded; memory stays bounded to the in-flight window.
+    let mut downloads = stream::iter(dirty.into_iter().map(|(name, digest)| {
+        let client = client.clone();
+        let cd = Arc::clone(&resolved.cd);
+        tokio::spawn(async move {
+            let result = pipeline::download_chk(&client, &cd, &name)
+                .await
+                .map_err(|e| e.to_string());
+            (name, digest, result)
+        })
+    }))
+    .buffered(4);
+    emit_progress(progress, "chk", 0, chk_dirty, "");
+    while let Some(joined) = downloads.next().await {
+        let (name, digest, result) = joined?;
+        let short = name.rsplit('/').next().unwrap_or(&name);
+        emit_progress(progress, "chk", chk_ok + chk_failed, chk_dirty, short);
+        let data = match result {
+            Ok(data) => data,
+            Err(e) => {
+                println!("  {}: download error: {}", name, e);
+                chk_failed += 1;
+                continue;
+            }
+        };
+        let ok = tokio::task::block_in_place(|| {
+            process_chk_contents(
+                &data,
+                &ChkExtractOptions {
+                    do_json: true,
+                    do_tex: !no_textures,
+                    do_gamedata: true,
+                    gamedata_dir: &gamedata,
+                    mono_dir: &mono,
+                    tex_dir: &textures,
+                },
+                &mut stats,
+            )
+        });
+        if ok {
+            state.chk.insert(name, digest);
+            // Checkpoint per chk so an interrupted run resumes instead of starting over.
+            update::save_state(state_path, &state)?;
+            chk_ok += 1;
+        } else {
+            println!("  {}: not a valid VFS container", name);
+            chk_failed += 1;
+        }
+    }
+    update::save_state(state_path, &state)?;
+
+    let staging_parent = output.join("decrypted/.staging");
+    let decrypted = output.join("decrypted");
+    std::fs::create_dir_all(&staging_parent)?;
+    let blc_total = blc::ENCRYPTED_DIRS.len() as u64;
+    for (i, dir) in blc::ENCRYPTED_DIRS.iter().enumerate() {
+        emit_progress(progress, "blc", i as u64, blc_total, dir);
+        let blc_name = format!("Endfield_Data/StreamingAssets/VFS/{0}/{0}.blc", dir);
+        let Some(entry) = resolved.cd.get(&blc_name) else {
+            state.blc_dirs.remove(*dir);
+            continue;
+        };
+        let mut parts = vec![update::zip_digest(entry.crc32, entry.uncompressed_size)];
+        if let Some(index) = &resolved.patch_index {
+            let mut patch: Vec<String> = index
+                .files
+                .iter()
+                .filter(|f| f.name.starts_with(&format!("{dir}/")))
+                .map(|f| format!("{}:{}", f.name, f.md5))
+                .collect();
+            patch.sort();
+            parts.extend(patch);
+        }
+        let digest = parts.join(";");
+        if !update::is_dirty(&state.blc_dirs, dir, &digest, force) {
+            continue;
+        }
+        blc_dirty += 1;
+        let staged = staging_parent.join(dir);
+        if staged.exists() {
+            std::fs::remove_dir_all(&staged)?;
+        }
+        match blc::extract_directory(client, &resolved, dir, &staging_parent).await {
+            Ok(result) => {
+                std::fs::create_dir_all(&decrypted)?;
+                let old = decrypted.join(format!(".old-{dir}"));
+                if old.exists() {
+                    std::fs::remove_dir_all(&old)?;
+                }
+                let final_dir = decrypted.join(dir);
+                if final_dir.exists() {
+                    std::fs::rename(&final_dir, &old)?;
+                }
+                std::fs::rename(&staged, &final_dir)?;
+                if old.exists() {
+                    std::fs::remove_dir_all(old)?;
+                }
+                if result.errors.is_empty() {
+                    state.blc_dirs.insert((*dir).to_string(), digest);
+                    blc_ok += 1;
+                } else {
+                    blc_failed += 1;
+                }
+            }
+            Err(_) => {
+                blc_failed += 1;
+            }
+        }
+    }
+    emit_progress(progress, "blc", blc_total, blc_total, "");
+    update::save_state(state_path, &state)?;
+    let failures = chk_failed + blc_failed;
+    if failures == 0 {
+        state.fingerprint = fingerprint;
+        state.version = resolved.config.version.clone();
+        state.res_version = resolved.config.res_version.clone();
+        state.updated_at = Utc::now().to_rfc3339();
+        update::save_state(state_path, &state)?;
+    }
+    std::fs::create_dir_all(output)?;
+    let line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
+        "chk_dirty": chk_dirty, "chk_ok": chk_ok, "chk_failed": chk_failed, "blc_dirty": blc_dirty, "blc_ok": blc_ok, "blc_failed": blc_failed,
+        "duration_secs": started.elapsed().as_secs_f64()});
+    use std::io::Write;
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output.join("update-log.jsonl"))?;
+    writeln!(log, "{}", line)?;
+    println!(
+        "update: chk {chk_ok}/{chk_dirty} ok, blc {blc_ok}/{blc_dirty} ok, failures {failures}"
+    );
+    if failures > 0 {
+        return Err("update had failures".into());
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════

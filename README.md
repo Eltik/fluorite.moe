@@ -165,6 +165,36 @@ Census of all Unity object types, class IDs, counts, and sizes across VFS direct
 cargo run --release --bin endfield -- survey --scan-all
 ```
 
+#### `endfield update`
+
+Incrementally sync all assets (`extract --all --scan-all` + `decrypt`) to the latest game and hot-update version. Built to run from cron: when nothing changed upstream it exits in ~1s after two launcher API calls; otherwise it re-processes only the `.chk` files and encrypted directories whose CRC32/size or patch MD5s changed.
+
+```bash
+# Sync everything (first run is a full extraction)
+cargo run --release --bin endfield -- update
+
+# Only check whether an update is available
+cargo run --release --bin endfield -- update --check
+```
+
+| Flag | Description |
+|------|-------------|
+| `--output <PATH>` | Output directory (default: `./output`) |
+| `--state <PATH>` | State file tracking processed versions and entries (default: `./data/update-state.json`) |
+| `--force` | Re-process everything regardless of state |
+| `--check` | Report only; exit `10` if an update is available, `0` if up to date |
+| `--no-textures` | Skip texture extraction (those chunks are re-processed by a later run with textures) |
+
+Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`.
+
+#### Scheduling
+
+`backend/scripts/auto-update.sh` rebuilds the binary if needed, runs `endfield update`, and logs to `backend/data/logs/update.log` (rotated at 10MB). Add it to `crontab -e`:
+
+```cron
+*/15 * * * * /abs/path/to/fluorite.moe/backend/scripts/auto-update.sh
+```
+
 ### auth-test
 
 Interactive Hypergryph account login, OAuth2 flow, gacha history, and character roster via the web API.
@@ -206,6 +236,7 @@ backend/
 │       ├── texture.rs          # Texture2D extraction (BC7, ASTC, etc. → PNG)
 │       ├── unity_extract.rs    # Unity SerializedFile + .chk container parsing
 │       ├── unityfs_header.rs   # UnityFS bundle header parsing + decompression
+│       ├── update.rs           # Incremental update state + change detection
 │       ├── utils.rs            # Shared utilities (format_bytes, hex_dump, etc.)
 │       ├── vfs_aes.rs          # Custom AES-128 with non-standard S-box
 │       ├── vfs_decrypt.rs      # VFS AES-128 CTR decryption
