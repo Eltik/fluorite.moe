@@ -16,6 +16,18 @@ pub struct AclInfo {
 /// Floats written per transform track and sample: rotation xyzw, translation xyz, scale xyz.
 pub const TRANSFORM_STRIDE: usize = 10;
 
+/// Largest decompression output accepted (2^26 floats = 256 MB): bigger headers are corrupt.
+pub const MAX_OUTPUT_FLOATS: usize = 1 << 26;
+
+/// `tracks × samples × per_track` floats, or an error on overflow or above the cap.
+pub fn output_len(tracks: u32, samples: u32, per_track: usize) -> Result<usize, String> {
+    (tracks as usize)
+        .checked_mul(samples as usize)
+        .and_then(|n| n.checked_mul(per_track))
+        .filter(|&n| n <= MAX_OUTPUT_FLOATS)
+        .ok_or_else(|| format!("ACL output of {tracks} tracks x {samples} samples is too large"))
+}
+
 #[cfg(feature = "acl")]
 mod ffi {
     unsafe extern "C" {
@@ -108,7 +120,7 @@ pub fn floats(data: &[u8]) -> Result<(AclInfo, Vec<f32>), String> {
             info.track_type
         ));
     }
-    let mut out = vec![0f32; info.num_tracks as usize * info.num_samples as usize];
+    let mut out = vec![0f32; output_len(info.num_tracks, info.num_samples, 1)?];
     // SAFETY: as in `transforms`.
     let rc =
         unsafe { ffi::fluorite_acl_floats(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len()) };

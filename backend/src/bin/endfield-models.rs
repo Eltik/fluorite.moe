@@ -10,7 +10,7 @@ use backend::extraction::rig::{self, ChunkFiles};
 use backend::extraction::zip_range::ZipCentralDirectory;
 use clap::{Parser, Subcommand};
 use reqwest::Client;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -68,6 +68,11 @@ enum Commands {
         /// Read clips from at most this many SerializedFiles
         #[arg(long, default_value_t = 400)]
         max_files: usize,
+    },
+    /// Check stored files against the index; remove damaged ones and re-queue their chunks
+    Repair {
+        #[arg(long)]
+        store: PathBuf,
     },
     /// Delete stored files the store's relevance rules no longer keep
     Prune {
@@ -166,6 +171,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("== {name}");
                 print!("{}", rig::inspect::summarize(&files, &filter));
             }
+            Ok(())
+        }
+        Commands::Repair { store } => {
+            let report = rig::store::repair(&store)?;
+            println!(
+                "checked {} stored SerializedFiles; removed {} damaged; re-queued chunks: {:?}",
+                report.checked,
+                report.removed.len(),
+                report.requeued
+            );
             Ok(())
         }
         Commands::Prune { store } => {
@@ -464,12 +479,26 @@ async fn scan_chunks(
         let cd = cd.clone();
         let client = client.clone();
         let cache = cache_dir.map(Path::to_path_buf);
+        let store = store.to_path_buf();
         async move {
             let hash = chunk_hash(&name);
+            // Held from download to index write; another scan holding it owns the chunk.
+            let lock = match rig::store::try_lock_chunk(&store, &hash) {
+                Ok(Some(lock)) if !rig::store::is_scanned(&store, &hash) => lock,
+                Ok(Some(_)) => return (hash, size, Ok(None)),
+                Ok(None) => {
+                    return (
+                        hash,
+                        size,
+                        Err("being scanned by another process".to_string()),
+                    );
+                }
+                Err(e) => return (hash, size, Err(format!("chunk lock: {e}"))),
+            };
             if let Some(dir) = &cache
                 && let Ok(data) = std::fs::read(dir.join(format!("{hash}.chk")))
             {
-                return (hash, size, Ok(data));
+                return (hash, size, Ok(Some((data, lock))));
             }
             let mut last_error = String::new();
             for attempt in 1..=3 {
@@ -481,7 +510,7 @@ async fn scan_chunks(
                             data.len() as f64 / 1e6,
                             data.len() as f64 / 1e6 / t0.elapsed().as_secs_f64().max(0.001)
                         );
-                        return (hash, size, Ok(data));
+                        return (hash, size, Ok(Some((data, lock))));
                     }
                     Err(e) => {
                         last_error = e.to_string();
@@ -497,8 +526,10 @@ async fn scan_chunks(
     let mut failed = Vec::new();
     while let Some((hash, size, data)) = downloads.next().await {
         done += 1;
-        let data = match data {
-            Ok(data) => data,
+        let (data, lock) = match data {
+            Ok(Some(fetched)) => fetched,
+            // Scanned meanwhile by another process.
+            Ok(None) => continue,
             Err(e) => {
                 failed.push(format!("{hash}: {e}"));
                 continue;
@@ -509,7 +540,9 @@ async fn scan_chunks(
         let result = tokio::task::spawn_blocking(move || {
             let files = rig::load_chunk(&data)?;
             drop(data);
-            rig::store::store_chunk(&store, &hash2, &files).map_err(|e| e.to_string())
+            let stats = rig::store::store_chunk(&store, &hash2, &files).map_err(|e| e.to_string());
+            drop(lock);
+            stats
         })
         .await?;
         match result {
@@ -663,6 +696,7 @@ async fn cmd_export(
                 chunk: "source-dir".into(),
                 sf_size: f.sf.data.len(),
                 resources: Vec::new(),
+                resource_sizes: BTreeMap::new(),
                 classes: f.sf.objects.iter().fold(BTreeMap::new(), |mut m, o| {
                     *m.entry(o.class_id).or_default() += 1;
                     m
@@ -716,6 +750,8 @@ async fn cmd_export(
     std::fs::create_dir_all(&args.output)?;
     let mut index = Vec::new();
     let mut total_bytes = 0u64;
+    // Output paths taken in this run, so two prefabs never overwrite one GLB.
+    let mut claimed: HashMap<String, String> = HashMap::new();
     for (n, cand) in candidates.iter().enumerate() {
         let t0 = Instant::now();
         let mut last_error = None;
@@ -737,7 +773,8 @@ async fn cmd_export(
             let mut exporter = rig::Exporter::new(&mut source, args.opts.clone());
             exporter.clip_sources =
                 select_clips(&clip_index, &cand.id, &args.anims, args.max_anims);
-            match exporter.export(
+            match export_isolated(
+                exporter,
                 rig::ObjRef {
                     file,
                     path_id: *path_id,
@@ -771,7 +808,8 @@ async fn cmd_export(
         };
         match result {
             Some((cab, r)) => {
-                let rel = format!("{}/{}.glb", cand.kind, rig::entity::file_stem(&cand.id));
+                let rel =
+                    rig::entity::claim_output(&mut claimed, cand.kind, &cand.id, &cand.container);
                 let path = args.output.join(&rel);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -817,40 +855,21 @@ async fn cmd_export(
         }
     }
     let exported = index.iter().filter(|e| e.glb.is_some()).count();
-    // Keep entries of earlier runs (other filters) that this run did not touch.
+    // Keep entries of earlier runs (other filters) that this run did not touch, under a lock
+    // so concurrent exports into one directory don't lose each other's entries.
     let index_path = args.output.join("index.json");
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    if let Ok(old) = std::fs::read(&index_path)
-        && let Ok(old) = serde_json::from_slice::<serde_json::Value>(&old)
-    {
-        let fresh: BTreeSet<&str> = index.iter().map(|e| e.container.as_str()).collect();
-        entries.extend(
-            old.get("entries")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|e| {
-                    e.get("container")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|c| !fresh.contains(c))
-                })
-                .cloned(),
-        );
-    }
-    entries.extend(
-        index
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap_or_default()),
-    );
-    entries.sort_by(|a, b| {
-        let key = |v: &serde_json::Value| {
-            (
-                v["kind"].as_str().unwrap_or("").to_string(),
-                v["id"].as_str().unwrap_or("").to_string(),
-            )
-        };
-        key(a).cmp(&key(b))
-    });
+    let _index_lock = rig::store::FileLock::acquire(
+        &args.output.join(".index.lock"),
+        std::time::Duration::from_secs(600),
+    )?;
+    let old = std::fs::read(&index_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let fresh: Vec<serde_json::Value> = index
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap_or_default())
+        .collect();
+    let entries = rig::entity::merge_index(old.as_ref(), fresh);
     let summary = serde_json::json!({
         "generator": "endfield-models export",
         "filter": args.filter,
@@ -863,7 +882,7 @@ async fn cmd_export(
         },
         "entries": entries,
     });
-    std::fs::write(&index_path, serde_json::to_vec_pretty(&summary)?)?;
+    rig::store::write_atomic(&index_path, &serde_json::to_vec_pretty(&summary)?)?;
     eprintln!(
         "exported {exported}/{} prefab(s), {:.1} MB, in {:.0}s",
         candidates.len(),
@@ -935,7 +954,14 @@ fn select_clips(
     // Exact folders first, so `chen` never picks up `chenpast/`; prefixes only as a fallback.
     let mut owned = in_folder(false);
     if owned.is_empty() {
-        owned = in_folder(true);
+        // A prefix match is only trusted when it names exactly one folder.
+        let folder_of = |path: &str| path.find("/animations/").map(|at| path[..at].to_string());
+        let candidates = in_folder(true);
+        let folders: BTreeSet<Option<String>> =
+            candidates.iter().map(|(p, _, _)| folder_of(p)).collect();
+        if folders.len() == 1 {
+            owned = candidates;
+        }
     }
     for keyword in keywords
         .iter()
@@ -983,6 +1009,25 @@ fn clip_code(id: &str) -> String {
 fn clip_folder_matches(folder: &str, code: &str, prefix: bool) -> bool {
     let base = code.trim_end_matches(|c: char| c.is_ascii_digit());
     !folder.is_empty() && (folder == code || folder == base || (prefix && folder.starts_with(code)))
+}
+
+/// Run one entity export, turning a panic into an error so one bad entity can't end the run.
+fn export_isolated(
+    exporter: rig::Exporter<'_>,
+    root: rig::ObjRef,
+    extras: serde_json::Value,
+) -> Result<rig::EntityExport, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exporter.export(root, extras)
+    }))
+    .unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        Err(format!("exporter panicked: {message}"))
+    })
 }
 
 #[cfg(test)]

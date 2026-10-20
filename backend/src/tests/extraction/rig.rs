@@ -246,9 +246,9 @@ fn gltf_document_is_structurally_valid() {
         bin.len()
     );
     assert!(
-        gltf::check_document(&doc, bin.len()).is_empty(),
+        gltf::check_document(&doc, bin).is_empty(),
         "{:?}",
-        gltf::check_document(&doc, bin.len())
+        gltf::check_document(&doc, bin)
     );
     // Joint indices are bytes for small skeletons, and every view is 4-byte aligned.
     let joints = &doc["accessors"][doc["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"]
@@ -265,20 +265,20 @@ fn gltf_document_is_structurally_valid() {
 fn gltf_check_reports_broken_references() {
     let (doc, glb) = skinned_document(3);
     let (_, bin) = gltf::parse_glb(&glb).unwrap();
-    let errors = gltf::check_document(&doc, bin.len());
+    let errors = gltf::check_document(&doc, bin);
     assert!(errors.iter().any(|e| e.contains("IBM count")), "{errors:?}");
 
     let (mut doc, glb) = skinned_document(2);
     let (_, bin) = gltf::parse_glb(&glb).unwrap();
     doc["meshes"][0]["primitives"][0]["material"] = json!(9);
     doc["nodes"][1]["children"] = json!([0, 0]);
-    let errors = gltf::check_document(&doc, bin.len());
+    let errors = gltf::check_document(&doc, bin);
     assert!(
         errors.iter().any(|e| e.contains("missing material")),
         "{errors:?}"
     );
     assert!(errors.iter().any(|e| e.contains("2 parents")), "{errors:?}");
-    assert!(!gltf::check_document(&doc, 8).is_empty());
+    assert!(!gltf::check_document(&doc, &bin[..8]).is_empty());
 }
 
 #[test]
@@ -314,6 +314,7 @@ fn candidates_prefer_local_prefabs_with_objects() {
             chunk: "C".into(),
             sf_size: 0,
             resources: vec![],
+            resource_sizes: BTreeMap::new(),
             classes: classes.iter().copied().collect::<BTreeMap<_, _>>(),
             containers,
             externals: vec![],
@@ -381,7 +382,7 @@ fn rig_fixture_exports_valid_skinned_glbs() {
             continue;
         };
         let (doc, bin) = gltf::parse_glb(&export.glb).unwrap();
-        assert!(gltf::check_document(&doc, bin.len()).is_empty());
+        assert!(gltf::check_document(&doc, bin).is_empty());
         for mesh in doc["meshes"].as_array().unwrap() {
             for prim in mesh["primitives"].as_array().unwrap() {
                 let Some(w) = prim["attributes"].get("WEIGHTS_0").and_then(Value::as_u64) else {
@@ -541,7 +542,7 @@ mod anim {
         b.animations = animations;
         let (doc, glb) = b.finish(vec![0], json!({}));
         let (_, bin) = gltf::parse_glb(&glb).unwrap();
-        assert!(gltf::check_document(&doc, bin.len()).is_empty());
+        assert!(gltf::check_document(&doc, bin).is_empty());
         let anim = &doc["animations"][0];
         let accessor = |i: &Value| doc["accessors"][i.as_u64().unwrap() as usize].clone();
         let rotation = anim["channels"]
@@ -596,5 +597,196 @@ mod anim {
             let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
             assert!((len - 1.0).abs() < 1e-3, "non-unit quaternion {len}");
         }
+    }
+}
+
+mod review_fixes {
+    use super::skinned_document;
+    use crate::extraction::rig::acl;
+    use crate::extraction::rig::anim::{self, DecodedClip, TrackBinding};
+    use crate::extraction::rig::entity::{claim_output, kind_of, merge_index};
+    use crate::extraction::rig::gltf::{self, Builder};
+    use crate::extraction::rig::store::{self, CabRecord, FileLock};
+    use serde_json::json;
+    use std::collections::{BTreeMap, HashMap};
+
+    /// NPC variants of operators are their own kind and never claim the operator's file.
+    #[test]
+    fn npc_postmodels_are_not_operators() {
+        let npc = "assets/beyond/dynamicassets/gameplay/actors/postmodels/npc/chr_0023_antal_postmodel.prefab";
+        let op = "assets/beyond/dynamicassets/gameplay/actors/postmodels/characters/chr_0023_antal_postmodel.prefab";
+        assert_eq!(kind_of(npc), "npc");
+        assert_eq!(kind_of(op), "operator");
+    }
+
+    #[test]
+    fn output_paths_are_unique_per_run() {
+        let mut claimed = HashMap::new();
+        let a = claim_output(&mut claimed, "operator", "chr_0023_antal", "a/x.prefab");
+        let again = claim_output(&mut claimed, "operator", "chr_0023_antal", "a/x.prefab");
+        let b = claim_output(&mut claimed, "operator", "chr_0023_antal", "b/x.prefab");
+        assert_eq!(a, "operator/chr_0023_antal.glb");
+        assert_eq!(again, a);
+        assert_ne!(b, a);
+        assert!(b.starts_with("operator/chr_0023_antal__") && b.ends_with(".glb"));
+    }
+
+    /// Fresh entries replace old ones for the same container or the same file, and no two
+    /// merged entries share a GLB.
+    #[test]
+    fn merged_index_never_shares_a_file() {
+        let old = json!({"entries": [
+            {"kind": "operator", "id": "chr_0023_antal", "container": "npc/antal", "glb": "operator/chr_0023_antal.glb"},
+            {"kind": "enemy", "id": "eny_1", "container": "e1", "glb": "enemy/eny_1.glb"},
+            {"kind": "enemy", "id": "eny_1b", "container": "e1b", "glb": "enemy/eny_1.glb"},
+            {"kind": "weapon", "id": "wpn_1", "container": "w1", "glb": "weapon/wpn_1.glb"},
+        ]});
+        let fresh = vec![
+            json!({"kind": "operator", "id": "chr_0023_antal", "container": "characters/antal", "glb": "operator/chr_0023_antal.glb"}),
+            json!({"kind": "weapon", "id": "wpn_1", "container": "w1", "glb": "weapon/wpn_1.glb"}),
+        ];
+        let merged = merge_index(Some(&old), fresh);
+        let glbs: Vec<&str> = merged.iter().filter_map(|e| e["glb"].as_str()).collect();
+        let mut unique = glbs.clone();
+        unique.dedup();
+        assert_eq!(glbs.len(), 3, "{merged:?}");
+        assert_eq!(unique.len(), glbs.len());
+        let antal = merged.iter().find(|e| e["id"] == "chr_0023_antal").unwrap();
+        assert_eq!(antal["container"], "characters/antal");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_and_hidden() {
+        let path = std::path::Path::new("/store/res/CAB-x.resS");
+        let a = store::temp_path(path);
+        let b = store::temp_path(path);
+        let c = store::temp_path(std::path::Path::new("/store/res/CAB-x.resource"));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.parent(), path.parent());
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".CAB-x.resS.")
+        );
+    }
+
+    #[test]
+    fn file_lock_is_exclusive_and_released() {
+        let dir = std::env::temp_dir().join(format!("fluorite-rig-lock-{}", std::process::id()));
+        let path = dir.join("x.lock");
+        let lock = FileLock::try_acquire(&path).unwrap().expect("free lock");
+        assert!(FileLock::try_acquire(&path).unwrap().is_none());
+        drop(lock);
+        assert!(FileLock::try_acquire(&path).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn rec(
+        cab: &str,
+        chunk: &str,
+        classes: &[i32],
+        container: &str,
+        resources: &[&str],
+    ) -> CabRecord {
+        CabRecord {
+            cab: cab.into(),
+            chunk: chunk.into(),
+            sf_size: 0,
+            resources: resources.iter().map(|r| r.to_string()).collect(),
+            resource_sizes: BTreeMap::new(),
+            classes: classes.iter().map(|c| (*c, 1)).collect(),
+            containers: vec![(container.into(), 0, 1)],
+            externals: vec![],
+        }
+    }
+
+    /// A CAB listed by a stale (irrelevant-looking) record and a newer relevant one is kept.
+    #[test]
+    fn prune_keeps_files_any_record_needs() {
+        let entity = "assets/beyond/arts/entity/actor/girl/chen/models/a.fbx";
+        let scene = "assets/beyond/arts/environment/x.mat";
+        let records = vec![
+            rec("CAB-shared", "OLD", &[114], scene, &["CAB-shared.resS"]),
+            rec("CAB-shared", "NEW", &[43], entity, &["CAB-shared.resS"]),
+            rec("CAB-scene", "NEW", &[43], scene, &["CAB-scene.resS"]),
+        ];
+        let (sf, res) = store::prune_plan(&records);
+        assert!(!sf.contains("CAB-shared") && !res.contains("CAB-shared.resS"));
+        assert!(sf.contains("CAB-scene") && res.contains("CAB-scene.resS"));
+    }
+
+    #[test]
+    fn acl_output_size_is_checked() {
+        assert_eq!(
+            acl::output_len(373, 151, acl::TRANSFORM_STRIDE),
+            Ok(563_230)
+        );
+        assert!(acl::output_len(u32::MAX, u32::MAX, acl::TRANSFORM_STRIDE).is_err());
+        assert!(acl::output_len(1 << 16, 1 << 11, 1).is_err());
+    }
+
+    #[test]
+    fn clips_without_usable_timing_are_rejected_without_panicking() {
+        assert!(anim::validate_timing(0, 60.0).is_err());
+        assert!(anim::validate_timing(10, 0.0).is_err());
+        assert!(anim::validate_timing(10, f32::NAN).is_err());
+        assert!(anim::validate_timing(1, 0.0).is_ok());
+        assert!(anim::validate_timing(151, 60.0).is_ok());
+        let tracks = vec![TrackBinding {
+            path_hash: 0,
+            position: true,
+            rotation: true,
+            scale: false,
+        }];
+        for (num_samples, rate, samples) in [
+            (0, 60.0, vec![]),
+            (3, 60.0, vec![0.0; 10]),
+            (2, 0.0, vec![0.0; 20]),
+        ] {
+            let clip = DecodedClip {
+                name: "bad".into(),
+                sample_rate: rate,
+                num_samples,
+                tracks: tracks.clone(),
+                samples,
+            };
+            let mut b = Builder::default();
+            b.nodes.push(json!({"name": "root"}));
+            let nodes = anim::node_path_hashes(&b.nodes, 0);
+            let mut animations = Vec::new();
+            let stats = anim::add_animation(&mut b, &mut animations, &clip, &nodes);
+            assert_eq!(stats.channels, 0);
+            assert!(animations.is_empty());
+        }
+    }
+
+    #[test]
+    fn repeated_joints_are_rejected() {
+        let (mut doc, glb) = skinned_document(2);
+        let (_, bin) = gltf::parse_glb(&glb).unwrap();
+        let root = doc["skins"][0]["joints"][0].clone();
+        doc["skins"][0]["joints"] = json!([root, root]);
+        let errors = gltf::check_document(&doc, bin);
+        assert!(
+            errors.iter().any(|e| e.contains("more than once")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn joint_indices_beyond_the_skin_are_rejected() {
+        let (mut doc, glb) = skinned_document(1);
+        let (_, bin) = gltf::parse_glb(&glb).unwrap();
+        // The mesh uses joint index 1; a one-joint skin can't serve it.
+        let root = doc["skins"][0]["joints"][0].clone();
+        doc["skins"][0]["joints"] = json!([root]);
+        let errors = gltf::check_document(&doc, bin);
+        assert!(
+            errors.iter().any(|e| e.contains("JOINTS_0 index 1 >= 1")),
+            "{errors:?}"
+        );
     }
 }

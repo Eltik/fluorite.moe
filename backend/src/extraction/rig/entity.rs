@@ -1,6 +1,7 @@
 //! Finding entity prefabs in the store index and naming their exports.
 use super::store::CabRecord;
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// A prefab container entry that may be an exportable entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,19 +15,20 @@ pub struct Candidate {
 }
 
 /// Entity kind from a container path.
+///
+/// NPC folders are checked first: `postmodels/npc/chr_0023_antal_postmodel` is the NPC
+/// variant of an operator and must not land on (and overwrite) the operator's file.
 #[must_use]
 pub fn kind_of(container: &str) -> &'static str {
     let c = container.to_ascii_lowercase();
     let stem = id_of(&c);
-    if c.contains("/postmodels/characters/")
+    if c.contains("/postmodels/npc/") || c.contains("/npc/") {
+        "npc"
+    } else if c.contains("/postmodels/characters/")
         || c.contains("/entity/actor/")
         || stem.starts_with("chr_")
     {
-        if stem.starts_with("chr_") || c.contains("/entity/actor/") {
-            "operator"
-        } else {
-            "npc"
-        }
+        "operator"
     } else if c.contains("/postmodels/enemies/")
         || c.contains("/entity/monster/")
         || stem.starts_with("eny_")
@@ -37,11 +39,66 @@ pub fn kind_of(container: &str) -> &'static str {
         || stem.starts_with("wpn_")
     {
         "weapon"
-    } else if c.contains("/npc") {
-        "npc"
     } else {
         "other"
     }
+}
+
+/// Claim the output path `<kind>/<id>.glb` for a container. When another container of this
+/// run already holds it, a short hash of the container is appended
+/// (`<kind>/<id>__<crc32>.glb`), so no export overwrites another.
+pub fn claim_output(
+    claimed: &mut HashMap<String, String>,
+    kind: &str,
+    id: &str,
+    container: &str,
+) -> String {
+    let base = format!("{kind}/{}", file_stem(id));
+    let mut rel = format!("{base}.glb");
+    if claimed.get(&rel).is_some_and(|c| c != container) {
+        rel = format!(
+            "{base}__{:08x}.glb",
+            super::anim::crc32(container.as_bytes())
+        );
+    }
+    claimed.insert(rel.clone(), container.to_string());
+    rel
+}
+
+/// Merge this run's index entries into the previous `index.json`: fresh entries replace old
+/// ones for the same container or the same GLB (whose file this run just rewrote), and no two
+/// entries ever point at one file. Sorted by kind, then id.
+#[must_use]
+pub fn merge_index(old: Option<&Value>, fresh: Vec<Value>) -> Vec<Value> {
+    let key = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let fresh_containers: HashSet<String> =
+        fresh.iter().filter_map(|e| key(e, "container")).collect();
+    let mut taken: HashSet<String> = fresh.iter().filter_map(|e| key(e, "glb")).collect();
+    let mut out = fresh;
+    for e in old
+        .and_then(|o| o.get("entries"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if key(e, "container").is_none_or(|c| fresh_containers.contains(&c)) {
+            continue;
+        }
+        if let Some(glb) = key(e, "glb")
+            && !taken.insert(glb)
+        {
+            continue;
+        }
+        out.push(e.clone());
+    }
+    out.sort_by_key(|v| {
+        (
+            key(v, "kind").unwrap_or_default(),
+            key(v, "id").unwrap_or_default(),
+            key(v, "container").unwrap_or_default(),
+        )
+    });
+    out
 }
 
 /// Entity id guess: the prefab file stem without a `_postmodel` suffix.

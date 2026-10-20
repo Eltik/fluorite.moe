@@ -30,8 +30,9 @@ pub struct ObjRef {
     pub path_id: i64,
 }
 
-/// Cache key of an exported mesh: source mesh, renderer materials, and whether it is skinned.
-type MeshKey = (ObjRef, Vec<Option<ObjRef>>, bool);
+/// Cache key of an exported mesh: source mesh, renderer materials, whether it is skinned, and
+/// the joint count its `JOINTS_0` indices were checked against.
+type MeshKey = (ObjRef, Vec<Option<ObjRef>>, bool, usize);
 
 /// Export settings.
 #[derive(Debug, Clone, Default)]
@@ -92,6 +93,8 @@ pub struct Exporter<'a> {
     lod_levels: HashMap<ObjRef, usize>,
     mesh_cache: HashMap<MeshKey, Option<usize>>,
     pub texture_paths: HashMap<usize, HashMap<i64, PathBuf>>,
+    /// Copies of materials with `texCoord` clamped, by (material, UV set count).
+    uv_clamped: HashMap<(usize, usize), usize>,
     pub material_cache: HashMap<material::MaterialKey, usize>,
     pub texture_cache: HashMap<(ObjRef, material::TextureRole), Option<usize>>,
     pub shader_cache: HashMap<ObjRef, String>,
@@ -158,6 +161,7 @@ impl<'a> Exporter<'a> {
             lod_levels: HashMap::new(),
             mesh_cache: HashMap::new(),
             texture_paths: HashMap::new(),
+            uv_clamped: HashMap::new(),
             material_cache: HashMap::new(),
             texture_cache: HashMap::new(),
             shader_cache: HashMap::new(),
@@ -543,7 +547,14 @@ impl<'a> Exporter<'a> {
     ) -> Option<(usize, Option<skin::SkinWeights>, Value)> {
         let mesh_ref = r.mesh?;
         let (mesh_value, decoded) = self.decode(mesh_ref)?;
-        let weights = if r.skinned {
+        if r.skinned && r.bones.is_empty() {
+            self.warn(format!(
+                "{}: skinned renderer without bones; exported static",
+                r.name
+            ));
+        }
+        // Without bones there is no skin, so JOINTS_0/WEIGHTS_0 would dangle: drop them.
+        let weights = if r.skinned && !r.bones.is_empty() {
             match skin::decode_skin_weights(&mesh_value, &self.src.files.resources) {
                 Ok(Some(w)) => Some(w),
                 Ok(None) => {
@@ -561,7 +572,12 @@ impl<'a> Exporter<'a> {
         } else {
             None
         };
-        let key = (mesh_ref, r.materials.clone(), weights.is_some());
+        let key = (
+            mesh_ref,
+            r.materials.clone(),
+            weights.is_some(),
+            joint_count,
+        );
         if let Some(cached) = self.mesh_cache.get(&key) {
             return cached.map(|m| (m, weights, mesh_value));
         }
@@ -691,6 +707,7 @@ impl<'a> Exporter<'a> {
                 .flatten()
                 .or_else(|| r.materials.last().copied().flatten());
             let material = material::material_index(self, mat_ref, &decoded.name);
+            let material = self.material_for_uvs(material, decoded.uvs.len());
             primitives.push(json!({"attributes": attributes, "indices": indices, "material": material, "mode": 4}));
         }
         if primitives.is_empty() {
@@ -707,6 +724,61 @@ impl<'a> Exporter<'a> {
         Some((index, weights, mesh_value))
     }
 
+    /// `material`, or a copy whose `texCoord`s are clamped to UV sets the mesh actually has
+    /// (a texture on a missing TEXCOORD_n would be invalid glTF).
+    fn material_for_uvs(&mut self, material: usize, uv_sets: usize) -> usize {
+        let slots = [
+            "/pbrMetallicRoughness/baseColorTexture",
+            "/normalTexture",
+            "/emissiveTexture",
+        ];
+        let fits = |m: &Value| {
+            slots.iter().all(|s| {
+                m.pointer(&format!("{s}/texCoord"))
+                    .and_then(Value::as_u64)
+                    .is_none_or(|t| (t as usize) < uv_sets.max(1))
+            })
+        };
+        if fits(&self.builder.materials[material]) {
+            return material;
+        }
+        if let Some(&i) = self.uv_clamped.get(&(material, uv_sets)) {
+            return i;
+        }
+        let mut copy = self.builder.materials[material].clone();
+        for s in slots {
+            if let Some(t) = copy.pointer_mut(&format!("{s}/texCoord")) {
+                *t = json!(
+                    uv_sets
+                        .saturating_sub(1)
+                        .min(t.as_u64().unwrap_or(0) as usize)
+                );
+            }
+        }
+        let name = copy["name"].as_str().unwrap_or("").to_string();
+        self.warn(format!(
+            "material {name}: texCoord clamped to the mesh's {uv_sets} UV set(s)"
+        ));
+        self.builder.materials.push(copy);
+        let i = self.builder.materials.len() - 1;
+        self.uv_clamped.insert((material, uv_sets), i);
+        i
+    }
+
+    /// An identity-transform child of `parent`, used as a unique stand-in joint.
+    fn placeholder_joint(&mut self, parent: usize, name: &str) -> usize {
+        let node = self
+            .builder
+            .node(json!({"name": name, "extras": {"placeholderJoint": true}}));
+        let mut children = self.builder.nodes[parent]["children"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        children.push(json!(node));
+        self.builder.nodes[parent]["children"] = json!(children);
+        node
+    }
+
     /// Skin for a skinned renderer: joints from `m_Bones`, IBMs from the mesh's bind poses.
     fn skin_for(&mut self, r: &Renderer, mesh_value: &Value, root: usize) -> usize {
         let poses = skin::bind_poses(mesh_value);
@@ -718,20 +790,37 @@ impl<'a> Exporter<'a> {
                 r.bones.len()
             ));
         }
+        // glTF forbids repeated joints: a missing bone, or a bone listed twice, gets an
+        // identity child of its node (the root for missing ones), which has the same world
+        // transform and so skins identically.
         let mut joints = Vec::with_capacity(r.bones.len());
-        let mut missing = 0;
-        for bone in &r.bones {
-            match bone.and_then(|b| self.transform_nodes.get(&b).copied()) {
-                Some(n) => joints.push(n),
+        let mut used = std::collections::HashSet::new();
+        let (mut missing, mut repeated) = (0, 0);
+        for (i, bone) in r.bones.iter().enumerate() {
+            let node = bone.and_then(|b| self.transform_nodes.get(&b).copied());
+            let joint = match node {
+                Some(n) if used.insert(n) => n,
+                Some(n) => {
+                    repeated += 1;
+                    self.placeholder_joint(n, &format!("{}_bone{i}_dup", r.name))
+                }
                 None => {
                     missing += 1;
-                    joints.push(root);
+                    self.placeholder_joint(root, &format!("{}_bone{i}_missing", r.name))
                 }
-            }
+            };
+            used.insert(joint);
+            joints.push(joint);
         }
         if missing > 0 {
             self.warn(format!(
-                "{}: {missing} bones outside the hierarchy mapped to the root",
+                "{}: {missing} bones outside the hierarchy bound to placeholder joints at the root",
+                r.name
+            ));
+        }
+        if repeated > 0 {
+            self.warn(format!(
+                "{}: {repeated} repeated bones given placeholder joints",
                 r.name
             ));
         }
@@ -901,11 +990,8 @@ impl<'a> Exporter<'a> {
             json!("Unity left-handed converted by negating X (rotations (x,-y,-z,w))");
         let warnings: Vec<String> = self.warnings.into_iter().collect();
         let (document, glb) = self.builder.finish(scene, extras);
-        let bin_len = document
-            .pointer("/buffers/0/byteLength")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let errors = gltf::check_document(&document, bin_len);
+        let (_, bin) = gltf::parse_glb(&glb)?;
+        let errors = gltf::check_document(&document, bin);
         if !errors.is_empty() {
             return Err(format!("invalid document: {}", errors.join("; ")));
         }

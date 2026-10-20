@@ -105,6 +105,7 @@ pub fn decode_clip(clip: &Value) -> Result<DecodedClip, String> {
         .ok_or("clip has no generic bindings")?;
     let tracks = transform_bindings(bindings);
     let (info, samples) = acl::transforms(&buffer)?;
+    validate_timing(info.num_samples, info.sample_rate)?;
     if info.num_tracks as usize != tracks.len() {
         return Err(format!(
             "ACL has {} transform tracks but bindings name {} paths",
@@ -119,6 +120,18 @@ pub fn decode_clip(clip: &Value) -> Result<DecodedClip, String> {
         tracks,
         samples,
     })
+}
+
+/// Reject clips that cannot become a glTF animation: no samples, or several samples without a
+/// finite positive rate (key times would be NaN or infinite).
+pub fn validate_timing(num_samples: u32, sample_rate: f32) -> Result<(), String> {
+    if num_samples == 0 {
+        return Err("clip has no samples".into());
+    }
+    if num_samples > 1 && !(sample_rate.is_finite() && sample_rate > 0.0) {
+        return Err(format!("clip has invalid sample rate {sample_rate}"));
+    }
+    Ok(())
 }
 
 /// Flip quaternions so consecutive keys stay in the same hemisphere (glTF slerps the short
@@ -158,13 +171,32 @@ pub fn add_animation(
     nodes: &HashMap<u32, usize>,
 ) -> AnimStats {
     let n = clip.tracks.len();
-    let count = clip.num_samples.max(1);
-    let times: Vec<[f32; 1]> = (0..count).map(|s| [s as f32 / clip.sample_rate]).collect();
+    let count = clip.num_samples;
     let mut stats = AnimStats {
         name: clip.name.clone(),
-        duration: times.last().map_or(0.0, |t| t[0]),
         ..AnimStats::default()
     };
+    // Defensive: `decode_clip` already rejects these, but a malformed clip must never panic.
+    let needed = count
+        .checked_mul(n)
+        .and_then(|x| x.checked_mul(TRANSFORM_STRIDE));
+    if count == 0
+        || needed.is_none_or(|need| clip.samples.len() < need)
+        || validate_timing(count as u32, clip.sample_rate).is_err()
+    {
+        stats.unmatched_tracks = n;
+        return stats;
+    }
+    let times: Vec<[f32; 1]> = (0..count)
+        .map(|s| {
+            [if s == 0 {
+                0.0
+            } else {
+                s as f32 / clip.sample_rate
+            }]
+        })
+        .collect();
+    stats.duration = times.last().map_or(0.0, |t| t[0]);
     let full_input = builder.floats(&times, "SCALAR", None, true);
     let single_input = builder.floats(&[[0.0f32]], "SCALAR", None, true);
     let mut samplers = Vec::new();

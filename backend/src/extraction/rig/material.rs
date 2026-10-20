@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const CLASS_TEXTURE2D: i32 = 28;
+/// Largest texture side decoded from bundle data.
+pub const MAX_TEXTURE_SIDE: usize = 16384;
 const CLASS_SHADER: i32 = 48;
 
 /// What a texture is used for, which decides how it is processed before embedding.
@@ -477,7 +479,8 @@ fn decode_from_bundle(exp: &mut Exporter, tref: ObjRef) -> Option<(DynamicImage,
         .and_then(value_bytes)
         .filter(|b| !b.is_empty())
         .or_else(|| resolve_stream_data(&tex, &exp.src.files.resources))?;
-    if width == 0 || height == 0 {
+    // Unity caps textures at 16384 per side; larger values are corrupt headers.
+    if width == 0 || height == 0 || width > MAX_TEXTURE_SIDE || height > MAX_TEXTURE_SIDE {
         return None;
     }
     let mut pixels = vec![0u32; width * height];

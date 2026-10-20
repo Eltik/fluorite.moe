@@ -130,25 +130,37 @@ fn decode_with_layout(
     data: &[u8],
     count: usize,
 ) -> Result<SkinWeights, String> {
+    let overflow = || "vertex layout overflow".to_string();
+    // Unity has at most four vertex streams; anything else is corrupt data.
     let stream_count = chans.iter().map(|c| c.stream + 1).max().unwrap_or(0);
+    if stream_count > 4 {
+        return Err(format!("invalid vertex stream count {stream_count}"));
+    }
     let mut strides = vec![0usize; stream_count];
     for c in chans {
         let size = format_size(c.format).ok_or("unsupported vertex format")?;
-        strides[c.stream] += size * c.dimension;
+        let bytes = size.checked_mul(c.dimension).ok_or_else(overflow)?;
+        strides[c.stream] = strides[c.stream].checked_add(bytes).ok_or_else(overflow)?;
     }
     let mut starts = Vec::with_capacity(stream_count);
     let mut running = 0usize;
     for stride in &strides {
-        running = running.div_ceil(16) * 16;
+        running = running.checked_next_multiple_of(16).ok_or_else(overflow)?;
         starts.push(running);
-        running += count * stride;
+        let len = count.checked_mul(*stride).ok_or_else(overflow)?;
+        running = running.checked_add(len).ok_or_else(overflow)?;
     }
     if data.len() < running {
         return Err("vertex buffer is too short".into());
     }
     let read = |c: Channel, vertex: usize, component: usize| -> Result<f32, String> {
         let size = format_size(c.format).ok_or("unsupported vertex format")?;
-        let off = starts[c.stream] + vertex * strides[c.stream] + c.offset + component * size;
+        let off = vertex
+            .checked_mul(strides[c.stream])
+            .and_then(|o| o.checked_add(starts[c.stream]))
+            .and_then(|o| o.checked_add(c.offset))
+            .and_then(|o| o.checked_add(component.checked_mul(size)?))
+            .ok_or_else(overflow)?;
         decode_scalar(
             c.format,
             data.get(off..).ok_or("vertex buffer is too short")?,

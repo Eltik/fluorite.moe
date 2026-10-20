@@ -248,7 +248,11 @@ pub fn parse_glb(data: &[u8]) -> Result<(Value, &[u8]), String> {
 
 /// Structural checks of a document: index references in range, accessors inside their views,
 /// skins with matching IBM counts, primitives with consistent attribute counts.
-pub fn check_document(doc: &Value, bin_len: usize) -> Vec<String> {
+///
+/// Also rejects repeated joints in a skin and `JOINTS_0` indices at or beyond the joint count
+/// of the skin a mesh is used with (read from `bin`).
+pub fn check_document(doc: &Value, bin: &[u8]) -> Vec<String> {
+    let bin_len = bin.len();
     let mut errors = Vec::new();
     let len = |key: &str| doc.get(key).and_then(Value::as_array).map_or(0, Vec::len);
     let arr = |key: &str| -> Vec<Value> {
@@ -337,6 +341,21 @@ pub fn check_document(doc: &Value, bin_len: usize) -> Vec<String> {
         if joints == 0 {
             errors.push(format!("skin {i} has no joints"));
         }
+        let listed: Vec<u64> = skin
+            .get("joints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
+        if listed
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != listed.len()
+        {
+            errors.push(format!("skin {i} lists a joint more than once"));
+        }
         for j in skin
             .get("joints")
             .and_then(Value::as_array)
@@ -393,5 +412,70 @@ pub fn check_document(doc: &Value, bin_len: usize) -> Vec<String> {
             }
         }
     }
+    // JOINTS_0 must index inside the skin of every node drawing the mesh.
+    let skins = arr("skins");
+    let meshes = arr("meshes");
+    for (i, node) in nodes.iter().enumerate() {
+        let (Some(m), Some(sk)) = (
+            node.get("mesh").and_then(idx),
+            node.get("skin").and_then(idx),
+        ) else {
+            continue;
+        };
+        let joint_count = skins
+            .get(sk)
+            .and_then(|s| s.get("joints"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let prims = meshes
+            .get(m)
+            .and_then(|m| m.get("primitives"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for prim in &prims {
+            let Some(a) = prim.pointer("/attributes/JOINTS_0").and_then(idx) else {
+                continue;
+            };
+            match max_joint_index(&accessors, &views, bin, a) {
+                Some(max) if max < joint_count => {}
+                Some(max) => errors.push(format!(
+                    "node {i}: JOINTS_0 index {max} >= {joint_count} joints"
+                )),
+                None => errors.push(format!("node {i}: JOINTS_0 accessor {a} unreadable")),
+            }
+        }
+    }
     errors
+}
+
+/// Largest joint index in a `JOINTS_0` accessor (unsigned byte or short VEC4).
+fn max_joint_index(
+    accessors: &[Value],
+    views: &[Value],
+    bin: &[u8],
+    accessor: usize,
+) -> Option<usize> {
+    let a = accessors.get(accessor)?;
+    let view = views.get(a.get("bufferView")?.as_u64()? as usize)?;
+    let size = match a.get("componentType")?.as_u64()? {
+        5121 => 1,
+        5123 => 2,
+        _ => return None,
+    };
+    let start = (view.get("byteOffset").and_then(Value::as_u64).unwrap_or(0)
+        + a.get("byteOffset").and_then(Value::as_u64).unwrap_or(0)) as usize;
+    let count = a.get("count")?.as_u64()? as usize;
+    let bytes = bin.get(start..start.checked_add(count.checked_mul(4 * size)?)?)?;
+    Some(
+        bytes
+            .chunks_exact(size)
+            .map(|c| match c {
+                [b] => usize::from(*b),
+                [lo, hi] => usize::from(u16::from_le_bytes([*lo, *hi])),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0),
+    )
 }

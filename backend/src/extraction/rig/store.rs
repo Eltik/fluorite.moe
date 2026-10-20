@@ -12,10 +12,12 @@
 use super::chunk::{ChunkFiles, NamedFile, containers};
 use crate::extraction::unity::SerializedFile;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const CLASS_MESH: i32 = 43;
 
@@ -78,6 +80,9 @@ pub struct CabRecord {
     /// Resource streams of this bundle that were stored.
     #[serde(default)]
     pub resources: Vec<String>,
+    /// Byte size of each stored resource stream, to detect damaged files.
+    #[serde(default)]
+    pub resource_sizes: BTreeMap<String, u64>,
     /// Object counts by Unity class ID.
     pub classes: BTreeMap<i32, usize>,
     /// `m_Container` entries: `[path, fileID, pathID]`.
@@ -94,13 +99,107 @@ pub struct StoreStats {
     pub res_bytes: usize,
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+/// A temp path next to `path`, unique per process and call, so concurrent writers (and
+/// `X.resS` vs `X.resource`) never share one.
+#[must_use]
+pub fn temp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// Write through a unique temp file and rename, so readers never see partial files.
+pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path)
+    let tmp = temp_path(path);
+    if let Err(e) = fs::write(&tmp, data).and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// An exclusive lock file created with `create_new`, removed on drop.
+#[derive(Debug)]
+pub struct FileLock {
+    path: PathBuf,
+}
+
+/// Locks older than this are assumed to belong to a crashed process.
+const STALE_LOCK: Duration = Duration::from_secs(6 * 3600);
+
+impl FileLock {
+    /// Take the lock if it is free (or stale).
+    pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        for _ in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{}", std::process::id());
+                    return Ok(Some(Self {
+                        path: path.to_path_buf(),
+                    }));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > STALE_LOCK);
+                    if !stale {
+                        return Ok(None);
+                    }
+                    let _ = fs::remove_file(path);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Wait for the lock, polling, for at most `timeout`.
+    pub fn acquire(path: &Path, timeout: Duration) -> io::Result<Self> {
+        let start = Instant::now();
+        loop {
+            if let Some(lock) = Self::try_acquire(path)? {
+                return Ok(lock);
+            }
+            if start.elapsed() > timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("lock {} is held", path.display()),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// The store-wide lock held while writing files, pruning or repairing.
+pub fn lock_store(store: &Path) -> io::Result<FileLock> {
+    FileLock::acquire(&store.join(".lock"), Duration::from_secs(600))
+}
+
+/// The per-chunk lock held from download to index write, so two scans never fetch the same
+/// chunk. `None` when another process holds it.
+pub fn try_lock_chunk(store: &Path, chunk: &str) -> io::Result<Option<FileLock>> {
+    FileLock::try_acquire(&store.join("index").join(format!("{chunk}.lock")))
 }
 
 fn record(chunk: &str, file: &NamedFile, resources: Vec<String>) -> CabRecord {
@@ -113,6 +212,7 @@ fn record(chunk: &str, file: &NamedFile, resources: Vec<String>) -> CabRecord {
         chunk: chunk.to_string(),
         sf_size: file.sf.data.len(),
         resources,
+        resource_sizes: BTreeMap::new(),
         classes,
         containers: containers(&file.sf)
             .into_iter()
@@ -143,6 +243,7 @@ pub fn is_scanned(store: &Path, chunk: &str) -> bool {
 ///
 /// The index is written last, so an interrupted scan is redone rather than half-trusted.
 pub fn store_chunk(store: &Path, chunk: &str, files: &ChunkFiles) -> io::Result<StoreStats> {
+    let _lock = lock_store(store)?;
     let mut stats = StoreStats::default();
     let mut lines = Vec::new();
     for file in &files.files {
@@ -161,6 +262,7 @@ pub fn store_chunk(store: &Path, chunk: &str, files: &ChunkFiles) -> io::Result<
                     write_atomic(&store.join("res").join(name), data)?;
                     stats.res_bytes += data.len();
                     stored.push(name.clone());
+                    rec.resource_sizes.insert(name.clone(), data.len() as u64);
                 }
             }
         }
@@ -281,25 +383,106 @@ impl CabSource {
     }
 }
 
-/// Delete stored files that the current relevance rules would not keep. Returns bytes freed.
+/// Delete stored files that the current relevance rules no longer keep. Records are grouped
+/// by CAB (a CAB can appear in several chunks): a file is kept if any record keeps it.
+/// Returns bytes freed.
 pub fn prune(store: &Path) -> io::Result<u64> {
+    let _lock = lock_store(store)?;
+    let (sf, res) = prune_plan(&read_index(store)?);
     let mut freed = 0u64;
-    for rec in read_index(store)? {
-        let mut doomed = Vec::new();
-        if !is_rig_relevant(&rec.classes, &rec.containers) {
-            doomed.push(store.join("sf").join(&rec.cab));
-        }
-        if !keeps_resources(&rec.classes, &rec.containers)
-            || !is_rig_relevant(&rec.classes, &rec.containers)
-        {
-            doomed.extend(rec.resources.iter().map(|r| store.join("res").join(r)));
-        }
-        for path in doomed {
-            if let Ok(meta) = fs::metadata(&path) {
-                fs::remove_file(&path)?;
-                freed += meta.len();
-            }
+    let paths = sf
+        .iter()
+        .map(|cab| store.join("sf").join(cab))
+        .chain(res.iter().map(|r| store.join("res").join(r)));
+    for path in paths {
+        if let Ok(meta) = fs::metadata(&path) {
+            fs::remove_file(&path)?;
+            freed += meta.len();
         }
     }
     Ok(freed)
+}
+
+/// SerializedFiles and resource streams no record keeps: `(sf cabs, res names)`.
+#[must_use]
+pub fn prune_plan(records: &[CabRecord]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut keep_sf: HashMap<&str, bool> = HashMap::new();
+    let mut keep_res: HashMap<&str, bool> = HashMap::new();
+    for rec in records {
+        let relevant = is_rig_relevant(&rec.classes, &rec.containers);
+        *keep_sf.entry(&rec.cab).or_default() |= relevant;
+        let resources = relevant && keeps_resources(&rec.classes, &rec.containers);
+        for r in &rec.resources {
+            *keep_res.entry(r).or_default() |= resources;
+        }
+    }
+    let unkept = |m: HashMap<&str, bool>| -> BTreeSet<String> {
+        m.into_iter()
+            .filter(|(_, keep)| !keep)
+            .map(|(k, _)| k.to_string())
+            .collect()
+    };
+    (unkept(keep_sf), unkept(keep_res))
+}
+
+/// Outcome of [`repair`].
+#[derive(Debug, Default)]
+pub struct RepairReport {
+    pub checked: usize,
+    /// CABs whose stored files were damaged and removed.
+    pub removed: Vec<String>,
+    /// Chunks whose index was removed so the next scan re-stores them.
+    pub requeued: BTreeSet<String>,
+}
+
+fn sf_intact(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|d| SerializedFile::parse(d).ok())
+        .is_some_and(|sf| sf.objects.iter().all(|o| sf.object_bytes(o).is_ok()))
+}
+
+/// Check stored files against the index: sizes must match a record of the CAB, and CABs
+/// listed by several chunks (possibly written concurrently) must parse with every object in
+/// bounds. Damaged files are removed and one chunk holding the CAB is re-queued (its index
+/// is deleted, so the next `scan` downloads and stores it again).
+pub fn repair(store: &Path) -> io::Result<RepairReport> {
+    let _lock = lock_store(store)?;
+    let mut by_cab: BTreeMap<String, Vec<CabRecord>> = BTreeMap::new();
+    for rec in read_index(store)? {
+        by_cab.entry(rec.cab.clone()).or_default().push(rec);
+    }
+    let mut report = RepairReport::default();
+    for (cab, recs) in &by_cab {
+        let sf_path = store.join("sf").join(cab);
+        let Ok(meta) = fs::metadata(&sf_path) else {
+            continue;
+        };
+        report.checked += 1;
+        let size_ok = recs.iter().any(|r| r.sf_size as u64 == meta.len());
+        let shared = recs.iter().map(|r| &r.chunk).collect::<BTreeSet<_>>().len() > 1;
+        let parses = !shared || sf_intact(&sf_path);
+        let res_ok = recs.iter().flat_map(|r| r.resources.iter()).all(|name| {
+            let sizes: Vec<u64> = recs
+                .iter()
+                .filter_map(|r| r.resource_sizes.get(name).copied())
+                .collect();
+            sizes.is_empty()
+                || fs::metadata(store.join("res").join(name))
+                    .is_ok_and(|m| sizes.contains(&m.len()))
+        });
+        if size_ok && parses && res_ok {
+            continue;
+        }
+        let _ = fs::remove_file(&sf_path);
+        for name in recs.iter().flat_map(|r| r.resources.iter()) {
+            let _ = fs::remove_file(store.join("res").join(name));
+        }
+        if let Some(chunk) = recs.iter().map(|r| r.chunk.clone()).min() {
+            let _ = fs::remove_file(chunk_index_path(store, &chunk));
+            report.requeued.insert(chunk);
+        }
+        report.removed.push(cab.clone());
+    }
+    Ok(report)
 }
