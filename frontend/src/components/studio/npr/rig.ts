@@ -8,9 +8,10 @@ import {
 	Color,
 	DepthTexture,
 	type IUniform,
+	LessEqualCompare,
+	LinearFilter,
 	MathUtils,
 	Matrix4,
-	NearestFilter,
 	UnsignedShortType,
 	Vector2,
 	Vector3,
@@ -192,7 +193,11 @@ export interface ShadowUniforms {
 
 let shadowTarget: WebGLRenderTarget | null = null;
 
-/** The self-shadow depth map (compared manually in the shader). */
+/**
+ * The self-shadow depth map. The texture compares on sampling (a
+ * `sampler2DShadow` with linear filtering), so every tap is already a
+ * bilinear blend of four depth tests.
+ */
 export function getShadowTarget(): WebGLRenderTarget {
 	if (shadowTarget) return shadowTarget;
 	const depth = new DepthTexture(
@@ -200,8 +205,9 @@ export function getShadowTarget(): WebGLRenderTarget {
 		SHADOW_MAP_SIZE,
 		UnsignedShortType,
 	);
-	depth.minFilter = NearestFilter;
-	depth.magFilter = NearestFilter;
+	depth.minFilter = LinearFilter;
+	depth.magFilter = LinearFilter;
+	depth.compareFunction = LessEqualCompare;
 	shadowTarget = new WebGLRenderTarget(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, {
 		depthTexture: depth,
 		depthBuffer: true,

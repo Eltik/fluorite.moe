@@ -24,6 +24,7 @@ import {
 	ZeroFactor,
 } from "three";
 import { extrasOf, nprKind } from "@/components/studio/npr/extras";
+import { isNprMaterial } from "@/components/studio/npr/material";
 import {
 	getShadowTarget,
 	rigUniforms,
@@ -68,6 +69,30 @@ const point = new Vector3();
 const centre = new Vector3();
 const eye = new Vector3();
 
+/**
+ * Opaque skin / hair / cloth meshes cast. The mesh may already wear its NPR
+ * variant (which carries no extras), so the original material is consulted
+ * too; VFX, overlays and transparent passes never cast.
+ */
+function casts(mesh: Mesh): boolean {
+	const current = Array.isArray(mesh.material)
+		? mesh.material
+		: [mesh.material];
+	const shading = mesh.userData.studioShading as
+		| { standard: Material | Material[] }
+		| undefined;
+	const original = shading
+		? Array.isArray(shading.standard)
+			? shading.standard
+			: [shading.standard]
+		: current;
+	return current.some((m: Material, i) => {
+		const source = original[i] ?? original[0];
+		const npr = isNprMaterial(m) || nprKind(extrasOf(source)?.shader) !== null;
+		return npr && !m.transparent;
+	});
+}
+
 export class SelfShadow {
 	private readonly camera = new OrthographicCamera(-1, 1, 1, -1, 0, 10);
 	private readonly caster = new MeshDepthMaterial({ side: DoubleSide });
@@ -81,14 +106,7 @@ export class SelfShadow {
 		root.traverse((node) => {
 			const mesh = node as SkinnedMesh;
 			if (!mesh.isMesh || mesh.userData.studioOutline) return;
-			const mats = Array.isArray(mesh.material)
-				? mesh.material
-				: [mesh.material];
-			const casts = mats.some(
-				(m: Material) =>
-					nprKind(extrasOf(m)?.shader) !== null && !m.transparent,
-			);
-			if (!casts) return;
+			if (!casts(mesh)) return;
 			mesh.layers.enable(CASTER_LAYER);
 			this.casters.push(mesh);
 			for (const b of mesh.skeleton?.bones ?? []) {

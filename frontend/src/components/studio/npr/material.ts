@@ -264,11 +264,20 @@ export function createNprMaterial(
 	return material;
 }
 
-/** Iris and brows: unlit, through the same tone curve. */
-export function createEyeMaterial(source: Material): MeshBasicMaterial {
+/**
+ * Unlit albedo through the game's tone curve. This is both the iris / brow
+ * look in toon mode and, with `exposure`, the whole character in the
+ * Standard mode (the game's menu renders no lighting there either, only the
+ * tone curve over the base colour).
+ */
+export function createUnlitMaterial(
+	source: Material,
+	options: { exposure?: boolean } = {},
+): MeshBasicMaterial {
 	const s = source as MeshStandardMaterial;
+	const exposure = options.exposure === true;
 	const material = new MeshBasicMaterial({
-		name: `${source.name || "material"} (eye)`,
+		name: `${source.name || "material"} (${exposure ? "flat" : "eye"})`,
 		map: s.map ?? null,
 		color: s.color?.clone() ?? new Color(1, 1, 1),
 		alphaTest: s.alphaTest,
@@ -276,18 +285,33 @@ export function createEyeMaterial(source: Material): MeshBasicMaterial {
 		opacity: s.opacity,
 		side: s.side,
 		depthWrite: s.depthWrite,
+		// The renderer's tone mapping is bypassed; the curve below is applied
+		// instead. With `toneMapped` off three omits its exposure declaration,
+		// so it is declared here; the renderer still uploads the value.
 		toneMapped: false,
 	});
+	const input = exposure
+		? "gl_FragColor.rgb * toneMappingExposure"
+		: "gl_FragColor.rgb";
+	const declare = exposure ? "uniform float toneMappingExposure;\n" : "";
 	material.onBeforeCompile = (shader) => {
 		shader.fragmentShader = shader.fragmentShader
-			.replace("#include <common>", `#include <common>\n${TONE_CURVE_GLSL}`)
+			.replace(
+				"#include <common>",
+				`#include <common>\n${declare}${TONE_CURVE_GLSL}`,
+			)
 			.replace(
 				"#include <tonemapping_fragment>",
-				"gl_FragColor.rgb = nprToneMap(gl_FragColor.rgb);",
+				`gl_FragColor.rgb = nprToneMap(${input});`,
 			);
 	};
-	material.customProgramCacheKey = () => "npr-eye";
+	material.customProgramCacheKey = () => (exposure ? "npr-flat" : "npr-eye");
 	return material;
+}
+
+/** Iris and brows: unlit, through the same tone curve. */
+export function createEyeMaterial(source: Material): MeshBasicMaterial {
+	return createUnlitMaterial(source);
 }
 
 export function isNprMaterial(material: Material): material is ShaderMaterial {

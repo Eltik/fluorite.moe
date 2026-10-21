@@ -1,7 +1,9 @@
 /**
  * Studio shading modes for loaded models.
  *
- * - Standard: the loader's PBR-ish MeshStandardMaterial (or the GLB's own).
+ * - Standard: character materials (`HGRP/CharacterNPR*` extras) go unlit
+ *   through the game's tone curve, which is what the game's menu shows with
+ *   toon shading off; anything else keeps the loader's MeshStandardMaterial.
  * - Toon: materials that carry `HGRP/CharacterNPR*` extras get the in-game
  *   NPR material (see `npr/`), eyes go unlit, and skinned meshes get an
  *   inverted-hull outline on averaged normals. Anything else (static parts,
@@ -37,6 +39,7 @@ import {
 import {
 	createEyeMaterial,
 	createNprMaterial,
+	createUnlitMaterial,
 	type NprUserData,
 	wantsFaceFrame,
 } from "@/components/studio/npr/material";
@@ -83,6 +86,8 @@ const NO_OUTLINE =
 interface ShadingData {
 	standard: Material | Material[];
 	toon?: Material | Material[];
+	/** Standard mode for character materials: unlit, tone mapped (as in the game's menu). */
+	flat?: Material | Material[];
 	outline?: ThreeMesh | null;
 	/** Head axes for SDF-lit skin; `null` once tried and not applicable. */
 	face?: FaceFrame | null;
@@ -246,6 +251,33 @@ function buildToonVariant(
 	return Array.isArray(standard) ? standard.map(build) : build(standard);
 }
 
+/** Standard mode: NPR character materials go unlit; anything else keeps its PBR material. */
+function buildFlatVariant(
+	standard: Material | Material[],
+): Material | Material[] {
+	const build = (source: Material): Material => {
+		const shader = extrasOf(source)?.shader;
+		return nprKind(shader) !== null || isEyeShader(shader)
+			? createUnlitMaterial(source, { exposure: true })
+			: source;
+	};
+	return Array.isArray(standard) ? standard.map(build) : build(standard);
+}
+
+/**
+ * The exporter currently writes vertex normals that sit ~40° off the mesh
+ * geometry (the game's, like warfarin's, are within a few degrees of the
+ * recomputed ones), which breaks every N·L-driven ramp. Until the exporter
+ * is fixed, rebuild them from the triangles for lit character meshes.
+ */
+function repairNormals(mesh: Mesh, sources: Material[]): void {
+	const g = mesh.geometry;
+	if (g.userData.normalsRepaired) return;
+	if (!sources.some((m) => nprKind(extrasOf(m)?.shader) !== null)) return;
+	g.computeVertexNormals();
+	g.userData.normalsRepaired = true;
+}
+
 /** Render queue from the extras of the mesh's (first) material, or -1. */
 function renderQueueOf(materials: Material[]): number {
 	for (const m of materials) {
@@ -284,17 +316,19 @@ export function applyShading(
 		const sources = Array.isArray(data.standard)
 			? data.standard
 			: [data.standard];
+		repairNormals(mesh, sources);
+		const queue = renderQueueOf(sources);
 		if (mode === "toon") {
 			if (!data.toon) {
 				data.npr = hasNprExtras(sources);
 				data.toon = buildToonVariant(mesh, data);
 			}
 			mesh.material = data.toon;
-			const queue = renderQueueOf(sources);
 			mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
 		} else {
-			mesh.material = data.standard;
-			mesh.renderOrder = data.renderOrder;
+			data.flat ??= buildFlatVariant(data.standard);
+			mesh.material = data.flat;
+			mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
 		}
 		const wantOutline = mode === "toon" && outlines && !wireframe;
 		if (wantOutline && data.outline === undefined) {
@@ -334,12 +368,12 @@ export function disposeShading(root: Object3D): void {
 	for (const mesh of meshesOf(root)) {
 		const data = mesh.userData.studioShading;
 		if (!data) continue;
-		const toon = data.toon;
-		if (toon) {
-			const originals = new Set(
-				Array.isArray(data.standard) ? data.standard : [data.standard],
-			);
-			for (const m of Array.isArray(toon) ? toon : [toon]) {
+		const originals = new Set(
+			Array.isArray(data.standard) ? data.standard : [data.standard],
+		);
+		for (const variant of [data.toon, data.flat]) {
+			if (!variant) continue;
+			for (const m of Array.isArray(variant) ? variant : [variant]) {
 				if (!originals.has(m)) m.dispose();
 			}
 		}

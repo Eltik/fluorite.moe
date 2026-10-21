@@ -123,13 +123,41 @@ varying vec3 vPosW;
 
 ${""}`;
 
-/** Depth-map lookup shared by the surface shader and the ground receiver. */
+/**
+ * Depth-map lookup shared by the surface shader and the ground receiver. The
+ * map is a comparison sampler (hardware PCF), filtered with a 5×5-texel tent
+ * collapsed into 3×3 bilinear taps, which gives the soft painted penumbra
+ * of the game instead of a stepped edge.
+ */
 const SELF_SHADOW_GLSL = /* glsl */ `
-uniform highp sampler2D uShadowMap;
+uniform highp sampler2DShadow uShadowMap;
 uniform mat4 uShadowMatrix;
 uniform vec2 uShadowBias;
 uniform float uShadowTexel;
 uniform float uShadowOn;
+
+/** Area of the 5-texel tent (half-width 2.5, normalised to 1) left of x. */
+float tentCdf(float x) {
+	x = clamp(x, -2.5, 2.5);
+	return (2.5 * x - 0.5 * x * abs(x) + 3.125) / 6.25;
+}
+
+/**
+ * Collapses the five tent-weighted texels along one axis into three bilinear
+ * taps (weights w, texel offsets o from the nearest centre) for a sample that
+ * sits f texels (−0.5…0.5) from that centre.
+ */
+void tentTaps(float f, out vec3 w, out vec3 o) {
+	float w2n = tentCdf(-1.5 - f) - tentCdf(-2.5 - f);
+	float w1n = tentCdf(-0.5 - f) - tentCdf(-1.5 - f);
+	float w0 = tentCdf(0.5 - f) - tentCdf(-0.5 - f);
+	float w1p = tentCdf(1.5 - f) - tentCdf(0.5 - f);
+	float w2p = tentCdf(2.5 - f) - tentCdf(1.5 - f);
+	float wa = w2n + w1n;
+	float wc = w1p + w2p;
+	w = vec3(wa, w0, wc) / (wa + w0 + wc);
+	o = vec3(-(2.0 * w2n + w1n) / max(wa, 1e-5), 0.0, (w1p + 2.0 * w2p) / max(wc, 1e-5));
+}
 
 /** 1 lit, 0 shadowed; outside the map everything is lit. */
 float selfShadow(vec3 P, vec3 N, vec3 L) {
@@ -138,15 +166,26 @@ float selfShadow(vec3 P, vec3 N, vec3 L) {
 	vec3 p = P + L * (uShadowBias.x * k) + N * (uShadowBias.y * k);
 	vec4 sc = uShadowMatrix * vec4(p, 1.0);
 	vec3 c = sc.xyz / sc.w;
-	if (c.x < 0.0 || c.x > 1.0 || c.y < 0.0 || c.y > 1.0 || c.z > 1.0) return 1.0;
-	float sum = 0.0;
-	for (int x = -1; x <= 1; x++) {
-		for (int y = -1; y <= 1; y++) {
-			float d = texture2D(uShadowMap, c.xy + vec2(float(x), float(y)) * uShadowTexel).r;
-			sum += step(c.z, d);
+	if (c.x <= 0.0 || c.x >= 1.0 || c.y <= 0.0 || c.y >= 1.0 || c.z >= 1.0) return 1.0;
+	float z = max(c.z, 0.0);
+	// Texel-centre coordinates (centres on integers).
+	vec2 t = c.xy / uShadowTexel - 0.5;
+	vec2 base = floor(t + 0.5);
+	vec2 f = t - base;
+	vec3 wx;
+	vec3 ox;
+	vec3 wy;
+	vec3 oy;
+	tentTaps(f.x, wx, ox);
+	tentTaps(f.y, wy, oy);
+	float lit = 0.0;
+	for (int j = 0; j < 3; j++) {
+		for (int i = 0; i < 3; i++) {
+			vec2 uv = (base + vec2(ox[i], oy[j]) + 0.5) * uShadowTexel;
+			lit += wx[i] * wy[j] * texture(uShadowMap, vec3(uv, z));
 		}
 	}
-	return sum / 9.0;
+	return lit;
 }
 `;
 
