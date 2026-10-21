@@ -9,8 +9,10 @@ import {
 	featuredGroups,
 	filterClips,
 	groupBySource,
+	holdAtRest,
 	parseClipIndex,
 	sourceFromName,
+	travelFromRest,
 } from "@/lib/clips";
 
 function entry(
@@ -131,6 +133,21 @@ describe("parseClipIndex", () => {
 		expect(parsed[1].duration).toBe(0);
 		expect(parsed[1].loop).toBe(false);
 		expect(parsed[1].rootMotion).toBeUndefined();
+	});
+
+	test("keeps the root node of a clip that holds it off rest", () => {
+		const [entry] = parseClipIndex([
+			{
+				file: "a_actor_jsspsi_uiteam_idle_01.glb",
+				rootMotion: false,
+				rootNode: "Root",
+				rootStart: [-0.9333, 0, -1.1749],
+				rootEnd: [-0.9333, 0, -1.1749],
+			},
+		]);
+		expect(entry.rootMotion).toBeUndefined();
+		expect(entry.rootNode).toBe("Root");
+		expect(entry.rootStart).toEqual([-0.9333, 0, -1.1749]);
 	});
 
 	test("ignores non-array payloads", () => {
@@ -315,5 +332,35 @@ describe("defaultClip", () => {
 				?.name,
 		).toBe("skill01");
 		expect(defaultClip([])).toBeUndefined();
+	});
+});
+
+describe("root placement", () => {
+	// Si's Team Pose 1: the generic root bone parks at the lineup slot.
+	const parked = [-0.9333, 0, -1.1749, -0.9333, 0, -1.1749];
+	// A clip that travels 0.46 m forward from 0.46 m and hops 0.2 m.
+	const travel = [0, 0, 0.4564, 0.1, 0.2, 0.9127];
+
+	test("in place holds the ground position at rest and keeps height", () => {
+		expect(Array.from(holdAtRest(parked, [0, 0, 0]))).toEqual([
+			0, 0, 0, 0, 0, 0,
+		]);
+		const held = Array.from(holdAtRest(travel, [0, 0, 0]));
+		expect(held[1]).toBe(0);
+		expect(held[4]).toBeCloseTo(0.2);
+		expect([held[0], held[2], held[3], held[5]]).toEqual([0, 0, 0, 0]);
+	});
+
+	test("root motion travels by the clip's delta from rest", () => {
+		const moved = Array.from(travelFromRest(travel, [0, 0, 0]));
+		expect(moved[0]).toBeCloseTo(0);
+		expect(moved[2]).toBeCloseTo(0);
+		expect(moved[3]).toBeCloseTo(0.1);
+		expect(moved[4]).toBeCloseTo(0.2);
+		expect(moved[5]).toBeCloseTo(0.4563);
+		// A parked root has no delta, so it stands at rest too.
+		expect(Array.from(travelFromRest(parked, [0, 0, 0]))).toEqual([
+			0, 0, 0, 0, 0, 0,
+		]);
 	});
 });

@@ -46,6 +46,11 @@ export interface ClipEntry {
 	size?: number;
 	/** The clip moves `rootNode` from `rootStart` to `rootEnd`. */
 	rootMotion?: boolean;
+	/**
+	 * The node that carries the clip's travel: the Animator's node for
+	 * humanoid clips, the Avatar's root motion bone (`Root`) for generic ones.
+	 * Playing in place holds it at its rest position.
+	 */
 	rootNode?: string;
 	rootStart?: Vec3;
 	rootEnd?: Vec3;
@@ -130,13 +135,57 @@ export function parseClipIndex(json: unknown): ClipEntry[] {
 		if (matched !== undefined) entry.matched = matched;
 		const size = num(r.size);
 		if (size !== undefined) entry.size = size;
-		if (r.rootMotion === true && typeof r.rootNode === "string") {
-			entry.rootMotion = true;
+		// The root node is kept for clips that hold it away from its rest
+		// position without moving it (team poses stand at their lineup slot),
+		// so playing in place can pin those too.
+		if (typeof r.rootNode === "string" && r.rootNode) {
+			if (r.rootMotion === true) entry.rootMotion = true;
 			entry.rootNode = r.rootNode;
-			entry.rootStart = vec3(r.rootStart);
-			entry.rootEnd = vec3(r.rootEnd);
+			const start = vec3(r.rootStart);
+			if (start) entry.rootStart = start;
+			const end = vec3(r.rootEnd);
+			if (end) entry.rootEnd = end;
 		}
 		out.push(entry);
+	}
+	return out;
+}
+
+// ------------------------------------------------------------- root placement
+
+/**
+ * Root positions (flat `x, y, z` keys) held at the rest ground position: x
+ * and z become the rest's, y keeps the clip's height. How a clip plays in
+ * place, including one that parks its root off rest without moving it.
+ */
+export function holdAtRest(
+	values: ArrayLike<number>,
+	rest: Vec3,
+): Float32Array {
+	const out = Float32Array.from(values);
+	for (let i = 0; i + 2 < out.length; i += 3) {
+		out[i] = rest[0];
+		out[i + 2] = rest[2];
+	}
+	return out;
+}
+
+/**
+ * Root positions moved so the clip's ground travel starts at the rest
+ * position (the game applies root motion as a delta from where the model
+ * stands); y keeps the clip's height.
+ */
+export function travelFromRest(
+	values: ArrayLike<number>,
+	rest: Vec3,
+): Float32Array {
+	const out = Float32Array.from(values);
+	if (out.length < 3) return out;
+	const dx = rest[0] - out[0];
+	const dz = rest[2] - out[2];
+	for (let i = 0; i + 2 < out.length; i += 3) {
+		out[i] += dx;
+		out[i + 2] += dz;
 	}
 	return out;
 }

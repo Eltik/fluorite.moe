@@ -16,10 +16,18 @@ import {
 	LoopOnce,
 	LoopRepeat,
 	type Object3D,
+	PropertyBinding,
 	VectorKeyframeTrack,
 } from "three";
 import type { ClipLibrary } from "@/components/studio/clip-library";
-import { type ClipEntry, clipStem, defaultClip } from "@/lib/clips";
+import {
+	type ClipEntry,
+	clipStem,
+	defaultClip,
+	holdAtRest,
+	travelFromRest,
+	type Vec3,
+} from "@/lib/clips";
 import {
 	crossed,
 	defaultEntry,
@@ -65,8 +73,11 @@ export class AnimationController {
 	private readonly root: Object3D;
 	private action: AnimationAction | null = null;
 	private current: { entry: ClipEntry; clip: AnimationClip } | null = null;
-	/** In-place variants of root-motion clips, built once per clip. */
+	/** Rest position of each root node, captured before anything plays. */
+	private readonly rest = new Map<string, Vec3>();
+	/** Root-placed variants of clips per root-motion mode, built once per clip. */
 	private readonly inPlace = new Map<AnimationClip, AnimationClip>();
+	private readonly travelling = new Map<AnimationClip, AnimationClip>();
 	/** Actions fading out; stopped and uncached once their weight hits zero. */
 	private retiring: AnimationAction[] = [];
 	private selectToken = 0;
@@ -104,6 +115,15 @@ export class AnimationController {
 			this.byFile.set(e.file, e);
 		}
 		this.hasRootMotion = this.entries.some((e) => e.rootMotion);
+		for (const e of this.entries) {
+			if (!e.rootNode || this.rest.has(e.rootNode)) continue;
+			// Resolved the way the mixer binds `<rootNode>.position`.
+			const node = PropertyBinding.findNode(
+				root,
+				e.rootNode,
+			) as Object3D | null;
+			if (node?.isObject3D) this.rest.set(e.rootNode, node.position.toArray());
+		}
 		this.menu = options.menu ?? null;
 		this.snapshot = {
 			...this.snapshot,
@@ -294,9 +314,7 @@ export class AnimationController {
 		time: number,
 		fade: number = FADE,
 	): void {
-		const playable = this.snapshot.rootMotion
-			? clip
-			: this.inPlaceVariant(entry, clip);
+		const playable = this.placed(entry, clip, this.snapshot.rootMotion);
 		const next = this.mixer.clipAction(playable);
 		const prev = this.action;
 		const loop = this.snapshot.loop;
@@ -335,28 +353,48 @@ export class AnimationController {
 		});
 	}
 
-	/** The clip with its root translation pinned to `rootStart`. */
-	private inPlaceVariant(entry: ClipEntry, clip: AnimationClip): AnimationClip {
-		if (!entry.rootMotion || !entry.rootNode) return clip;
-		const cached = this.inPlace.get(clip);
+	/**
+	 * The clip as it plays in the current root-motion mode. The root node's
+	 * ground position (x, z) starts where the model stands, as the game's
+	 * Animator applies root motion: in place it stays there; with root motion
+	 * it travels from there by the clip's own delta. Height is the clip's,
+	 * so jumps and airborne poses keep it. Clips whose root sits off its rest
+	 * position without moving (team poses stand at their lineup slot) are
+	 * planted too.
+	 */
+	private placed(
+		entry: ClipEntry,
+		clip: AnimationClip,
+		rootMotion: boolean,
+	): AnimationClip {
+		const node = entry.rootNode;
+		if (!node) return clip;
+		const cache = rootMotion ? this.travelling : this.inPlace;
+		const cached = cache.get(clip);
 		if (cached) return cached;
-		const name = `${entry.rootNode}.position`;
+		const name = `${node}.position`;
 		const index = clip.tracks.findIndex((t) => t.name === name);
-		if (index < 0) {
-			this.inPlace.set(clip, clip);
+		const rest = this.rest.get(node);
+		if (index < 0 || !rest) {
+			cache.set(clip, clip);
 			return clip;
 		}
 		const track = clip.tracks[index];
-		const start =
-			entry.rootStart ?? (Array.from(track.values.slice(0, 3)) as number[]);
+		const values = rootMotion
+			? travelFromRest(track.values, rest)
+			: holdAtRest(track.values, rest);
 		const tracks = [...clip.tracks];
-		tracks[index] = new VectorKeyframeTrack(name, [0], start);
+		tracks[index] = new VectorKeyframeTrack(
+			name,
+			Array.from(track.times),
+			Array.from(values),
+		);
 		const variant = new AnimationClip(
-			`${clip.name}:inplace`,
+			`${clip.name}:${rootMotion ? "travel" : "inplace"}`,
 			clip.duration,
 			tracks,
 		);
-		this.inPlace.set(clip, variant);
+		cache.set(clip, variant);
 		return variant;
 	}
 
@@ -459,7 +497,7 @@ export class AnimationController {
 	setRootMotion(rootMotion: boolean): void {
 		if (rootMotion === this.snapshot.rootMotion) return;
 		this.set({ rootMotion });
-		if (!this.current || !this.current.entry.rootMotion) return;
+		if (!this.current?.entry.rootNode) return;
 		const { entry, clip } = this.current;
 		this.start(entry, clip, this.snapshot.playing, this.time);
 	}
@@ -513,6 +551,7 @@ export class AnimationController {
 		this.mixer.uncacheRoot(this.root);
 		this.retiring = [];
 		this.inPlace.clear();
+		this.travelling.clear();
 		this.action = null;
 		this.current = null;
 		this.listeners.clear();

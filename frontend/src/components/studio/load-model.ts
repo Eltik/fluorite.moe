@@ -492,9 +492,30 @@ function lodOfNode(mesh: Mesh): number | undefined {
 	return m ? Number(m[1]) : undefined;
 }
 
-/** Game-side helpers that never draw in the menu: LODs, shadow proxies, overlays, VFX. */
-function isHiddenCharacterMesh(mesh: Mesh, lod: number | undefined): boolean {
+/**
+ * Whether the exporter marked the mesh, or a node above it, as inactive in
+ * the prefab (`extras.active === false`): renderers the game switches on
+ * only for an effect, like Si's top-potential `vfxpart_*` meshes. A
+ * multi-material mesh carries the flag on its group node.
+ */
+export function isInactiveNode(node: Object3D, root: Object3D): boolean {
+	for (let o: Object3D | null = node; o && o !== root; o = o.parent) {
+		if (o.userData.active === false) return true;
+	}
+	return false;
+}
+
+/**
+ * Game-side helpers that never draw in the menu: inactive renderers, LODs,
+ * shadow proxies, overlays, VFX.
+ */
+function isHiddenCharacterMesh(
+	mesh: Mesh,
+	lod: number | undefined,
+	root: Object3D,
+): boolean {
 	if ((lod ?? 0) > 0 || SHADOW_PROXY.test(mesh.name)) return true;
+	if (isInactiveNode(mesh, root)) return true;
 	const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
 	return mats.some((m) => {
 		const shader = extrasOf(m)?.shader;
@@ -555,7 +576,7 @@ async function loadRigged(
 				object: mesh,
 				status: "embedded",
 				triangles: triangleCount(mesh),
-				hiddenByDefault: isHiddenCharacterMesh(mesh, lod),
+				hiddenByDefault: isHiddenCharacterMesh(mesh, lod, content),
 			});
 		});
 		// With a clip index the GLB's own clips (humanoid idles that don't
