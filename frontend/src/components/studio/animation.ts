@@ -4,6 +4,10 @@
  * selected; selection crossfades from whatever is playing. The canvas drives
  * `update()` from useFrame while playing; everything else is imperative so
  * the overlay can scrub without re-rendering the scene graph.
+ *
+ * With a menu state machine (`lib/menu`), moments play their state and the
+ * controller follows the machine's automatic exits (overview start → loop)
+ * with the game's crossfade, exit time and offset.
  */
 import {
 	type AnimationAction,
@@ -16,6 +20,15 @@ import {
 } from "three";
 import type { ClipLibrary } from "@/components/studio/clip-library";
 import { type ClipEntry, clipStem, defaultClip } from "@/lib/clips";
+import {
+	crossed,
+	defaultEntry,
+	type MenuMachine,
+	type MomentPlan,
+	nextExit,
+	planMoment,
+	upcomingClips,
+} from "@/lib/menu";
 
 export const FRAME = 1 / 30;
 export const SPEEDS = [0.25, 0.5, 1, 1.5, 2] as const;
@@ -35,12 +48,18 @@ export interface AnimationState {
 	duration: number;
 	/** Let clips with root motion travel instead of holding in place. */
 	rootMotion: boolean;
+	/** The menu moment being played, while the state machine drives clips. */
+	moment: string | null;
+	/** The menu state currently playing (null for a raw clip). */
+	menuState: string | null;
 }
 
 export class AnimationController {
 	readonly entries: readonly ClipEntry[];
 	readonly hasRootMotion: boolean;
+	readonly menu: MenuMachine | null;
 	private readonly byStem = new Map<string, ClipEntry>();
+	private readonly byFile = new Map<string, ClipEntry>();
 	private readonly library: ClipLibrary;
 	private readonly mixer: AnimationMixer;
 	private readonly root: Object3D;
@@ -53,6 +72,10 @@ export class AnimationController {
 	private selectToken = 0;
 	private disposed = false;
 	private listeners = new Set<() => void>();
+	/** Clip time at the previous tick, for exit detection (-1 = just entered). */
+	private prevTime = -1;
+	/** A moment waiting for the current clip to reach its `at` time. */
+	private pending: (MomentPlan & { moment: string }) | null = null;
 	private snapshot: AnimationState = {
 		clip: null,
 		loading: null,
@@ -62,6 +85,8 @@ export class AnimationController {
 		loop: true,
 		duration: 0,
 		rootMotion: false,
+		moment: null,
+		menuState: null,
 	};
 	/** Set by the canvas so imperative changes trigger a frame. */
 	invalidate: () => void = () => {};
@@ -69,13 +94,17 @@ export class AnimationController {
 	constructor(
 		root: Object3D,
 		library: ClipLibrary,
-		options: { rootMotion?: boolean } = {},
+		options: { rootMotion?: boolean; menu?: MenuMachine | null } = {},
 	) {
 		this.root = root;
 		this.library = library;
 		this.entries = library.entries;
-		for (const e of this.entries) this.byStem.set(clipStem(e.file), e);
+		for (const e of this.entries) {
+			this.byStem.set(clipStem(e.file), e);
+			this.byFile.set(e.file, e);
+		}
 		this.hasRootMotion = this.entries.some((e) => e.rootMotion);
+		this.menu = options.menu ?? null;
 		this.snapshot = {
 			...this.snapshot,
 			rootMotion: options.rootMotion ?? false,
@@ -99,6 +128,16 @@ export class AnimationController {
 		return this.byStem.get(stem);
 	}
 
+	/** The entry for a clip file name (as menu states and tracks name them). */
+	entryByFile(file: string): ClipEntry | undefined {
+		return this.byFile.get(file);
+	}
+
+	/** The entry currently playing, if any. */
+	get currentEntry(): ClipEntry | null {
+		return this.current?.entry ?? null;
+	}
+
 	subscribe = (listener: () => void): (() => void) => {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
@@ -120,14 +159,99 @@ export class AnimationController {
 		if (entry) this.library.prefetch(entry);
 	}
 
+	/** Warms the cache for the clips a menu state can lead to. */
+	private prefetchUpcoming(state: string): void {
+		if (!this.menu) return;
+		for (const file of upcomingClips(this.menu, state)) {
+			const entry = this.byFile.get(file);
+			if (entry) this.library.prefetch(entry);
+		}
+	}
+
 	/**
 	 * Fetches the clip (from cache when possible) and crossfades to it.
 	 * Resolves false when the stem is unknown, the load failed, or a later
-	 * selection superseded this one.
+	 * selection superseded this one. Leaves the menu state machine.
 	 */
 	async select(stem: string, autoplay = true): Promise<boolean> {
 		const entry = this.byStem.get(stem);
 		if (!entry || this.disposed) return false;
+		this.pending = null;
+		return this.swapTo(entry, {
+			autoplay,
+			time: 0,
+			fade: FADE,
+			loop: entry.loop,
+			moment: null,
+			menuState: null,
+		});
+	}
+
+	/**
+	 * Plays a menu moment: its state, then whatever the machine exits into.
+	 * When the game would wait for the current loop to reach a point first
+	 * (`from` + `on`), the moment is queued and starts there.
+	 */
+	async selectMoment(id: string): Promise<boolean> {
+		if (!this.menu || this.disposed) return false;
+		const plan = planMoment(this.menu, id, this.snapshot.menuState);
+		if (!plan) return false;
+		if (plan.at !== null && this.action && this.snapshot.playing) {
+			this.pending = { ...plan, moment: id };
+			this.set({ moment: id });
+			const file = this.menu.states[plan.state]?.clip;
+			const entry = file ? this.byFile.get(file) : undefined;
+			if (entry) this.library.prefetch(entry);
+			return true;
+		}
+		this.pending = null;
+		return this.enterState(plan.state, plan.fade, plan.offset, id);
+	}
+
+	/** The moment (or bare state) the machine opens on, if any. */
+	playDefaultMoment(): Promise<boolean> {
+		if (!this.menu) return Promise.resolve(false);
+		const entry = defaultEntry(this.menu);
+		if (!entry) return Promise.resolve(false);
+		if (entry.moment) return this.selectMoment(entry.moment.id);
+		return this.enterState(entry.state, FADE, 0, null);
+	}
+
+	private async enterState(
+		name: string,
+		fade: number,
+		offset: number,
+		moment: string | null,
+	): Promise<boolean> {
+		const menu = this.menu;
+		const state = menu?.states[name];
+		const entry = state?.clip ? this.byFile.get(state.clip) : undefined;
+		if (!menu || !state || !entry) return false;
+		const ok = await this.swapTo(entry, {
+			autoplay: true,
+			time: offset,
+			fade,
+			loop: state.loop,
+			moment,
+			menuState: name,
+		});
+		if (ok) this.prefetchUpcoming(name);
+		return ok;
+	}
+
+	/** Loads an entry and swaps it in; the shared tail of every selection. */
+	private async swapTo(
+		entry: ClipEntry,
+		options: {
+			autoplay: boolean;
+			time: number;
+			fade: number;
+			loop: boolean;
+			moment: string | null;
+			menuState: string | null;
+		},
+	): Promise<boolean> {
+		const stem = clipStem(entry.file);
 		const token = ++this.selectToken;
 		const previous = this.current ? clipStem(this.current.entry.file) : null;
 		// Optimistic: the row highlights and the transport shows the new
@@ -137,7 +261,9 @@ export class AnimationController {
 			loading: this.library.isReady(entry) ? null : stem,
 			failed: null,
 			duration: entry.duration,
-			loop: entry.loop,
+			loop: options.loop,
+			moment: options.moment,
+			menuState: options.menuState,
 		});
 		let clip: AnimationClip;
 		try {
@@ -150,11 +276,13 @@ export class AnimationController {
 				failed: stem,
 				duration: this.current?.entry.duration ?? 0,
 				loop: this.current?.entry.loop ?? true,
+				moment: null,
+				menuState: null,
 			});
 			return false;
 		}
 		if (token !== this.selectToken || this.disposed) return false;
-		this.start(entry, clip, autoplay, 0);
+		this.start(entry, clip, options.autoplay, options.time, options.fade);
 		return true;
 	}
 
@@ -164,6 +292,7 @@ export class AnimationController {
 		clip: AnimationClip,
 		autoplay: boolean,
 		time: number,
+		fade: number = FADE,
 	): void {
 		const playable = this.snapshot.rootMotion
 			? clip
@@ -180,7 +309,7 @@ export class AnimationController {
 		if (prev && prev !== next) {
 			if (autoplay) {
 				next.play();
-				prev.crossFadeTo(next, FADE, false);
+				prev.crossFadeTo(next, Math.max(fade, 0.02), false);
 				this.retiring.push(prev);
 			} else {
 				// Paused: nothing would advance the fade, so cut instead.
@@ -195,6 +324,7 @@ export class AnimationController {
 		next.paused = !autoplay;
 		this.action = next;
 		this.current = { entry, clip };
+		this.prevTime = -1;
 		this.mixer.update(0);
 		this.reap();
 		this.set({
@@ -252,6 +382,10 @@ export class AnimationController {
 
 	play(): void {
 		if (!this.action) {
+			if (this.menu) {
+				void this.playDefaultMoment();
+				return;
+			}
 			const first = defaultClip(this.entries);
 			if (first) void this.select(clipStem(first.file));
 			return;
@@ -262,6 +396,7 @@ export class AnimationController {
 		) {
 			this.action.reset();
 			this.action.play();
+			this.prevTime = -1;
 		}
 		this.action.paused = false;
 		this.set({ playing: true });
@@ -282,6 +417,7 @@ export class AnimationController {
 		const t = Math.max(0, Math.min(time, this.snapshot.duration));
 		this.action.time = t;
 		this.action.paused = !this.snapshot.playing;
+		this.prevTime = t;
 		this.mixer.update(0);
 		this.invalidate();
 		for (const l of this.listeners) l();
@@ -297,6 +433,12 @@ export class AnimationController {
 	}
 
 	restart(): void {
+		// Restarting a moment replays it from its transition clip.
+		const moment = this.snapshot.moment;
+		if (moment && this.menu) {
+			void this.selectMoment(moment);
+			return;
+		}
 		this.seek(0);
 		this.play();
 	}
@@ -326,11 +468,47 @@ export class AnimationController {
 		if (!this.snapshot.playing) return;
 		this.mixer.update(delta * this.snapshot.speed);
 		if (this.retiring.length) this.reap();
+		this.followMenu();
+	}
+
+	/** Fires the machine's exit (or a queued moment) once the clip gets there. */
+	private followMenu(): void {
+		const menu = this.menu;
+		const state = this.snapshot.menuState;
+		const action = this.action;
+		if (!menu || !state || !action || this.snapshot.loading) return;
+		const prev = this.prevTime;
+		const time = action.time;
+		this.prevTime = time;
+		const pending = this.pending;
+		if (pending) {
+			const loop = menu.states[state]?.loop ?? false;
+			if (crossed(pending.at ?? 0, prev, time, loop)) {
+				this.pending = null;
+				void this.enterState(
+					pending.state,
+					pending.fade,
+					pending.offset,
+					pending.moment,
+				);
+			}
+			return;
+		}
+		const exit = nextExit(menu, state, prev, time);
+		if (exit) {
+			void this.enterState(
+				exit.to,
+				exit.fade,
+				exit.offset,
+				this.snapshot.moment,
+			);
+		}
 	}
 
 	dispose(): void {
 		this.disposed = true;
 		this.selectToken++;
+		this.pending = null;
 		this.mixer.stopAllAction();
 		this.mixer.uncacheRoot(this.root);
 		this.retiring = [];

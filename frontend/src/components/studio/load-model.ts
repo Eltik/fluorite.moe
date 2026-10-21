@@ -30,6 +30,10 @@ import {
 import { fetchBytes, ProgressTracker } from "@/components/studio/bytes";
 import type { StudioModelSource } from "@/components/studio/catalog-source";
 import {
+	type CharScreen,
+	loadCharScreen,
+} from "@/components/studio/charscreen";
+import {
 	type ClipLibrary,
 	embeddedClipLibrary,
 	loadClipIndex,
@@ -90,6 +94,8 @@ export interface LoadedModel {
 	volume: CharacterVolume;
 	/** Additional menu lights (empty until exported). */
 	lights: CharacterLight[];
+	/** Character-screen data (camera, menu machine, weapon, props); null for static models. */
+	charscreen: CharScreen | null;
 	stats: ModelStats;
 	/** Non-fatal problems (missing parts, textures that failed to decode). */
 	warnings: string[];
@@ -365,7 +371,7 @@ const STANDARD_SLOTS = new Set(["_BaseMap", "_BumpMap", "_EmissionMap"]);
  * material extras and stores them under `userData.nprTextures`. Slots the
  * exporter left as `null` are skipped; the shaders fall back without them.
  */
-async function resolveDataTextures(gltf: GLTF): Promise<void> {
+export async function resolveDataTextures(gltf: GLTF): Promise<void> {
 	const jobs: Promise<void>[] = [];
 	const seen = new Set<Material>();
 	gltf.scene.traverse((node) => {
@@ -514,13 +520,14 @@ async function loadRigged(
 	const tracker = new ProgressTracker(onProgress);
 	const warnings: string[] = [];
 	try {
-		const [buf, lighting, clipIndex] = await Promise.all([
+		const [buf, lighting, clipIndex, charscreen] = await Promise.all([
 			fetchBytes(source.riggedUrl ?? modelFileUrl(path), {
 				signal,
 				onProgress: tracker.reporter(path),
 			}),
 			loadLightingFor(source, signal),
 			loadClipSource(source, signal, (w) => warnings.push(w)),
+			loadCharScreen(source, signal),
 		]);
 		throwIfAborted(signal);
 		const gltf = await makeLoader().parseAsync(buf, "");
@@ -566,6 +573,7 @@ async function loadRigged(
 			detectedZUp: detectZUp(content),
 			volume: lighting.volume,
 			lights: lighting.lights,
+			charscreen,
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),
@@ -740,6 +748,7 @@ async function loadParts(
 			detectedZUp: detectZUp(content),
 			volume: volumeFor(source.entry.kind),
 			lights: [],
+			charscreen: null,
 			stats: {
 				meshes: parts.length,
 				triangles: parts.reduce((s, p) => s + p.triangles, 0),

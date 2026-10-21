@@ -191,7 +191,7 @@ export function WelcomeHint({
 				<span className="text-muted-foreground text-xs leading-relaxed">
 					{touch
 						? "Drag to orbit, pinch to zoom and use two fingers to pan."
-						: "Drag to orbit, right-drag to pan and scroll to zoom."}{" "}
+						: "Drag to orbit, right-drag or Shift-drag to pan, scroll to zoom."}{" "}
 					Models are shown in their rest pose with approximate materials.
 					{!touch && (
 						<>
@@ -234,6 +234,7 @@ const SHORTCUTS: { keys: string[]; label: string; clips?: true }[] = [
 	{ keys: ["H"], label: "Hide or show the interface" },
 	{ keys: ["Space"], label: "Play or pause", clips: true },
 	{ keys: ["←", "→"], label: "Step one frame", clips: true },
+	{ keys: ["Shift", "←↑↓→"], label: "Pan the view" },
 	{ keys: ["R"], label: "Restart the animation", clips: true },
 	{ keys: ["Esc"], label: "Close the open panel" },
 	{ keys: ["?"], label: "This help" },
@@ -241,7 +242,11 @@ const SHORTCUTS: { keys: string[]; label: string; clips?: true }[] = [
 
 const GESTURES: { input: string; mouse: string; touch: string }[] = [
 	{ input: "Orbit", mouse: "Left-drag", touch: "One finger" },
-	{ input: "Pan", mouse: "Right-drag", touch: "Two fingers" },
+	{
+		input: "Pan",
+		mouse: "Right-drag, or Shift / Ctrl + drag",
+		touch: "Two fingers",
+	},
 	{ input: "Zoom", mouse: "Scroll wheel", touch: "Pinch" },
 ];
 

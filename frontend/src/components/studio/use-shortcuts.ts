@@ -13,6 +13,8 @@ export interface ShortcutHandlers {
 	/** Escape with the interface visible: closes a non-modal panel, if any. */
 	onEscape: () => void;
 	onReset: () => void;
+	/** Shift + arrow keys: pan the view by a fraction of the frame. */
+	onPan: (dx: number, dy: number) => void;
 	onLock: () => void;
 	onFlyout: (flyout: FlyoutId) => void;
 	onScreenshot: () => void;
@@ -68,6 +70,14 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 			if (!h.enabled) return;
 			const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 			const anim = h.animation;
+			if (e.shiftKey && key.startsWith("Arrow")) {
+				if (ownsArrows(e.target)) return;
+				const dx = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
+				const dy = key === "ArrowUp" ? -1 : key === "ArrowDown" ? 1 : 0;
+				h.onPan(dx, dy);
+				e.preventDefault();
+				return;
+			}
 			switch (key) {
 				case "h":
 					h.onToggleUi();

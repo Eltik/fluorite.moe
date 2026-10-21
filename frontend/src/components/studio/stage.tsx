@@ -6,6 +6,7 @@
  */
 import {
 	CameraControls,
+	CameraControlsImpl,
 	Environment,
 	Grid,
 	Lightformer,
@@ -16,11 +17,13 @@ import {
 	Box3,
 	CanvasTexture,
 	type Group,
-	MathUtils,
+	type Mesh,
 	NeutralToneMapping,
 	NoToneMapping,
 	type PerspectiveCamera,
+	type Quaternion,
 	SkeletonHelper,
+	type SkinnedMesh,
 	setConsoleFunction,
 	Vector2,
 	Vector3,
@@ -56,12 +59,21 @@ import {
 	type LightingPreset,
 	type ResolvedBackground,
 } from "@/components/studio/presets";
+import { PropsRig } from "@/components/studio/props-rig";
 import {
 	applyShading,
 	shadingUniforms,
 	updateFaceFrames,
 } from "@/components/studio/shading";
 import { publishStats } from "@/components/studio/stats-store";
+import {
+	cameraDirection,
+	FRONT_DIRECTION,
+	fitBox,
+	type Insets,
+	STATIC_DIRECTION,
+	type Vec3,
+} from "@/lib/framing";
 
 // r3f still constructs THREE.Clock, whose deprecation warning fires on every
 // canvas mount. Drop just that message; everything else passes through.
@@ -77,7 +89,10 @@ setConsoleFunction((type: string, message: string, ...params: unknown[]) => {
 });
 
 export interface StageHandle {
+	/** Back to the default view, re-fitted to the current viewport. */
 	resetView: () => void;
+	/** Pans by a fraction of the view (1 = a full frame). */
+	pan: (dx: number, dy: number) => void;
 	screenshot: (filename: string) => Promise<void>;
 }
 
@@ -92,6 +107,8 @@ export interface StageProps {
 	handleRef: React.RefObject<StageHandle | null>;
 	/** Called once a model is compiled, attached and framed. */
 	onShown: (model: LoadedModel | null) => void;
+	/** Non-fatal problems while loading the weapon or props. */
+	onPropWarnings: (warnings: string[]) => void;
 	onContextLost: (lost: boolean) => void;
 	label: string;
 }
@@ -99,15 +116,19 @@ export interface StageProps {
 interface Framing {
 	center: Vector3;
 	size: Vector3;
+	min: Vector3;
+	max: Vector3;
 	radius: number;
 	/** Bumps on every re-frame (keys the baked contact shadow). */
 	version: number;
 }
 
-const DEFAULT_AZIMUTH = MathUtils.degToRad(28);
-const DEFAULT_POLAR = MathUtils.degToRad(80);
 /** The game's character menu camera. */
 const CAMERA_FOV = 20;
+/** Room around the fitted figure. */
+const FIT_MARGIN = 1.06;
+/** Interface chrome in CSS pixels, converted to viewport fractions. */
+const CHROME = { top: 76, bottomBare: 72, bottomTransport: 128, side: 24 };
 
 // ------------------------------------------------------------- renderer
 
@@ -396,9 +417,40 @@ function FloorDisc({
 
 let framingVersion = 0;
 
+/**
+ * Bounds of what actually draws: hidden parts (LOD levels, shadow proxies,
+ * VFX meshes that sit far from the body) must not pull the framing, and
+ * skinned meshes are measured through their bones (their geometry sits in
+ * bind space, which can be far from where the skeleton puts it).
+ */
 function measure(object: Group): Framing {
 	object.updateMatrixWorld(true);
-	const box = new Box3().setFromObject(object, true);
+	const box = new Box3();
+	const part = new Box3();
+	const visit = (node: Group | Mesh) => {
+		if (!node.visible) return;
+		const mesh = node as Mesh;
+		if (mesh.isMesh && mesh.geometry) {
+			const skinned = mesh as SkinnedMesh;
+			if (skinned.isSkinnedMesh) {
+				skinned.skeleton.update();
+				skinned.computeBoundingBox();
+				if (skinned.boundingBox) {
+					part.copy(skinned.boundingBox).applyMatrix4(mesh.matrixWorld);
+					box.union(part);
+				}
+			} else {
+				const g = mesh.geometry;
+				if (!g.boundingBox) g.computeBoundingBox();
+				if (g.boundingBox) {
+					part.copy(g.boundingBox).applyMatrix4(mesh.matrixWorld);
+					box.union(part);
+				}
+			}
+		}
+		for (const child of node.children) visit(child as Group);
+	};
+	visit(object);
 	if (box.isEmpty())
 		box.set(new Vector3(-0.5, 0, -0.5), new Vector3(0.5, 1, 0.5));
 	const size = box.getSize(new Vector3());
@@ -406,52 +458,68 @@ function measure(object: Group): Framing {
 	return {
 		center,
 		size,
+		min: box.min.clone(),
+		max: box.max.clone(),
 		radius: Math.max(size.length() / 2, 1e-3),
 		version: ++framingVersion,
 	};
 }
 
+/** Chrome fractions for a viewport, with room for the transport bar. */
+function insetsFor(width: number, height: number, transport: boolean): Insets {
+	const h = Math.max(height, 1);
+	const w = Math.max(width, 1);
+	return {
+		top: Math.min(CHROME.top / h, 0.3),
+		bottom: Math.min(
+			(transport ? CHROME.bottomTransport : CHROME.bottomBare) / h,
+			0.35,
+		),
+		left: Math.min(CHROME.side / w, 0.2),
+		right: Math.min(CHROME.side / w, 0.2),
+	};
+}
+
+/**
+ * The default view: the game's character-screen camera direction and FOV
+ * where the catalog has them (centred, whole figure in view; the game's lens
+ * shift for its own UI is dropped), else a front view for characters and a
+ * three-quarter view for static models. The fit uses the free part of the
+ * viewport, so it holds on phones too.
+ */
 function frameCamera(
 	controls: CameraControls,
 	camera: PerspectiveCamera,
 	framing: Framing,
-	character: boolean,
+	model: LoadedModel,
+	orientation: Quaternion,
+	viewport: { width: number; height: number },
 	transition: boolean,
 ): void {
-	const { center, size, radius } = framing;
-	const vFov = MathUtils.degToRad(camera.fov);
-	const hFov = 2 * Math.atan(Math.tan(vFov / 2) * camera.aspect);
-	let distance: number;
-	let target: Vector3;
-	let offset: Vector3;
-	if (character) {
-		// The menu framing: from the front, aimed at 78 % of the height, at
-		// 0.6× the distance that fits the bounding sphere. The game measures
-		// the posed (arms-down) character, whose sphere is ~0.56× the height;
-		// using the height keeps T-pose bind poses from pushing the camera
-		// back, with a floor for wide, squat models.
-		const sphere = Math.max(size.y, Math.hypot(size.x, size.z) * 0.6) * 0.56;
-		const fit = (sphere / Math.sin(Math.min(vFov, hFov) / 2)) * 1.05;
-		distance = fit * 0.6;
-		target = new Vector3(
-			center.x,
-			MathUtils.lerp(center.y - size.y / 2, center.y + size.y / 2, 0.78),
-			center.z,
-		);
-		offset = new Vector3(0, 0, distance);
-	} else {
-		const depth = Math.max(size.x, size.z);
-		const fitH = size.y / 2 / Math.tan(vFov / 2);
-		const fitW = Math.max(size.x, size.z) / 2 / Math.tan(hFov / 2);
-		distance = Math.max(fitH, fitW) * 1.15 + depth / 2;
-		offset = new Vector3().setFromSphericalCoords(
-			distance,
-			DEFAULT_POLAR,
-			DEFAULT_AZIMUTH,
-		);
-		// Aim slightly below centre so the model clears the bottom toolbar.
-		target = center.clone().setY(center.y - size.y * 0.07);
-	}
+	const game = model.charscreen?.camera ?? null;
+	const dir = new Vector3(
+		...(game
+			? cameraDirection(game)
+			: model.rigged
+				? FRONT_DIRECTION
+				: STATIC_DIRECTION),
+	).applyQuaternion(orientation);
+	const fov = game ? game.fov : CAMERA_FOV;
+	const fit = fitBox({
+		min: framing.min.toArray() as Vec3,
+		max: framing.max.toArray() as Vec3,
+		direction: dir.toArray() as Vec3,
+		fov,
+		aspect: viewport.width / Math.max(viewport.height, 1),
+		insets: insetsFor(
+			viewport.width,
+			viewport.height,
+			Boolean(model.clips?.entries.length),
+		),
+		margin: FIT_MARGIN,
+	});
+	const { radius } = framing;
+	camera.fov = fov;
 	// Depth range sized to the model (and the stage dome): close-ups stay
 	// crisp, no z-fighting.
 	camera.near = Math.max(radius * 0.01, 0.001);
@@ -459,15 +527,14 @@ function frameCamera(
 	camera.updateProjectionMatrix();
 	controls.minDistance = radius * 0.08;
 	controls.maxDistance = radius * 14;
-	shadingUniforms.outlineRef.value = distance;
-	const position = target.clone().add(offset);
+	shadingUniforms.outlineRef.value = fit.distance;
 	void controls.setLookAt(
-		position.x,
-		position.y,
-		position.z,
-		target.x,
-		target.y,
-		target.z,
+		fit.position[0],
+		fit.position[1],
+		fit.position[2],
+		fit.target[0],
+		fit.target[1],
+		fit.target[2],
 		transition,
 	);
 	controls.saveState();
@@ -483,6 +550,8 @@ interface MountProps {
 	onFramed: (framing: Framing | null) => void;
 	onShown: (model: LoadedModel | null) => void;
 	controls: React.RefObject<CameraControls | null>;
+	/** Receives a function that re-frames the shown model (Reset). */
+	reframeRef: React.RefObject<((transition: boolean) => void) | null>;
 }
 
 const reducedMotion = () =>
@@ -512,11 +581,15 @@ function ModelMount({
 	onFramed,
 	onShown,
 	controls,
+	reframeRef,
 }: MountProps) {
 	const gl = useThree((s) => s.gl);
 	const camera = useThree((s) => s.camera) as PerspectiveCamera;
 	const scene = useThree((s) => s.scene);
 	const invalidate = useThree((s) => s.invalidate);
+	const size = useThree((s) => s.size);
+	const sizeRef = React.useRef(size);
+	sizeRef.current = size;
 	const outer = React.useRef<Group>(null);
 	const turn = React.useRef<Group>(null);
 	const [current, setCurrent] = React.useState<LoadedModel | null>(null);
@@ -556,6 +629,9 @@ function ModelMount({
 	}, [current]);
 
 	// Orientation, ground placement and framing, all before the first paint.
+	// `hiddenParts` only matters for the measurement when the model lands;
+	// toggling parts later must not re-frame.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: see above
 	React.useLayoutEffect(() => {
 		const o = outer.current;
 		const t = turn.current;
@@ -569,6 +645,11 @@ function ModelMount({
 		const zUp = zUpMode === "auto" ? current.detectedZUp : zUpMode === "on";
 		t.rotation.set(zUp ? -Math.PI / 2 : 0, 0, 0);
 		o.position.set(0, 0, 0);
+		// Default-hidden helpers are applied below in an effect; measure
+		// without them from the start.
+		for (const part of current.parts) {
+			part.object.visible = !hiddenParts.has(part.id);
+		}
 		const raw = measure(o);
 		o.position.set(
 			-raw.center.x,
@@ -577,16 +658,43 @@ function ModelMount({
 		);
 		const framing = measure(o);
 		onFramed(framing);
-		const c = controls.current;
 		const swapped = framed.current !== current;
+		const reframe = (transition: boolean) => {
+			const c = controls.current;
+			if (c) {
+				frameCamera(
+					c,
+					camera,
+					framing,
+					current,
+					t.quaternion,
+					sizeRef.current,
+					transition,
+				);
+			}
+		};
+		reframeRef.current = reframe;
 		// A new model snaps into place behind a fade; re-orienting the same
 		// model glides.
-		if (c) frameCamera(c, camera, framing, current.rigged, !swapped);
+		reframe(!swapped);
 		if (swapped) fadeIn(gl.domElement);
 		framed.current = current;
 		invalidate();
 		onShown(current);
-	}, [current, zUpMode, camera, controls, gl, invalidate, onFramed, onShown]);
+		return () => {
+			if (reframeRef.current === reframe) reframeRef.current = null;
+		};
+	}, [
+		current,
+		zUpMode,
+		camera,
+		controls,
+		gl,
+		invalidate,
+		onFramed,
+		onShown,
+		reframeRef,
+	]);
 
 	React.useEffect(() => {
 		if (!current) return;
@@ -668,19 +776,35 @@ function HandleBridge({
 	handleRef,
 	controls,
 	background,
+	reframeRef,
 }: {
 	handleRef: React.RefObject<StageHandle | null>;
 	controls: React.RefObject<CameraControls | null>;
 	background: ResolvedBackground;
+	reframeRef: React.RefObject<((transition: boolean) => void) | null>;
 }) {
 	const gl = useThree((s) => s.gl);
 	const scene = useThree((s) => s.scene);
 	const camera = useThree((s) => s.camera);
+	const invalidate = useThree((s) => s.invalidate);
 	React.useImperativeHandle(
 		handleRef,
 		() => ({
 			resetView: () => {
-				void controls.current?.reset(true);
+				const c = controls.current;
+				if (!c) return;
+				if (reframeRef.current) reframeRef.current(true);
+				else void c.reset(true);
+				invalidate();
+			},
+			pan: (dx, dy) => {
+				const c = controls.current;
+				if (!c?.enabled) return;
+				// A tenth of the visible height per key press.
+				const cam = c.camera as PerspectiveCamera;
+				const visible = 2 * c.distance * Math.tan((cam.fov * Math.PI) / 360);
+				void c.truck(dx * visible * 0.1, dy * visible * 0.1, true);
+				invalidate();
 			},
 			screenshot: async (filename: string) => {
 				gl.render(scene, camera);
@@ -704,8 +828,130 @@ function HandleBridge({
 				window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 			},
 		}),
-		[gl, scene, camera, controls, background],
+		[gl, scene, camera, controls, background, reframeRef, invalidate],
 	);
+	return null;
+}
+
+/**
+ * Shift- or Ctrl-drag with the left button pans, for trackpads without a
+ * right button. The modifier is read on pointerdown (before camera-controls
+ * sees it) and the button mapping restored on release. Right-drag and
+ * two-finger drag pan through camera-controls' defaults.
+ */
+function PanModifiers({
+	controls,
+}: {
+	controls: React.RefObject<CameraControls | null>;
+}) {
+	const gl = useThree((s) => s.gl);
+	React.useEffect(() => {
+		const el = gl.domElement;
+		const onDown = (e: PointerEvent) => {
+			const c = controls.current;
+			if (!c?.enabled || e.button !== 0 || !(e.shiftKey || e.ctrlKey)) return;
+			c.mouseButtons.left = CameraControlsImpl.ACTION.TRUCK;
+			const restore = () => {
+				c.mouseButtons.left = CameraControlsImpl.ACTION.ROTATE;
+				window.removeEventListener("pointerup", restore, true);
+				window.removeEventListener("pointercancel", restore, true);
+			};
+			window.addEventListener("pointerup", restore, true);
+			window.addEventListener("pointercancel", restore, true);
+		};
+		// Ctrl-click is a context menu on macOS; keep the drag alive.
+		const onMenu = (e: Event) => e.preventDefault();
+		el.addEventListener("pointerdown", onDown, true);
+		el.addEventListener("contextmenu", onMenu);
+		return () => {
+			el.removeEventListener("pointerdown", onDown, true);
+			el.removeEventListener("contextmenu", onMenu);
+		};
+	}, [gl, controls]);
+	return null;
+}
+
+/**
+ * The model's default weapon and deco props: loaded once the model is shown,
+ * shaded like it, shown or hidden per clip time.
+ */
+function CharProps({
+	model,
+	controller,
+	shading,
+	outlines,
+	wireframe,
+	showWeapon,
+	showProps,
+	onWarnings,
+}: {
+	model: LoadedModel | null;
+	controller: AnimationController | null;
+	shading: ShadingId;
+	outlines: boolean;
+	wireframe: boolean;
+	showWeapon: boolean;
+	showProps: boolean;
+	onWarnings: (warnings: string[]) => void;
+}) {
+	const gl = useThree((s) => s.gl);
+	const camera = useThree((s) => s.camera);
+	const scene = useThree((s) => s.scene);
+	const invalidate = useThree((s) => s.invalidate);
+	const rig = React.useRef<PropsRig | null>(null);
+	const look = React.useRef({ shading, outlines, wireframe });
+	look.current = { shading, outlines, wireframe };
+	const enabled = React.useRef({ showWeapon, showProps });
+	enabled.current = { showWeapon, showProps };
+
+	React.useEffect(() => {
+		rig.current = null;
+		const cs = model?.charscreen;
+		if (!model || !cs || (!cs.weapon?.glb && !cs.deco?.items.length)) return;
+		const r = new PropsRig(model);
+		const aborter = new AbortController();
+		void r.load(aborter.signal, look.current).then(
+			() => {
+				if (aborter.signal.aborted) return;
+				r.setEnabled(enabled.current.showWeapon, enabled.current.showProps);
+				rig.current = r;
+				if (r.warnings.length) onWarnings(r.warnings);
+				(gl as WebGLRenderer)
+					.compileAsync(model.content, camera, scene)
+					.catch(() => {})
+					.finally(invalidate);
+			},
+			() => {},
+		);
+		return () => {
+			aborter.abort();
+			rig.current = null;
+			r.dispose();
+			invalidate();
+		};
+	}, [model, gl, camera, scene, invalidate, onWarnings]);
+
+	React.useEffect(() => {
+		rig.current?.setLook({ shading, outlines, wireframe });
+		invalidate();
+	}, [shading, outlines, wireframe, invalidate]);
+
+	React.useEffect(() => {
+		rig.current?.setEnabled(showWeapon, showProps);
+		invalidate();
+	}, [showWeapon, showProps, invalidate]);
+
+	useFrame(() => {
+		const r = rig.current;
+		if (!r) return;
+		const entry = controller?.currentEntry ?? null;
+		const changed = r.update(
+			entry?.file ?? null,
+			entry?.source ?? null,
+			controller?.time ?? 0,
+		);
+		if (changed) invalidate();
+	});
 	return null;
 }
 
@@ -734,10 +980,12 @@ export function Stage({
 	animation,
 	handleRef,
 	onShown,
+	onPropWarnings,
 	onContextLost,
 	label,
 }: StageProps): React.ReactElement {
 	const controls = React.useRef<CameraControls | null>(null);
+	const reframeRef = React.useRef<((transition: boolean) => void) | null>(null);
 	const [framing, setFraming] = React.useState<Framing | null>(null);
 	const [shown, setShown] = React.useState<LoadedModel | null>(null);
 	const preset = LIGHTING[prefs.lighting];
@@ -816,9 +1064,20 @@ export function Stage({
 				onFramed={setFraming}
 				onShown={handleShown}
 				outlines={prefs.outlines}
+				reframeRef={reframeRef}
 				shading={prefs.shading}
 				wireframe={prefs.wireframe}
 				zUpMode={zUpMode}
+			/>
+			<CharProps
+				controller={animation}
+				model={shown}
+				onWarnings={onPropWarnings}
+				outlines={prefs.outlines}
+				shading={prefs.shading}
+				showProps={prefs.showProps}
+				showWeapon={prefs.showWeapon}
+				wireframe={prefs.wireframe}
 			/>
 			{prefs.floor && !background.stage && shown && framing && (
 				<FloorDisc
@@ -866,6 +1125,7 @@ export function Stage({
 				smoothTime={0.2}
 			/>
 			<ControlsLock controls={controls} locked={locked} />
+			<PanModifiers controls={controls} />
 			<AutoRotate controls={controls} enabled={prefs.autoRotate && !locked} />
 			<MixerDriver controller={animation} />
 			<Bloom enabled={toon && prefs.bloom} />
@@ -873,6 +1133,7 @@ export function Stage({
 				background={background}
 				controls={controls}
 				handleRef={handleRef}
+				reframeRef={reframeRef}
 			/>
 		</Canvas>
 	);

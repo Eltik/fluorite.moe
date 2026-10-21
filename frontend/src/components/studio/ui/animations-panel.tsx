@@ -12,6 +12,7 @@ import {
 	HandIcon,
 	type LucideIcon,
 	MessageSquareIcon,
+	PackageXIcon,
 	RepeatIcon,
 	SearchIcon,
 	SparklesIcon,
@@ -34,6 +35,7 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTab } from "@/components/ui/tabs";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "@/components/ui/tooltip";
 import {
 	type ClipEntry,
 	type ClipSource,
@@ -45,6 +47,7 @@ import {
 	groupBySource,
 	matchesQuery,
 } from "@/lib/clips";
+import { type MenuMoment, momentAvailable } from "@/lib/menu";
 import { cn } from "@/lib/utils";
 
 const SOURCE_ICON: Record<ClipSource, LucideIcon> = {
@@ -77,6 +80,17 @@ type Row =
 			entry: ClipEntry;
 			label: string;
 			icon: LucideIcon;
+	  }
+	| {
+			kind: "moment";
+			id: string;
+			moment: MenuMoment;
+			/** The transition clip the moment plays; undefined when not exported. */
+			entry: ClipEntry | undefined;
+			/** Whether the moment settles into a loop. */
+			loops: boolean;
+			label: string;
+			icon: LucideIcon;
 	  };
 
 const HEADER_HEIGHT = 32;
@@ -84,12 +98,42 @@ const ROW_HEIGHT = 46;
 
 function buildRows(
 	tab: ClipTab,
-	entries: readonly ClipEntry[],
+	controller: AnimationController,
 	query: string,
 ): Row[] {
+	const entries = controller.entries;
 	const rows: Row[] = [];
 	if (tab === "featured") {
+		const menu = controller.menu;
+		if (menu?.moments.length) {
+			const items = menu.moments.filter(
+				(m) => !query || matchesQuery(`${m.label} ${m.id} ${m.state}`, query),
+			);
+			if (items.length) {
+				rows.push({
+					kind: "header",
+					id: "h:menu",
+					label: "Menu",
+					count: items.length,
+					icon: FEATURED_ICON.menu,
+				});
+				for (const m of items) {
+					const file = menu.states[m.state]?.clip;
+					rows.push({
+						kind: "moment",
+						id: `moment:${m.id}`,
+						moment: m,
+						entry: file ? controller.entryByFile(file) : undefined,
+						loops: menu.states[m.idle]?.loop ?? false,
+						label: m.label,
+						icon: FEATURED_ICON.menu,
+					});
+				}
+			}
+		}
 		for (const group of featuredGroups(entries)) {
+			// The state machine replaces the pattern-based menu group.
+			if (group.id === "menu" && menu?.moments.length) continue;
 			const items = query
 				? group.items.filter((i) =>
 						matchesQuery(`${i.label} ${i.entry.name} ${i.entry.file}`, query),
@@ -141,6 +185,7 @@ function buildRows(
 export interface AnimationsBrowserProps {
 	controller: AnimationController;
 	onSelect: (stem: string) => void;
+	onSelectMoment: (id: string) => void;
 	/** Escape with an empty search (desktop card only). */
 	onClose?: () => void;
 	searchRef?: React.RefObject<HTMLInputElement | null>;
@@ -151,6 +196,7 @@ export interface AnimationsBrowserProps {
 export function AnimationsBrowser({
 	controller,
 	onSelect,
+	onSelectMoment,
 	onClose,
 	searchRef,
 	mobile = false,
@@ -164,7 +210,7 @@ export function AnimationsBrowser({
 	const listRef = React.useRef<HTMLUListElement>(null);
 
 	const rows = React.useMemo(
-		() => buildRows(tab, controller.entries, deferred.trim()),
+		() => buildRows(tab, controller, deferred.trim()),
 		[tab, controller, deferred],
 	);
 	const featuredEmpty =
@@ -181,10 +227,10 @@ export function AnimationsBrowser({
 
 	// Keep the playing clip in view when the list changes (tab, search, new
 	// model), not on every tick.
-	const activeId = state.clip;
+	const activeId = state.moment ? `moment:${state.moment}` : state.clip;
 	// biome-ignore lint/correctness/useExhaustiveDependencies: scroll on list change only
 	React.useEffect(() => {
-		const i = rows.findIndex((r) => r.kind === "clip" && r.id === activeId);
+		const i = rows.findIndex((r) => r.kind !== "header" && r.id === activeId);
 		if (i >= 0) virtualizer.scrollToIndex(i, { align: "auto" });
 	}, [rows]);
 
@@ -203,7 +249,7 @@ export function AnimationsBrowser({
 	/** Next clip row from `from` in direction `dir` (skipping headers). */
 	const nextClipRow = (from: number, dir: 1 | -1): number => {
 		for (let i = from + dir; i >= 0 && i < rows.length; i += dir) {
-			if (rows[i].kind === "clip") return i;
+			if (rows[i].kind !== "header") return i;
 		}
 		return -1;
 	};
@@ -350,6 +396,33 @@ export function AnimationsBrowser({
 									</li>
 								);
 							}
+							if (row.kind === "moment") {
+								const stem = row.entry ? clipStem(row.entry.file) : null;
+								return (
+									<li
+										className="absolute inset-x-0 py-0.5"
+										key={v.key}
+										style={style}
+									>
+										<MomentRow
+											active={state.moment === row.moment.id}
+											available={Boolean(
+												controller.menu &&
+													row.entry &&
+													momentAvailable(controller.menu, row.moment),
+											)}
+											controller={controller}
+											failed={stem !== null && stem === state.failed}
+											index={v.index}
+											loading={
+												state.moment === row.moment.id && state.loading !== null
+											}
+											onSelect={onSelectMoment}
+											row={row}
+										/>
+									</li>
+								);
+							}
 							return (
 								<li
 									className="absolute inset-x-0 py-0.5"
@@ -357,7 +430,7 @@ export function AnimationsBrowser({
 									style={style}
 								>
 									<ClipRow
-										active={row.id === state.clip}
+										active={!state.moment && row.id === state.clip}
 										controller={controller}
 										failed={row.id === state.failed}
 										index={v.index}
@@ -465,6 +538,105 @@ function ClipRow({
 			)}
 			{active && <RowProgress controller={controller} />}
 		</button>
+	);
+}
+
+/** A character-screen moment: plays its state, then follows the machine. */
+function MomentRow({
+	row,
+	index,
+	active,
+	available,
+	loading,
+	failed,
+	controller,
+	onSelect,
+}: {
+	row: Extract<Row, { kind: "moment" }>;
+	index: number;
+	active: boolean;
+	available: boolean;
+	loading: boolean;
+	failed: boolean;
+	controller: AnimationController;
+	onSelect: (id: string) => void;
+}): React.ReactElement {
+	const Icon = row.icon;
+	const { entry, moment } = row;
+	const prefetch = () => {
+		if (entry) controller.prefetch(clipStem(entry.file));
+	};
+	const button = (
+		<button
+			aria-busy={loading || undefined}
+			aria-current={active ? "true" : undefined}
+			aria-disabled={!available || undefined}
+			className={cn(
+				"group relative flex h-full w-full items-center gap-2.5 overflow-hidden rounded-lg px-2 text-start outline-none transition-colors hover:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring",
+				active && "bg-primary/10 hover:bg-primary/14 dark:bg-primary/16",
+				!available && "text-muted-foreground hover:bg-transparent",
+			)}
+			data-row={index}
+			onClick={() => {
+				if (available) onSelect(moment.id);
+			}}
+			onFocus={prefetch}
+			onPointerEnter={prefetch}
+			title={entry?.file ?? moment.state}
+			type="button"
+		>
+			<span
+				className={cn(
+					"flex size-7 shrink-0 items-center justify-center rounded-md bg-muted/70 text-muted-foreground",
+					active && "bg-primary/15 text-primary",
+					failed && "bg-destructive/10 text-destructive",
+				)}
+			>
+				{loading ? (
+					<Spinner className="size-3.5" />
+				) : failed ? (
+					<TriangleAlertIcon aria-hidden="true" className="size-3.5" />
+				) : available ? (
+					<Icon aria-hidden="true" className="size-3.5" />
+				) : (
+					<PackageXIcon aria-hidden="true" className="size-3.5" />
+				)}
+			</span>
+			<span className="flex min-w-0 flex-1 flex-col leading-tight">
+				<span className={cn("truncate text-sm", active && "font-medium")}>
+					{row.label}
+				</span>
+				<span className="font-mono text-[0.6875rem] text-muted-foreground tabular-nums">
+					{failed
+						? "Couldn't load"
+						: loading
+							? "Loading…"
+							: !available
+								? "Not exported"
+								: `${(entry?.duration ?? 0).toFixed(1)} s`}
+				</span>
+			</span>
+			{available && row.loops && (
+				<Badge
+					className="gap-0.5 border-border/70 bg-transparent text-muted-foreground"
+					size="sm"
+					variant="outline"
+				>
+					<RepeatIcon aria-hidden="true" />
+					loop
+				</Badge>
+			)}
+			{active && <RowProgress controller={controller} />}
+		</button>
+	);
+	if (available) return button;
+	return (
+		<Tooltip>
+			<TooltipTrigger render={button} />
+			<TooltipPopup side="right">
+				Not exported: the game clip for this moment is missing.
+			</TooltipPopup>
+		</Tooltip>
 	);
 }
 

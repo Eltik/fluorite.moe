@@ -12,6 +12,7 @@ import {
 	isApiError,
 	type SearchItem,
 } from "@/lib/api";
+import type { GameCamera } from "@/lib/framing";
 import type { StudioKind } from "@/lib/studio";
 
 const MINUTE = 60_000;
@@ -42,6 +43,14 @@ export interface StudioModelSource {
 	lights?: string;
 	/** Per-clip animation index JSON under the `models` root. */
 	clips?: string;
+	/** The game's character-screen camera, in model space. */
+	camera?: GameCamera;
+	/** Character-screen state machine (`menu.json`) under the `models` root. */
+	menu?: string;
+	/** Default weapon mounting JSON under the `models` root. */
+	weapon?: string;
+	/** Deco props index JSON under the `models` root. */
+	deco?: string;
 	/** Dev builds only: absolute URL that replaces `rigged`. */
 	riggedUrl?: string;
 	/** Dev builds only: URL of a JSON `CharacterVolume` (or `{ volume }`). */
@@ -216,17 +225,56 @@ function strings(value: unknown): string[] {
 		.filter((v): v is string => Boolean(v));
 }
 
+function vec3(value: unknown): [number, number, number] | undefined {
+	return Array.isArray(value) &&
+		value.length === 3 &&
+		value.every((n) => typeof n === "number" && Number.isFinite(n))
+		? [value[0], value[1], value[2]]
+		: undefined;
+}
+
+/** The character-screen camera from `model.camera`, if well formed. */
+export function cameraFromDetail(value: unknown): GameCamera | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const c = value as Record<string, unknown>;
+	const position = vec3(c.position);
+	const target = vec3(c.target);
+	const fov =
+		typeof c.fov === "number" && c.fov > 1 && c.fov < 170 ? c.fov : 20;
+	if (!position || !target) return undefined;
+	const camera: GameCamera = { position, target, fov };
+	if (typeof c.near === "number") camera.near = c.near;
+	if (typeof c.far === "number") camera.far = c.far;
+	if (
+		Array.isArray(c.screenOffset) &&
+		c.screenOffset.length === 2 &&
+		c.screenOffset.every((n) => typeof n === "number")
+	) {
+		camera.screenOffset = [c.screenOffset[0], c.screenOffset[1]];
+	}
+	if (typeof c.referenceAspect === "number") {
+		camera.referenceAspect = c.referenceAspect;
+	}
+	return camera;
+}
+
+export interface DetailModel {
+	parts: string[];
+	rigged?: string;
+	lights?: string;
+	clips?: string;
+	camera?: GameCamera;
+	menu?: string;
+	weapon?: string;
+	deco?: string;
+}
+
 /**
  * Pulls model references out of a detail payload. Accepts `model.parts` /
  * `model.rigged`, top-level `rigged`, and a `models` object or array, since
  * the detail shape is kind-specific.
  */
-export function modelFromDetail(detail: CatalogDetail): {
-	parts: string[];
-	rigged?: string;
-	lights?: string;
-	clips?: string;
-} {
+export function modelFromDetail(detail: CatalogDetail): DetailModel {
 	const record = detail as Record<string, unknown>;
 	const model = (record.model ?? {}) as Record<string, unknown>;
 	const models = record.models;
@@ -234,25 +282,39 @@ export function modelFromDetail(detail: CatalogDetail): {
 	let rigged = str(model.rigged) ?? str(record.rigged);
 	let lights = str(model.lights);
 	let clips = str(model.clips);
+	let camera = cameraFromDetail(model.camera);
+	let menu = str(model.menu);
+	let weapon = str(model.weapon);
+	let deco = str(model.deco);
+	const absorb = (mm: Record<string, unknown>) => {
+		if (!parts.length) parts = strings(mm.parts);
+		rigged ??= str(mm.rigged);
+		lights ??= str(mm.lights);
+		clips ??= str(mm.clips);
+		camera ??= cameraFromDetail(mm.camera);
+		menu ??= str(mm.menu);
+		weapon ??= str(mm.weapon);
+		deco ??= str(mm.deco);
+	};
 	if (models && typeof models === "object") {
 		if (Array.isArray(models)) {
 			for (const m of models) {
-				if (!m || typeof m !== "object") continue;
-				const mm = m as Record<string, unknown>;
-				if (!parts.length) parts = strings(mm.parts);
-				rigged ??= str(mm.rigged);
-				lights ??= str(mm.lights);
-				clips ??= str(mm.clips);
+				if (m && typeof m === "object") absorb(m as Record<string, unknown>);
 			}
 		} else {
-			const mm = models as Record<string, unknown>;
-			if (!parts.length) parts = strings(mm.parts);
-			rigged ??= str(mm.rigged);
-			lights ??= str(mm.lights);
-			clips ??= str(mm.clips);
+			absorb(models as Record<string, unknown>);
 		}
 	}
-	return { parts: bestLodParts(parts), rigged, lights, clips };
+	return {
+		parts: bestLodParts(parts),
+		rigged,
+		lights,
+		clips,
+		camera,
+		menu,
+		weapon,
+		deco,
+	};
 }
 
 // ------------------------------------------------------------- queries
@@ -302,14 +364,10 @@ export const studioDetailQuery = (
 		queryFn: async ({ signal }): Promise<StudioModelSource> => {
 			try {
 				const detail = await api.catalogDetail(kind, id, lang, signal);
-				const { parts, rigged, lights, clips } = modelFromDetail(detail);
 				return {
 					entry: toEntry(kind, detail),
 					description: str(detail.description),
-					parts,
-					rigged,
-					lights,
-					clips,
+					...modelFromDetail(detail),
 					source: "api",
 				};
 			} catch (error) {

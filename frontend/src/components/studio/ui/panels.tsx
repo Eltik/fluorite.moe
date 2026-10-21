@@ -1,6 +1,7 @@
 /** Flyout bodies: parts, background and lighting. */
 import { CheckIcon, EyeIcon, EyeOffIcon } from "lucide-react";
 import * as React from "react";
+import { hasProps, hasWeapon } from "@/components/studio/charscreen";
 import type { LoadedModel, PartStatus } from "@/components/studio/load-model";
 import {
 	BACKGROUND_IDS,
@@ -35,10 +36,12 @@ export function PartsPanel({
 	model,
 	hidden,
 	onHiddenChange,
+	prefs,
 }: {
 	model: LoadedModel | null;
 	hidden: ReadonlySet<string>;
 	onHiddenChange: (next: Set<string>) => void;
+	prefs: StudioPrefs;
 }): React.ReactElement {
 	if (!model) {
 		return (
@@ -88,6 +91,39 @@ export function PartsPanel({
 			>
 				{visible} of {model.parts.length} parts
 			</PanelHeading>
+			{(hasWeapon(model) || hasProps(model)) && (
+				<div className="flex flex-col gap-1 border-b pb-2">
+					{hasWeapon(model) && (
+						<label className="flex items-center justify-between gap-2 px-1 text-sm">
+							<span className="flex flex-col">
+								<span>Weapon</span>
+								<span className="text-muted-foreground text-xs">
+									{model.charscreen?.weapon?.weapon}, shown as the menu clips
+									draw it
+								</span>
+							</span>
+							<Switch
+								checked={prefs.showWeapon}
+								onCheckedChange={(showWeapon) => setPrefs({ showWeapon })}
+							/>
+						</label>
+					)}
+					{hasProps(model) && (
+						<label className="flex items-center justify-between gap-2 px-1 text-sm">
+							<span className="flex flex-col">
+								<span>Props</span>
+								<span className="text-muted-foreground text-xs">
+									Character-screen decorations, per clip
+								</span>
+							</span>
+							<Switch
+								checked={prefs.showProps}
+								onCheckedChange={(showProps) => setPrefs({ showProps })}
+							/>
+						</label>
+					)}
+				</div>
+			)}
 			<ul className="-mx-1 flex max-h-[min(24rem,50dvh)] flex-col overflow-y-auto">
 				{model.parts.map((part) => {
 					const on = !hidden.has(part.id);

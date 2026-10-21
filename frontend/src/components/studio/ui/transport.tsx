@@ -28,6 +28,8 @@ const IDLE: AnimationState = {
 	loop: true,
 	duration: 0,
 	rootMotion: false,
+	moment: null,
+	menuState: null,
 };
 
 export function useAnimationState(

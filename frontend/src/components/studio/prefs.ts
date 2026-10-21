@@ -65,6 +65,10 @@ export interface StudioPrefs {
 	rootMotion: boolean;
 	/** Last tab opened in the animations panel. */
 	clipTab: ClipTab;
+	/** Show the operator's default weapon on its mount. */
+	showWeapon: boolean;
+	/** Show the character-screen props (deco meshes). */
+	showProps: boolean;
 }
 
 export const CLIP_TABS = ["featured", "all"] as const;
@@ -94,6 +98,8 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	pickerKind: "operators",
 	rootMotion: false,
 	clipTab: "featured",
+	showWeapon: true,
+	showProps: true,
 };
 
 const KEY = "fluorite.studio";
@@ -156,6 +162,8 @@ function read(): StudioPrefs {
 			pickerKind: pick(p.pickerKind, PICKER_KINDS, d.pickerKind),
 			rootMotion: bool(p.rootMotion, d.rootMotion),
 			clipTab: pick(p.clipTab, CLIP_TABS, d.clipTab),
+			showWeapon: bool(p.showWeapon, d.showWeapon),
+			showProps: bool(p.showProps, d.showProps),
 		};
 	} catch {
 		return DEFAULT_PREFS;

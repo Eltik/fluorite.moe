@@ -369,6 +369,7 @@ function Studio(): React.ReactElement {
 			shown?.clips?.entries.length
 				? new AnimationController(shown.content, shown.clips, {
 						rootMotion: prefs.rootMotion,
+						menu: shown.charscreen?.menu ?? null,
 					})
 				: null,
 		[shown],
@@ -390,22 +391,28 @@ function Studio(): React.ReactElement {
 		[animation],
 	);
 
-	// `?clip=` deep link once the clips are known, else a sensible idle. Only
-	// on a new controller: later URL changes come from selecting clips.
+	// `?clip=` deep link once the clips are known, else the character
+	// screen's opening moment (overview start, then its loop), else a
+	// sensible idle. Only on a new controller: later URL changes come from
+	// selecting clips.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: see above
 	React.useEffect(() => {
 		if (!animation) return;
 		const wanted = search.clip;
-		const fallback = defaultClip(animation.entries);
-		const stem =
-			wanted && animation.entry(wanted)
-				? wanted
-				: fallback
-					? clipStem(fallback.file)
-					: null;
-		if (!stem) return;
-		void animation.select(stem).then((ok) => {
-			if (!ok && animation.state.failed === stem) reportClipFailure(stem);
+		if (wanted && animation.entry(wanted)) {
+			void animation.select(wanted).then((ok) => {
+				if (!ok && animation.state.failed === wanted) reportClipFailure(wanted);
+			});
+			return;
+		}
+		void animation.playDefaultMoment().then((ok) => {
+			if (ok) return;
+			const fallback = defaultClip(animation.entries);
+			const stem = fallback ? clipStem(fallback.file) : null;
+			if (!stem) return;
+			void animation.select(stem).then((done) => {
+				if (!done && animation.state.failed === stem) reportClipFailure(stem);
+			});
 		});
 	}, [animation]);
 
@@ -423,6 +430,33 @@ function Studio(): React.ReactElement {
 		},
 		[animation, navigate, reportClipFailure],
 	);
+
+	const selectMoment = React.useCallback(
+		(id: string) => {
+			if (!animation) return;
+			void animation.selectMoment(id).then((ok) => {
+				const failed = animation.state.failed;
+				if (!ok && failed) reportClipFailure(failed);
+			});
+			// Moments are the default view; a deep link only names raw clips.
+			if (search.clip !== undefined) {
+				void navigate({
+					to: ".",
+					search: (prev: StudioSearch) => ({ ...prev, clip: undefined }),
+					replace: true,
+				} as never);
+			}
+		},
+		[animation, navigate, reportClipFailure, search.clip],
+	);
+
+	const handlePropWarnings = React.useCallback((warnings: string[]) => {
+		toastManager.add({
+			type: "warning",
+			title: "Some props couldn't be loaded",
+			description: warnings[0],
+		});
+	}, []);
 
 	// ---------------------------------------------------------- view
 
@@ -511,6 +545,7 @@ function Studio(): React.ReactElement {
 		},
 		uiHidden,
 		onReset: () => stageRef.current?.resetView(),
+		onPan: (dx, dy) => stageRef.current?.pan(dx, dy),
 		onLock: () => setLocked((l) => !l),
 		onFlyout: (f) => {
 			if (f === "animations" && !animation) return;
@@ -551,7 +586,7 @@ function Studio(): React.ReactElement {
 	};
 
 	const stageLabel = shown
-		? `3D view of ${shown.name}. Drag to orbit, right-drag to pan, scroll to zoom.`
+		? `3D view of ${shown.name}. Drag to orbit, right-drag or Shift-drag to pan, scroll to zoom.`
 		: "Empty 3D stage";
 
 	return (
@@ -569,6 +604,7 @@ function Studio(): React.ReactElement {
 					locked={locked}
 					model={model}
 					onContextLost={setContextLost}
+					onPropWarnings={handlePropWarnings}
 					onShown={handleShown}
 					prefs={prefs}
 					zUpMode={prefs.zUp}
@@ -765,6 +801,7 @@ function Studio(): React.ReactElement {
 							controller={animation}
 							onClose={closeAnimations}
 							onSelect={selectClip}
+							onSelectMoment={selectMoment}
 							searchRef={clipSearchRef}
 						/>
 					</div>
@@ -836,6 +873,7 @@ function Studio(): React.ReactElement {
 								hidden={hiddenParts}
 								model={shown}
 								onHiddenChange={setHiddenParts}
+								prefs={prefs}
 							/>
 						</Flyout>
 						{animation && mobile && (
@@ -855,6 +893,7 @@ function Studio(): React.ReactElement {
 									controller={animation}
 									mobile
 									onSelect={selectClip}
+									onSelectMoment={selectMoment}
 								/>
 							</Flyout>
 						)}
