@@ -117,8 +117,15 @@ pub(crate) fn decode_scalar(format: usize, data: &[u8]) -> Result<f32, String> {
         _ => unreachable!(),
     })
 }
-/// Channel `dimension` high nibble marking a normal packed into one 32-bit word.
+/// Channel `dimension` high nibble marking a compressed normal. With one Float32 component
+/// it is a 32-bit word decoded by [`packed_normal`]; other layouts (SNorm8 x4 on far-batch
+/// HLODs) are ordinary normalized components and decode as such.
 const PACKED_NORMAL: usize = 3;
+
+/// Whether a channel's raw `dimension` and `format` hold one [`packed_normal`] word.
+pub(crate) fn is_packed_normal(raw_dimension: usize, format: usize) -> bool {
+    raw_dimension >> 4 == PACKED_NORMAL && raw_dimension & 0x0f == 1 && format == 0
+}
 
 /// Decode a normal packed into one 32-bit word: an octahedral encoding with x in bits 0–9
 /// and y in bits 10–19, both signed-normalized. The upper bits hold the tangent frame
@@ -143,11 +150,15 @@ pub(crate) fn octahedral_unit(x: f32, y: f32) -> [f32; 3] {
     } else {
         [x, y]
     };
-    let length = (x * x + y * y + z * z).sqrt();
-    if length < 1e-6 {
+    unit_or_up([x, y, z])
+}
+/// `v` scaled to unit length, or +Z when it has none.
+fn unit_or_up(v: [f32; 3]) -> [f32; 3] {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if length < 1e-6 || !length.is_finite() {
         return [0.0, 0.0, 1.0];
     }
-    [x / length, y / length, z / length]
+    [v[0] / length, v[1] / length, v[2] / length]
 }
 fn channel_values(
     data: &[u8],
@@ -605,12 +616,13 @@ pub fn decode_mesh(
         .map(|v| {
             let o = v.as_object().ok_or_else(|| "invalid channel".to_string())?;
             let raw_dimension = index_field(o, "dimension")?;
+            let format = index_field(o, "format")?;
             Ok(Channel {
                 stream: index_field(o, "stream")?,
                 offset: index_field(o, "offset")?,
-                format: index_field(o, "format")?,
+                format,
                 dimension: raw_dimension & 0x0f,
-                packed: raw_dimension >> 4 == PACKED_NORMAL,
+                packed: is_packed_normal(raw_dimension, format),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -662,7 +674,15 @@ pub fn decode_mesh(
     let normals = match values(1) {
         Ok(Some(v)) if v.iter().all(|x| x.len() >= 3) => Some(to3(v)),
         _ => None,
-    };
+    }
+    .map(|n: Vec<[f32; 3]>| {
+        // Normalized-integer components (SNorm8 and the like) are only approximately unit.
+        if channels[1].packed || channels[1].format == 0 || channels[1].format == 1 {
+            n
+        } else {
+            n.into_iter().map(unit_or_up).collect()
+        }
+    });
     let tangents = match values(2)? {
         Some(v) if v.iter().all(|x| x.len() >= 4) => {
             Some(v.into_iter().map(|x| [x[0], x[1], x[2], x[3]]).collect())

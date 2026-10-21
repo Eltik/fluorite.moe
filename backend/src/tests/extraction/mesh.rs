@@ -468,3 +468,44 @@ fn packed_normal_channel_decodes_octahedral() {
     assert_close(&normals[1], &[0.6, 0.0, -0.8], 2e-3);
     assert_close(&normals[2], &[-0.558, -0.190, -0.808], 5e-3);
 }
+
+#[test]
+fn flagged_snorm8_normal_channel_decodes_components() {
+    // The whole vertex buffer of S_HLOD0_6_8_Cluster_0110_indie_dg005_art (far-batch HLOD):
+    // its normal channel has the compressed-normal nibble (dimension 0x34) but is plain
+    // SNorm8 x4, not a packed octahedral word.
+    let data = hex_bytes(
+        "0090b03f207f95404fb870c1be4eb400c091014100547cbf6795d5c1bb4bb400\
+         004671c0a088bac040e459c1a025b60000692e4110b61c4130922fc1e468bd00",
+    );
+    let object = json!({
+        "m_Name": "S_HLOD0_6_8_Cluster_0110_indie_dg005_art",
+        "m_IndexFormat": 0,
+        "m_IndexBuffer": [0, 0, 1, 0, 2, 0, 3, 0, 1, 0, 0, 0],
+        "m_SubMeshes": [{"firstByte": 0, "indexCount": 6, "topology": 0, "baseVertex": 0}],
+        "m_VertexData": {
+            "m_VertexCount": 4,
+            "m_Channels": [
+                {"stream": 0, "offset": 0, "format": 0, "dimension": 3},
+                {"stream": 0, "offset": 12, "format": 3, "dimension": 0x34},
+            ],
+            "m_DataSize": data,
+        },
+        "m_CompressedMesh": {"m_Vertices": empty_vector(), "m_Triangles": empty_vector()},
+    });
+    let mesh = decode_mesh(&object, &HashMap::new()).unwrap();
+    let normals = mesh.normals.unwrap();
+    for n in &normals {
+        assert!((n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1.0).abs() < 1e-5);
+    }
+    // Vertices 2 and 3 each belong to one triangle; their normals match its face normal.
+    assert_close(&normals[2], &[-0.7595, 0.2936, -0.5805], 5e-3);
+    assert_close(&normals[3], &[-0.2180, 0.8226, -0.5251], 5e-3);
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
