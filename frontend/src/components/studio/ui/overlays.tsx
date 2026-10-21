@@ -1,15 +1,20 @@
 /** Loading, empty, error, welcome, help and stats overlays. */
 import {
+	EyeOffIcon,
 	MonitorOffIcon,
 	MousePointer2Icon,
+	ScanIcon,
 	SparklesIcon,
 	TriangleAlertIcon,
 	XIcon,
 } from "lucide-react";
 import type * as React from "react";
+import type { MeshInfo } from "@/components/studio/inspect";
+import { shortShader } from "@/components/studio/inspect";
 import type { LoadedModel } from "@/components/studio/load-model";
 import { useRenderStats } from "@/components/studio/stats-store";
-import { formatMB, GlassCard } from "@/components/studio/ui/chrome";
+import { formatMB, GlassCard, IconButton } from "@/components/studio/ui/chrome";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -218,26 +223,69 @@ export function WelcomeHint({
 	);
 }
 
-const SHORTCUTS: { keys: string[]; label: string; clips?: true }[] = [
-	{ keys: ["M"], label: "Open the model picker" },
-	{ keys: ["P"], label: "Parts" },
-	{ keys: ["A"], label: "Animations", clips: true },
-	{ keys: ["B"], label: "Backdrop" },
-	{ keys: ["L"], label: "Lighting" },
-	{ keys: ["T"], label: "Toon or standard shading" },
-	{ keys: ["F"], label: "Reset the view" },
-	{ keys: ["C"], label: "Lock or unlock the camera" },
-	{ keys: ["O"], label: "Auto-rotate" },
-	{ keys: ["G"], label: "Floor grid" },
-	{ keys: ["W"], label: "Wireframe" },
-	{ keys: ["S"], label: "Save a screenshot" },
-	{ keys: ["H"], label: "Hide or show the interface" },
-	{ keys: ["Space"], label: "Play or pause", clips: true },
-	{ keys: ["←", "→"], label: "Step one frame", clips: true },
-	{ keys: ["Shift", "←↑↓→"], label: "Pan the view" },
-	{ keys: ["R"], label: "Restart the animation", clips: true },
-	{ keys: ["Esc"], label: "Close the open panel" },
-	{ keys: ["?"], label: "This help" },
+interface Shortcut {
+	keys: string[];
+	label: string;
+	clips?: true;
+}
+
+const SHORTCUT_GROUPS: { title: string; items: Shortcut[] }[] = [
+	{
+		title: "Panels",
+		items: [
+			{ keys: ["M"], label: "Model picker" },
+			{ keys: ["P"], label: "Parts" },
+			{ keys: ["A"], label: "Animations", clips: true },
+			{ keys: ["B"], label: "Backdrop" },
+			{ keys: ["L"], label: "Lighting" },
+			{ keys: ["V"], label: "View tools" },
+			{ keys: ["H"], label: "Hide or show the interface" },
+			{ keys: ["Esc"], label: "Close the panel, clear the selection" },
+			{ keys: ["?"], label: "This help" },
+		],
+	},
+	{
+		title: "Camera",
+		items: [
+			{ keys: ["F"], label: "Reset the view" },
+			{ keys: ["1", "…", "6"], label: "Front, back, right, left, top, ¾" },
+			{ keys: ["=", "−"], label: "Zoom in or out" },
+			{ keys: ["Shift", "←↑↓→"], label: "Pan the view" },
+			{ keys: ["C"], label: "Lock or unlock the camera" },
+			{ keys: ["O"], label: "Auto-rotate" },
+		],
+	},
+	{
+		title: "Display",
+		items: [
+			{ keys: ["T"], label: "Toon or standard shading" },
+			{ keys: ["U"], label: "Shaded, albedo or UV checker" },
+			{ keys: ["W"], label: "Wireframe" },
+			{ keys: ["Shift", "W"], label: "Wireframe overlay" },
+			{ keys: ["K"], label: "Skeleton" },
+			{ keys: ["N"], label: "Vertex normals" },
+			{ keys: ["X"], label: "Bounding box" },
+			{ keys: ["G"], label: "Floor grid" },
+			{ keys: ["Shift", "G"], label: "Axes" },
+		],
+	},
+	{
+		title: "Inspect and capture",
+		items: [
+			{ keys: ["I"], label: "Pick meshes by clicking" },
+			{ keys: ["⌫"], label: "Hide the selected part" },
+			{ keys: ["Shift", "S"], label: "Performance stats" },
+			{ keys: ["S"], label: "Save a screenshot" },
+		],
+	},
+	{
+		title: "Playback",
+		items: [
+			{ keys: ["Space"], label: "Play or pause", clips: true },
+			{ keys: ["←", "→"], label: "Step one frame", clips: true },
+			{ keys: ["R"], label: "Restart the animation", clips: true },
+		],
+	},
 ];
 
 const GESTURES: { input: string; mouse: string; touch: string }[] = [
@@ -245,9 +293,14 @@ const GESTURES: { input: string; mouse: string; touch: string }[] = [
 	{
 		input: "Pan",
 		mouse: "Right-drag, or Shift / Ctrl + drag",
-		touch: "Two fingers",
+		touch: "Two fingers, or one with pan mode",
 	},
-	{ input: "Zoom", mouse: "Scroll wheel", touch: "Pinch" },
+	{ input: "Zoom", mouse: "Scroll wheel, or = and −", touch: "Pinch, or +/−" },
+	{
+		input: "Inspect",
+		mouse: "Click a mesh with Pick on",
+		touch: "Tap a mesh with Pick on",
+	},
 ];
 
 export function HelpDialog({
@@ -262,18 +315,18 @@ export function HelpDialog({
 }): React.ReactElement {
 	return (
 		<Dialog onOpenChange={onOpenChange} open={open}>
-			<DialogPopup className="max-w-xl">
+			<DialogPopup className="max-w-2xl">
 				<DialogHeader>
 					<DialogTitle>Studio controls</DialogTitle>
 					<DialogDescription>
 						Look around a model with the mouse or touch, and drive everything
-						else from the keyboard.
+						else from the keyboard or the View tools.
 					</DialogDescription>
 				</DialogHeader>
-				<DialogPanel className="grid gap-6 sm:grid-cols-[1fr_1.1fr]">
+				<DialogPanel className="grid max-h-[70dvh] gap-6 overflow-y-auto sm:grid-cols-[1fr_1.3fr]">
 					<section className="flex flex-col gap-2">
 						<h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-							Camera
+							Gestures
 						</h3>
 						<dl className="flex flex-col gap-2 text-sm">
 							{GESTURES.map((g) => (
@@ -286,26 +339,34 @@ export function HelpDialog({
 							))}
 						</dl>
 					</section>
-					<section className="flex flex-col gap-2">
-						<h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-							Keyboard
-						</h3>
-						<dl className="flex flex-col gap-1.5 text-sm">
-							{SHORTCUTS.filter((s) => hasClips || !s.clips).map((s) => (
-								<div
-									className="flex items-center justify-between gap-3"
-									key={s.label}
-								>
-									<dt className="text-muted-foreground">{s.label}</dt>
-									<dd className="flex gap-1">
-										{s.keys.map((k) => (
-											<Kbd key={k}>{k}</Kbd>
+					<div className="flex flex-col gap-4">
+						{SHORTCUT_GROUPS.map((group) => {
+							const items = group.items.filter((s) => hasClips || !s.clips);
+							if (!items.length) return null;
+							return (
+								<section className="flex flex-col gap-1.5" key={group.title}>
+									<h3 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+										{group.title}
+									</h3>
+									<dl className="flex flex-col gap-1 text-sm">
+										{items.map((s) => (
+											<div
+												className="flex items-center justify-between gap-3"
+												key={s.label}
+											>
+												<dt className="text-muted-foreground">{s.label}</dt>
+												<dd className="flex shrink-0 gap-1">
+													{s.keys.map((k) => (
+														<Kbd key={k}>{k}</Kbd>
+													))}
+												</dd>
+											</div>
 										))}
-									</dd>
-								</div>
-							))}
-						</dl>
-					</section>
+									</dl>
+								</section>
+							);
+						})}
+					</div>
 				</DialogPanel>
 			</DialogPopup>
 		</Dialog>
@@ -323,7 +384,8 @@ export function StatsCard({
 	const rows: [string, string][] = [
 		["FPS", stats ? (stats.fps < 0.5 ? "idle" : stats.fps.toFixed(0)) : "–"],
 		["Draw calls", stats ? formatNumber(stats.calls) : "–"],
-		["Triangles", model ? formatNumber(model.stats.triangles) : "–"],
+		["Triangles", stats ? formatNumber(stats.triangles) : "–"],
+		["Model tris", model ? formatNumber(model.stats.triangles) : "–"],
 		["Meshes", model ? formatNumber(model.stats.meshes) : "–"],
 		[
 			"Textures",
@@ -345,6 +407,81 @@ export function StatsCard({
 					</div>
 				))}
 			</dl>
+		</GlassCard>
+	);
+}
+
+/**
+ * Floating chip for the picked mesh: what it is and the game shader that
+ * draws it, with isolate / hide at hand even when the View panel is closed.
+ */
+export function SelectionCard({
+	info,
+	canIsolate,
+	onIsolate,
+	onHide,
+	onClear,
+	className,
+}: {
+	info: MeshInfo;
+	canIsolate: boolean;
+	onIsolate: () => void;
+	onHide: () => void;
+	onClear: () => void;
+	className?: string;
+}): React.ReactElement {
+	return (
+		<GlassCard
+			aria-label="Selected mesh"
+			className={cn("flex items-center gap-2 p-1.5 ps-3", className)}
+			role="region"
+		>
+			<span
+				aria-hidden="true"
+				className="size-2 shrink-0 rounded-full bg-[#8b7cf6] shadow-[0_0_0_3px_rgb(139_124_246/0.25)]"
+			/>
+			<div className="flex min-w-0 flex-col">
+				<span className="truncate font-medium text-sm leading-tight">
+					{info.name}
+				</span>
+				<span className="flex min-w-0 items-center gap-1.5 overflow-hidden text-muted-foreground text-xs leading-tight">
+					{info.shader ? (
+						<Badge
+							className="min-w-0 shrink font-mono text-[0.625rem]"
+							size="sm"
+							title={info.shader}
+							variant="secondary"
+						>
+							<span className="truncate">{shortShader(info.shader)}</span>
+						</Badge>
+					) : (
+						<span className="truncate">{info.materialName}</span>
+					)}
+					<span className="shrink-0 tabular-nums">
+						{formatNumber(info.triangles)} tris
+					</span>
+				</span>
+			</div>
+			<div className="ms-1 flex shrink-0 items-center gap-0.5 border-s ps-1">
+				<IconButton
+					disabled={!canIsolate}
+					label="Isolate this part"
+					onClick={onIsolate}
+				>
+					<ScanIcon />
+				</IconButton>
+				<IconButton
+					disabled={!canIsolate}
+					label="Hide this part"
+					onClick={onHide}
+					shortcut="⌫"
+				>
+					<EyeOffIcon />
+				</IconButton>
+				<IconButton label="Clear selection" onClick={onClear} shortcut="Esc">
+					<XIcon />
+				</IconButton>
+			</div>
 		</GlassCard>
 	);
 }

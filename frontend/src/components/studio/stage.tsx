@@ -14,14 +14,18 @@ import {
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import * as React from "react";
 import {
+	AxesHelper,
 	Box3,
+	Box3Helper,
 	CanvasTexture,
+	Color,
 	type Group,
 	type Mesh,
 	NeutralToneMapping,
 	NoToneMapping,
 	type PerspectiveCamera,
 	type Quaternion,
+	Raycaster,
 	SkeletonHelper,
 	type SkinnedMesh,
 	setConsoleFunction,
@@ -31,6 +35,13 @@ import {
 } from "three";
 import type { AnimationController } from "@/components/studio/animation";
 import { ContactShadows } from "@/components/studio/contact-shadows";
+import {
+	makeOverlay,
+	NormalsHelper,
+	selectionMaterials,
+	wireOverlayColor,
+} from "@/components/studio/helpers";
+import { partOf } from "@/components/studio/inspect";
 import type { LoadedModel } from "@/components/studio/load-model";
 import { StageBackdrop } from "@/components/studio/npr/backdrop";
 import { Bloom } from "@/components/studio/npr/bloom";
@@ -48,11 +59,7 @@ import {
 } from "@/components/studio/npr/rig";
 import { SelfShadow } from "@/components/studio/npr/self-shadow";
 import { useSceneObjects } from "@/components/studio/npr/use-scene-objects";
-import type {
-	ShadingId,
-	StudioPrefs,
-	ZUpMode,
-} from "@/components/studio/prefs";
+import type { StudioPrefs, ZUpMode } from "@/components/studio/prefs";
 import {
 	type DirLight,
 	LIGHTING,
@@ -62,10 +69,24 @@ import {
 import { PropsRig } from "@/components/studio/props-rig";
 import {
 	applyShading,
+	meshesOf,
+	type ShadingLook,
 	shadingUniforms,
 	updateFaceFrames,
 } from "@/components/studio/shading";
 import { publishStats } from "@/components/studio/stats-store";
+import {
+	clampFov,
+	distanceForFov,
+	distanceFromZoom,
+	presetDirection,
+	type ViewPresetId,
+} from "@/components/studio/view-math";
+import {
+	publishCamera,
+	type Selection,
+	type ViewState,
+} from "@/components/studio/view-state";
 import {
 	cameraDirection,
 	FRONT_DIRECTION,
@@ -93,7 +114,15 @@ export interface StageHandle {
 	resetView: () => void;
 	/** Pans by a fraction of the view (1 = a full frame). */
 	pan: (dx: number, dy: number) => void;
-	screenshot: (filename: string) => Promise<void>;
+	/** Multiplies the camera distance (< 1 zooms in). */
+	zoomBy: (factor: number) => void;
+	/** Slider position, 0 = far limit, 1 = near limit. */
+	setZoom: (zoom: number) => void;
+	/** Frames the whole model from a preset direction, keeping the lens. */
+	setView: (preset: ViewPresetId) => void;
+	/** Vertical field of view; the camera dollies so the subject keeps its size. */
+	setFov: (fov: number) => void;
+	screenshot: (filename: string, transparent?: boolean) => Promise<void>;
 }
 
 export interface StageProps {
@@ -103,6 +132,9 @@ export interface StageProps {
 	prefs: StudioPrefs;
 	background: ResolvedBackground;
 	locked: boolean;
+	view: ViewState;
+	/** A mesh was picked (or empty space, with null). */
+	onPick: (selection: Selection | null) => void;
 	animation: AnimationController | null;
 	handleRef: React.RefObject<StageHandle | null>;
 	/** Called once a model is compiled, attached and framed. */
@@ -339,8 +371,14 @@ function NprSync({
 	return null;
 }
 
-/** Keeps the fallback toon rim and outline uniforms in sync with the view. */
-function ShadingSync({ preset }: { preset: LightingPreset }) {
+/** Keeps the fallback toon rim, outline and wire-overlay uniforms in sync with the view. */
+function ShadingSync({
+	preset,
+	dark,
+}: {
+	preset: LightingPreset;
+	dark: boolean;
+}) {
 	const gl = useThree((s) => s.gl);
 	const invalidate = useThree((s) => s.invalidate);
 	const size = React.useMemo(() => new Vector2(), []);
@@ -349,6 +387,10 @@ function ShadingSync({ preset }: { preset: LightingPreset }) {
 		shadingUniforms.rimStrength.value = preset.toon.rim.strength;
 		invalidate();
 	}, [preset, invalidate]);
+	React.useEffect(() => {
+		wireOverlayColor.set(dark ? "#d8d2ff" : "#2a2440");
+		invalidate();
+	}, [dark, invalidate]);
 	useFrame(() => {
 		gl.getDrawingBufferSize(size);
 		shadingUniforms.resolution.value.copy(size);
@@ -487,6 +529,15 @@ function insetsFor(width: number, height: number, transport: boolean): Insets {
  * three-quarter view for static models. The fit uses the free part of the
  * viewport, so it holds on phones too.
  */
+interface ReframeOptions {
+	transition: boolean;
+	/**
+	 * A view preset: world-space direction from the model to the camera. The
+	 * current lens is kept and the saved (default) state left alone.
+	 */
+	direction?: Vec3;
+}
+
 function frameCamera(
 	controls: CameraControls,
 	camera: PerspectiveCamera,
@@ -494,17 +545,19 @@ function frameCamera(
 	model: LoadedModel,
 	orientation: Quaternion,
 	viewport: { width: number; height: number },
-	transition: boolean,
+	{ transition, direction }: ReframeOptions,
 ): void {
 	const game = model.charscreen?.camera ?? null;
-	const dir = new Vector3(
-		...(game
-			? cameraDirection(game)
-			: model.rigged
-				? FRONT_DIRECTION
-				: STATIC_DIRECTION),
-	).applyQuaternion(orientation);
-	const fov = game ? game.fov : CAMERA_FOV;
+	const dir = direction
+		? new Vector3(...direction)
+		: new Vector3(
+				...(game
+					? cameraDirection(game)
+					: model.rigged
+						? FRONT_DIRECTION
+						: STATIC_DIRECTION),
+			).applyQuaternion(orientation);
+	const fov = direction ? camera.fov : game ? game.fov : CAMERA_FOV;
 	const fit = fitBox({
 		min: framing.min.toArray() as Vec3,
 		max: framing.max.toArray() as Vec3,
@@ -537,21 +590,21 @@ function frameCamera(
 		fit.target[2],
 		transition,
 	);
-	controls.saveState();
+	if (!direction) controls.saveState();
 }
+
+type Reframe = (options: ReframeOptions) => void;
 
 interface MountProps {
 	model: LoadedModel | null;
 	zUpMode: ZUpMode;
 	hiddenParts: ReadonlySet<string>;
-	wireframe: boolean;
-	shading: ShadingId;
-	outlines: boolean;
+	look: ShadingLook;
 	onFramed: (framing: Framing | null) => void;
 	onShown: (model: LoadedModel | null) => void;
 	controls: React.RefObject<CameraControls | null>;
-	/** Receives a function that re-frames the shown model (Reset). */
-	reframeRef: React.RefObject<((transition: boolean) => void) | null>;
+	/** Receives a function that re-frames the shown model (Reset, presets). */
+	reframeRef: React.RefObject<Reframe | null>;
 }
 
 const reducedMotion = () =>
@@ -575,9 +628,7 @@ function ModelMount({
 	model,
 	zUpMode,
 	hiddenParts,
-	wireframe,
-	shading,
-	outlines,
+	look,
 	onFramed,
 	onShown,
 	controls,
@@ -594,8 +645,8 @@ function ModelMount({
 	const turn = React.useRef<Group>(null);
 	const [current, setCurrent] = React.useState<LoadedModel | null>(null);
 	const framed = React.useRef<LoadedModel | null>(null);
-	const look = React.useRef({ shading, outlines, wireframe });
-	look.current = { shading, outlines, wireframe };
+	const lookRef = React.useRef(look);
+	lookRef.current = look;
 
 	// Pre-compile shaders off-screen (with the final materials), then swap
 	// the new model in.
@@ -606,8 +657,7 @@ function ModelMount({
 			return;
 		}
 		let cancelled = false;
-		const l = look.current;
-		applyShading(model.content, l.shading, l.outlines, l.wireframe);
+		applyShading(model.content, lookRef.current);
 		(gl as WebGLRenderer)
 			.compileAsync(model.content, camera, scene)
 			.catch(() => {})
@@ -659,7 +709,7 @@ function ModelMount({
 		const framing = measure(o);
 		onFramed(framing);
 		const swapped = framed.current !== current;
-		const reframe = (transition: boolean) => {
+		const reframe: Reframe = (options) => {
 			const c = controls.current;
 			if (c) {
 				frameCamera(
@@ -669,14 +719,14 @@ function ModelMount({
 					current,
 					t.quaternion,
 					sizeRef.current,
-					transition,
+					options,
 				);
 			}
 		};
 		reframeRef.current = reframe;
 		// A new model snaps into place behind a fade; re-orienting the same
 		// model glides.
-		reframe(!swapped);
+		reframe({ transition: !swapped });
 		if (swapped) fadeIn(gl.domElement);
 		framed.current = current;
 		invalidate();
@@ -706,9 +756,9 @@ function ModelMount({
 
 	React.useEffect(() => {
 		if (!current) return;
-		applyShading(current.content, shading, outlines, wireframe);
+		applyShading(current.content, look);
 		invalidate();
-	}, [current, shading, outlines, wireframe, invalidate]);
+	}, [current, look, invalidate]);
 
 	return (
 		<group ref={outer}>
@@ -724,6 +774,216 @@ function Skeleton({ model }: { model: LoadedModel }) {
 	);
 	React.useEffect(() => () => helper.dispose(), [helper]);
 	return helper.bones.length ? <primitive object={helper} /> : null;
+}
+
+// ------------------------------------------------------------- inspect
+
+/** Whether every ancestor up to the scene is visible. */
+function effectivelyVisible(object: Mesh): boolean {
+	for (let o: Mesh["parent"] = object; o; o = o.parent) {
+		if (!o.visible) return false;
+	}
+	return true;
+}
+
+/** The model's drawn meshes, for picking and the normals helper. */
+function visibleMeshes(model: LoadedModel): Mesh[] {
+	return meshesOf(model.content).filter(effectivelyVisible);
+}
+
+/**
+ * Click-to-select: a press that neither travels nor lingers raycasts the
+ * shown model (skinned meshes in their current pose) and reports the mesh
+ * under the pointer, or null for empty space.
+ */
+function Picker({
+	model,
+	enabled,
+	onPick,
+}: {
+	model: LoadedModel | null;
+	enabled: boolean;
+	onPick: (selection: Selection | null) => void;
+}) {
+	const gl = useThree((s) => s.gl);
+	const camera = useThree((s) => s.camera);
+	const raycaster = React.useMemo(() => new Raycaster(), []);
+	React.useEffect(() => {
+		if (!enabled || !model) return;
+		const el = gl.domElement;
+		let down: { x: number; y: number; t: number; id: number } | null = null;
+		const onDown = (e: PointerEvent) => {
+			if (e.button !== 0) return;
+			down = {
+				x: e.clientX,
+				y: e.clientY,
+				t: performance.now(),
+				id: e.pointerId,
+			};
+		};
+		const onUp = (e: PointerEvent) => {
+			const d = down;
+			down = null;
+			if (!d || d.id !== e.pointerId) return;
+			if (
+				Math.hypot(e.clientX - d.x, e.clientY - d.y) > 6 ||
+				performance.now() - d.t > 500
+			) {
+				return;
+			}
+			const rect = el.getBoundingClientRect();
+			raycaster.setFromCamera(
+				new Vector2(
+					((e.clientX - rect.left) / rect.width) * 2 - 1,
+					-((e.clientY - rect.top) / rect.height) * 2 + 1,
+				),
+				camera,
+			);
+			const meshes = visibleMeshes(model);
+			for (const mesh of meshes) {
+				const skinned = mesh as SkinnedMesh;
+				if (skinned.isSkinnedMesh) {
+					// Pose-dependent bounds gate the per-triangle test.
+					skinned.computeBoundingBox();
+					skinned.computeBoundingSphere();
+				}
+			}
+			const hit = raycaster.intersectObjects(meshes, false)[0];
+			if (!hit) {
+				onPick(null);
+				return;
+			}
+			const mesh = hit.object as Mesh;
+			onPick({
+				partId: partOf(model, mesh)?.id ?? null,
+				meshId: mesh.uuid,
+				materialIndex: hit.face?.materialIndex ?? 0,
+			});
+		};
+		const onCancel = () => {
+			down = null;
+		};
+		el.addEventListener("pointerdown", onDown);
+		el.addEventListener("pointerup", onUp);
+		el.addEventListener("pointercancel", onCancel);
+		return () => {
+			el.removeEventListener("pointerdown", onDown);
+			el.removeEventListener("pointerup", onUp);
+			el.removeEventListener("pointercancel", onCancel);
+		};
+	}, [gl, camera, raycaster, model, enabled, onPick]);
+	return null;
+}
+
+/** Translucent tint and wire over the picked mesh. */
+function SelectionHighlight({
+	model,
+	selection,
+}: {
+	model: LoadedModel;
+	selection: Selection;
+}) {
+	const invalidate = useThree((s) => s.invalidate);
+	React.useEffect(() => {
+		const mesh = model.content.getObjectByProperty("uuid", selection.meshId) as
+			| Mesh
+			| undefined;
+		if (!mesh?.isMesh) return;
+		const [tint, wire] = selectionMaterials();
+		const overlays = [makeOverlay(mesh, tint), makeOverlay(mesh, wire)];
+		for (const o of overlays) {
+			o.name = "selection";
+			o.renderOrder = mesh.renderOrder + 2;
+			mesh.add(o);
+		}
+		invalidate();
+		return () => {
+			for (const o of overlays) o.removeFromParent();
+			tint.dispose();
+			wire.dispose();
+			invalidate();
+		};
+	}, [model, selection.meshId, invalidate]);
+	return null;
+}
+
+/**
+ * Vertex normals for the selected mesh, or every visible mesh under a
+ * global cap. Built when toggled (and when the set of meshes changes); the
+ * positions are refreshed only while a clip plays.
+ */
+function Normals({
+	model,
+	selection,
+	visibilityKey,
+	radius,
+	animation,
+}: {
+	model: LoadedModel;
+	selection: Selection | null;
+	visibilityKey: string;
+	radius: number;
+	animation: AnimationController | null;
+}) {
+	const invalidate = useThree((s) => s.invalidate);
+	const meshId = selection?.meshId ?? null;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: visibilityKey tracks part toggles
+	const helper = React.useMemo(() => {
+		const picked = meshId
+			? (model.content.getObjectByProperty("uuid", meshId) as Mesh | undefined)
+			: undefined;
+		const meshes = picked?.isMesh ? [picked] : visibleMeshes(model);
+		return new NormalsHelper(meshes, Math.max(radius * 0.025, 0.002));
+	}, [model, meshId, visibilityKey, radius]);
+	React.useEffect(() => {
+		invalidate();
+		return () => helper.dispose();
+	}, [helper, invalidate]);
+	useFrame(() => {
+		if (animation?.state.playing) helper.update();
+	});
+	return <primitive object={helper.object} />;
+}
+
+function Bounds({ framing, dark }: { framing: Framing; dark: boolean }) {
+	const helper = React.useMemo(() => {
+		const box = new Box3(framing.min, framing.max);
+		const h = new Box3Helper(box, new Color(dark ? "#f0ad4e" : "#c47d0e"));
+		h.raycast = () => {};
+		return h;
+	}, [framing, dark]);
+	React.useEffect(() => () => helper.dispose(), [helper]);
+	return <primitive object={helper} />;
+}
+
+function Axes({ size }: { size: number }) {
+	const helper = React.useMemo(() => {
+		const h = new AxesHelper(size);
+		h.raycast = () => {};
+		h.renderOrder = 5;
+		return h;
+	}, [size]);
+	React.useEffect(() => () => helper.dispose(), [helper]);
+	return <primitive object={helper} position={[0, 0.001 * size, 0]} />;
+}
+
+/** Publishes the camera distance, limits and lens for the View panel. */
+function CameraSync({
+	controls,
+}: {
+	controls: React.RefObject<CameraControls | null>;
+}) {
+	useFrame(() => {
+		const c = controls.current;
+		if (!c) return;
+		publishCamera({
+			distance: c.distance,
+			minDistance: c.minDistance,
+			maxDistance: c.maxDistance,
+			fov: (c.camera as PerspectiveCamera).fov,
+		});
+	});
+	return null;
 }
 
 // ------------------------------------------------------------- drivers
@@ -772,6 +1032,9 @@ function MixerDriver({
 	return null;
 }
 
+const clampDistance = (c: CameraControls, d: number) =>
+	Math.min(c.maxDistance, Math.max(c.minDistance, d));
+
 function HandleBridge({
 	handleRef,
 	controls,
@@ -781,7 +1044,7 @@ function HandleBridge({
 	handleRef: React.RefObject<StageHandle | null>;
 	controls: React.RefObject<CameraControls | null>;
 	background: ResolvedBackground;
-	reframeRef: React.RefObject<((transition: boolean) => void) | null>;
+	reframeRef: React.RefObject<Reframe | null>;
 }) {
 	const gl = useThree((s) => s.gl);
 	const scene = useThree((s) => s.scene);
@@ -793,8 +1056,43 @@ function HandleBridge({
 			resetView: () => {
 				const c = controls.current;
 				if (!c) return;
-				if (reframeRef.current) reframeRef.current(true);
+				if (reframeRef.current) reframeRef.current({ transition: true });
 				else void c.reset(true);
+				invalidate();
+			},
+			zoomBy: (factor) => {
+				const c = controls.current;
+				if (!c?.enabled) return;
+				void c.dollyTo(clampDistance(c, c.distance * factor), true);
+				invalidate();
+			},
+			setZoom: (zoom) => {
+				const c = controls.current;
+				if (!c?.enabled) return;
+				void c.dollyTo(
+					distanceFromZoom(zoom, c.minDistance, c.maxDistance),
+					false,
+				);
+				invalidate();
+			},
+			setView: (preset) => {
+				const c = controls.current;
+				if (!c?.enabled || !reframeRef.current) return;
+				reframeRef.current({
+					transition: true,
+					direction: presetDirection(preset),
+				});
+				invalidate();
+			},
+			setFov: (fov) => {
+				const c = controls.current;
+				if (!c?.enabled) return;
+				const cam = c.camera as PerspectiveCamera;
+				const next = clampFov(fov);
+				const distance = distanceForFov(c.distance, cam.fov, next);
+				cam.fov = next;
+				cam.updateProjectionMatrix();
+				void c.dollyTo(clampDistance(c, distance), false);
 				invalidate();
 			},
 			pan: (dx, dy) => {
@@ -806,15 +1104,34 @@ function HandleBridge({
 				void c.truck(dx * visible * 0.1, dy * visible * 0.1, true);
 				invalidate();
 			},
-			screenshot: async (filename: string) => {
+			screenshot: async (filename: string, transparent = false) => {
+				// The stage backdrop is scene geometry; a transparent capture
+				// leaves it (and the painted background) out.
+				const hidden: Mesh[] = [];
+				if (transparent) {
+					for (const child of scene.children) {
+						const mesh = child as Mesh;
+						const material = mesh.material as { name?: string } | undefined;
+						if (
+							mesh.isMesh &&
+							mesh.visible &&
+							material?.name?.startsWith("stage ")
+						) {
+							mesh.visible = false;
+							hidden.push(mesh);
+						}
+					}
+				}
 				gl.render(scene, camera);
+				for (const mesh of hidden) mesh.visible = true;
+				if (hidden.length) invalidate();
 				const src = gl.domElement;
 				const out = document.createElement("canvas");
 				out.width = src.width;
 				out.height = src.height;
 				const ctx = out.getContext("2d");
 				if (!ctx) throw new Error("Canvas 2D is unavailable");
-				background.paint(ctx, out.width, out.height);
+				if (!transparent) background.paint(ctx, out.width, out.height);
 				ctx.drawImage(src, 0, 0);
 				const blob = await new Promise<Blob | null>((resolve) =>
 					out.toBlob(resolve, "image/png"),
@@ -834,25 +1151,47 @@ function HandleBridge({
 }
 
 /**
- * Shift- or Ctrl-drag with the left button pans, for trackpads without a
- * right button. The modifier is read on pointerdown (before camera-controls
- * sees it) and the button mapping restored on release. Right-drag and
- * two-finger drag pan through camera-controls' defaults.
+ * Pan mode swaps the primary gesture (left-drag, one finger) from orbit to
+ * pan, which is what touch users need. Shift- or Ctrl-drag with the left
+ * button pans too, for trackpads without a right button: the modifier is read
+ * on pointerdown (before camera-controls sees it) and the button mapping
+ * restored on release. Right-drag and two-finger drag pan through
+ * camera-controls' defaults.
  */
 function PanModifiers({
 	controls,
+	panMode,
 }: {
 	controls: React.RefObject<CameraControls | null>;
+	panMode: boolean;
 }) {
 	const gl = useThree((s) => s.gl);
+	const mode = React.useRef(panMode);
+	mode.current = panMode;
+	React.useEffect(() => {
+		const c = controls.current;
+		if (!c) return;
+		c.mouseButtons.left = panMode
+			? CameraControlsImpl.ACTION.TRUCK
+			: CameraControlsImpl.ACTION.ROTATE;
+		c.touches.one = panMode
+			? CameraControlsImpl.ACTION.TOUCH_TRUCK
+			: CameraControlsImpl.ACTION.TOUCH_ROTATE;
+	}, [controls, panMode]);
 	React.useEffect(() => {
 		const el = gl.domElement;
+		// The primary action to restore after a modifier drag (pan mode may
+		// have changed meanwhile).
+		const primary = () =>
+			mode.current
+				? CameraControlsImpl.ACTION.TRUCK
+				: CameraControlsImpl.ACTION.ROTATE;
 		const onDown = (e: PointerEvent) => {
 			const c = controls.current;
 			if (!c?.enabled || e.button !== 0 || !(e.shiftKey || e.ctrlKey)) return;
 			c.mouseButtons.left = CameraControlsImpl.ACTION.TRUCK;
 			const restore = () => {
-				c.mouseButtons.left = CameraControlsImpl.ACTION.ROTATE;
+				c.mouseButtons.left = primary();
 				window.removeEventListener("pointerup", restore, true);
 				window.removeEventListener("pointercancel", restore, true);
 			};
@@ -878,18 +1217,14 @@ function PanModifiers({
 function CharProps({
 	model,
 	controller,
-	shading,
-	outlines,
-	wireframe,
+	look,
 	showWeapon,
 	showProps,
 	onWarnings,
 }: {
 	model: LoadedModel | null;
 	controller: AnimationController | null;
-	shading: ShadingId;
-	outlines: boolean;
-	wireframe: boolean;
+	look: ShadingLook;
 	showWeapon: boolean;
 	showProps: boolean;
 	onWarnings: (warnings: string[]) => void;
@@ -899,8 +1234,8 @@ function CharProps({
 	const scene = useThree((s) => s.scene);
 	const invalidate = useThree((s) => s.invalidate);
 	const rig = React.useRef<PropsRig | null>(null);
-	const look = React.useRef({ shading, outlines, wireframe });
-	look.current = { shading, outlines, wireframe };
+	const lookRef = React.useRef(look);
+	lookRef.current = look;
 	const enabled = React.useRef({ showWeapon, showProps });
 	enabled.current = { showWeapon, showProps };
 
@@ -910,7 +1245,7 @@ function CharProps({
 		if (!model || !cs || (!cs.weapon?.glb && !cs.deco?.items.length)) return;
 		const r = new PropsRig(model);
 		const aborter = new AbortController();
-		void r.load(aborter.signal, look.current).then(
+		void r.load(aborter.signal, lookRef.current).then(
 			() => {
 				if (aborter.signal.aborted) return;
 				r.setEnabled(enabled.current.showWeapon, enabled.current.showProps);
@@ -932,9 +1267,9 @@ function CharProps({
 	}, [model, gl, camera, scene, invalidate, onWarnings]);
 
 	React.useEffect(() => {
-		rig.current?.setLook({ shading, outlines, wireframe });
+		rig.current?.setLook(look);
 		invalidate();
-	}, [shading, outlines, wireframe, invalidate]);
+	}, [look, invalidate]);
 
 	React.useEffect(() => {
 		rig.current?.setEnabled(showWeapon, showProps);
@@ -977,6 +1312,8 @@ export function Stage({
 	prefs,
 	background,
 	locked,
+	view,
+	onPick,
 	animation,
 	handleRef,
 	onShown,
@@ -985,7 +1322,7 @@ export function Stage({
 	label,
 }: StageProps): React.ReactElement {
 	const controls = React.useRef<CameraControls | null>(null);
-	const reframeRef = React.useRef<((transition: boolean) => void) | null>(null);
+	const reframeRef = React.useRef<Reframe | null>(null);
 	const [framing, setFraming] = React.useState<Framing | null>(null);
 	const [shown, setShown] = React.useState<LoadedModel | null>(null);
 	const preset = LIGHTING[prefs.lighting];
@@ -1009,6 +1346,28 @@ export function Stage({
 		() => [...hiddenParts].sort().join("|"),
 		[hiddenParts],
 	);
+	const look = React.useMemo<ShadingLook>(
+		() => ({
+			shading: prefs.shading,
+			outlines: prefs.outlines,
+			wireframe: prefs.wireframe,
+			wireframeOverlay: prefs.wireframeOverlay,
+			surface: prefs.surface,
+		}),
+		[
+			prefs.shading,
+			prefs.outlines,
+			prefs.wireframe,
+			prefs.wireframeOverlay,
+			prefs.surface,
+		],
+	);
+	// A selection that no longer belongs to the shown model is ignored.
+	const selection =
+		view.selection &&
+		shown?.content.getObjectByProperty("uuid", view.selection.meshId)
+			? view.selection
+			: null;
 
 	return (
 		<Canvas
@@ -1045,7 +1404,7 @@ export function Stage({
 			{prefs.stats && <StatsProbe />}
 			<LightRig preset={preset} radius={radius} toon={toon} />
 			<StudioEnvironment key={prefs.lighting} preset={preset} />
-			<ShadingSync preset={preset} />
+			<ShadingSync dark={background.dark} preset={preset} />
 			<NprSync
 				extraLights={prefs.extraLights}
 				follow={prefs.lightFollow}
@@ -1060,24 +1419,20 @@ export function Stage({
 			<ModelMount
 				controls={controls}
 				hiddenParts={hiddenParts}
+				look={look}
 				model={model}
 				onFramed={setFraming}
 				onShown={handleShown}
-				outlines={prefs.outlines}
 				reframeRef={reframeRef}
-				shading={prefs.shading}
-				wireframe={prefs.wireframe}
 				zUpMode={zUpMode}
 			/>
 			<CharProps
 				controller={animation}
+				look={look}
 				model={shown}
 				onWarnings={onPropWarnings}
-				outlines={prefs.outlines}
-				shading={prefs.shading}
 				showProps={prefs.showProps}
 				showWeapon={prefs.showWeapon}
-				wireframe={prefs.wireframe}
 			/>
 			{prefs.floor && !background.stage && shown && framing && (
 				<FloorDisc
@@ -1087,12 +1442,29 @@ export function Stage({
 				/>
 			)}
 			{shown?.rigged && prefs.skeleton && <Skeleton model={shown} />}
+			{shown && selection && (
+				<SelectionHighlight model={shown} selection={selection} />
+			)}
+			{shown && view.normals && (
+				<Normals
+					animation={animation}
+					model={shown}
+					radius={radius}
+					selection={selection}
+					visibilityKey={visibilityKey}
+				/>
+			)}
+			{shown && framing && prefs.bounds && (
+				<Bounds dark={background.dark} framing={framing} />
+			)}
+			{shown && prefs.axes && <Axes size={Math.max(radius * 0.6, 0.1)} />}
+			<Picker enabled={view.picking} model={shown} onPick={onPick} />
 			{prefs.groundShadow && shown?.rigged && framing && (
 				<ContactBlobs placementKey={framing.version} root={shown.content} />
 			)}
 			{prefs.groundShadow && shown && !shown.rigged && framing && (
 				<ContactShadows
-					bakeKey={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}`}
+					bakeKey={`${framing.version}:${visibilityKey}:${prefs.wireframe}:${prefs.shading}:${prefs.outlines}:${prefs.surface}`}
 					blur={2.2}
 					color={background.dark ? "#000000" : "#2a2440"}
 					far={Math.max(height * 0.4, 0.2)}
@@ -1125,7 +1497,8 @@ export function Stage({
 				smoothTime={0.2}
 			/>
 			<ControlsLock controls={controls} locked={locked} />
-			<PanModifiers controls={controls} />
+			<PanModifiers controls={controls} panMode={view.panMode} />
+			<CameraSync controls={controls} />
 			<AutoRotate controls={controls} enabled={prefs.autoRotate && !locked} />
 			<MixerDriver controller={animation} />
 			<Bloom enabled={toon && prefs.bloom} />

@@ -30,6 +30,12 @@ import {
 	Vector2,
 	type WebGLProgramParametersWithUniforms,
 } from "three";
+import {
+	getUvChecker,
+	isHelper,
+	makeOverlay,
+	wireOverlayMaterial,
+} from "@/components/studio/helpers";
 import { extrasOf, isEyeShader, nprKind } from "@/components/studio/npr/extras";
 import {
 	computeFaceFrame,
@@ -44,7 +50,18 @@ import {
 	wantsFaceFrame,
 } from "@/components/studio/npr/material";
 import { createNprOutline } from "@/components/studio/npr/outline";
-import type { ShadingId } from "@/components/studio/prefs";
+import type { ShadingId, SurfaceId } from "@/components/studio/prefs";
+
+/** Everything `applyShading` needs to dress a model. */
+export interface ShadingLook {
+	shading: ShadingId;
+	outlines: boolean;
+	wireframe: boolean;
+	/** Wireframe drawn over the shaded surface instead of replacing it. */
+	wireframeOverlay?: boolean;
+	/** Debug surface view; `shaded` (default) uses the real materials. */
+	surface?: SurfaceId;
+}
 
 /** Uniforms shared by the fallback toon / outline materials of the page. */
 export const shadingUniforms = {
@@ -88,7 +105,12 @@ interface ShadingData {
 	toon?: Material | Material[];
 	/** Standard mode for character materials: unlit, tone mapped (as in the game's menu). */
 	flat?: Material | Material[];
+	/** Debug views: the base colour unlit, and the UV checker. */
+	albedo?: Material | Material[];
+	uv?: Material | Material[];
 	outline?: ThreeMesh | null;
+	/** Wireframe overlay child, created on first use. */
+	wire?: ThreeMesh;
 	/** Head axes for SDF-lit skin; `null` once tried and not applicable. */
 	face?: FaceFrame | null;
 	/** True when the toon variant uses the NPR materials. */
@@ -273,22 +295,61 @@ function renderQueueOf(materials: Material[]): number {
 	return -1;
 }
 
-function meshesOf(root: Object3D): ShadedMesh[] {
+/** The model's own meshes: outlines and overlay helpers are skipped. */
+export function meshesOf(root: Object3D): ShadedMesh[] {
 	const meshes: ShadedMesh[] = [];
 	root.traverse((node) => {
 		const mesh = node as ShadedMesh;
-		if (mesh.isMesh && !mesh.userData.studioOutline) meshes.push(mesh);
+		if (mesh.isMesh && !isHelper(mesh)) meshes.push(mesh);
 	});
 	return meshes;
 }
 
-/** Applies a shading mode, outline toggle and wireframe to a model. */
-export function applyShading(
-	root: Object3D,
-	mode: ShadingId,
-	outlines: boolean,
-	wireframe: boolean,
-): void {
+// ------------------------------------------------------------- debug surfaces
+
+/** Unlit copy of a material's base colour (texture × tint), no tone curve. */
+function albedoOf(source: Material): Material {
+	const s = source as MeshStandardMaterial;
+	return new MeshBasicMaterial({
+		name: `${s.name || "material"} (albedo)`,
+		map: s.map ?? null,
+		color: s.color?.clone() ?? new Color(1, 1, 1),
+		alphaTest: s.alphaTest,
+		transparent: s.transparent,
+		opacity: s.opacity,
+		side: s.side,
+		depthWrite: s.depthWrite,
+		vertexColors: s.vertexColors,
+		toneMapped: false,
+	});
+}
+
+function uvOf(source: Material): Material {
+	const s = source as MeshStandardMaterial;
+	return new MeshBasicMaterial({
+		name: `${s.name || "material"} (uv)`,
+		map: getUvChecker(),
+		alphaTest: s.alphaTest,
+		side: s.side,
+		toneMapped: false,
+	});
+}
+
+function mapMaterials(
+	standard: Material | Material[],
+	build: (m: Material) => Material,
+): Material | Material[] {
+	return Array.isArray(standard) ? standard.map(build) : build(standard);
+}
+
+/** Applies a shading mode, outline toggle, wireframe and debug views to a model. */
+export function applyShading(root: Object3D, look: ShadingLook): void {
+	const mode = look.shading;
+	const surface = look.surface ?? "shaded";
+	const overlay = look.wireframe && look.wireframeOverlay === true;
+	// Replacing the materials with wireframe only when there is no overlay.
+	const wireframe = look.wireframe && !overlay;
+	const outlines = look.outlines;
 	if (import.meta.env.DEV) {
 		// Dev-only: lets the console inspect the shaded model.
 		(window as unknown as { __studioModel?: Object3D }).__studioModel = root;
@@ -303,19 +364,25 @@ export function applyShading(
 			? data.standard
 			: [data.standard];
 		const queue = renderQueueOf(sources);
-		if (mode === "toon") {
+		mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
+		if (surface === "albedo") {
+			data.albedo ??= mapMaterials(data.standard, albedoOf);
+			mesh.material = data.albedo;
+		} else if (surface === "uv") {
+			data.uv ??= mapMaterials(data.standard, uvOf);
+			mesh.material = data.uv;
+		} else if (mode === "toon") {
 			if (!data.toon) {
 				data.npr = hasNprExtras(sources);
 				data.toon = buildToonVariant(mesh, data);
 			}
 			mesh.material = data.toon;
-			mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
 		} else {
 			data.flat ??= buildFlatVariant(data.standard);
 			mesh.material = data.flat;
-			mesh.renderOrder = queue >= 0 ? queue : data.renderOrder;
 		}
-		const wantOutline = mode === "toon" && outlines && !wireframe;
+		const wantOutline =
+			mode === "toon" && outlines && !wireframe && surface === "shaded";
 		if (wantOutline && data.outline === undefined) {
 			data.outline = data.npr
 				? (mesh as SkinnedMesh).isSkinnedMesh
@@ -331,6 +398,15 @@ export function applyShading(
 		const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
 		for (const m of mats) {
 			if ("wireframe" in m) (m as { wireframe: boolean }).wireframe = wireframe;
+		}
+		if (overlay && !data.wire) {
+			data.wire = makeOverlay(mesh, wireOverlayMaterial());
+			data.wire.name = "wire overlay";
+			mesh.add(data.wire);
+		}
+		if (data.wire) {
+			data.wire.visible = overlay;
+			data.wire.renderOrder = mesh.renderOrder + 1;
 		}
 	}
 }
@@ -356,19 +432,19 @@ export function disposeShading(root: Object3D): void {
 		const originals = new Set(
 			Array.isArray(data.standard) ? data.standard : [data.standard],
 		);
-		for (const variant of [data.toon, data.flat]) {
+		for (const variant of [data.toon, data.flat, data.albedo, data.uv]) {
 			if (!variant) continue;
 			for (const m of Array.isArray(variant) ? variant : [variant]) {
 				if (!originals.has(m)) m.dispose();
 			}
 		}
-		const outline = data.outline;
-		if (outline) {
-			const mats = Array.isArray(outline.material)
-				? outline.material
-				: [outline.material];
+		for (const child of [data.outline, data.wire]) {
+			if (!child) continue;
+			const mats = Array.isArray(child.material)
+				? child.material
+				: [child.material];
 			for (const m of mats) m.dispose();
-			outline.removeFromParent();
+			child.removeFromParent();
 		}
 		// Restore the original so the caller disposes what it created.
 		mesh.material = data.standard;

@@ -13,8 +13,11 @@ import {
 	resolveDataTextures,
 } from "@/components/studio/load-model";
 import { extrasOf, isVfxShader } from "@/components/studio/npr/extras";
-import type { ShadingId } from "@/components/studio/prefs";
-import { applyShading, disposeShading } from "@/components/studio/shading";
+import {
+	applyShading,
+	disposeShading,
+	type ShadingLook,
+} from "@/components/studio/shading";
 import { modelFileUrl } from "@/lib/api";
 import type { ClipSource } from "@/lib/clips";
 import {
@@ -82,11 +85,7 @@ interface MountedDeco {
 	baseline: Map<Object3D, boolean>;
 }
 
-export interface Look {
-	shading: ShadingId;
-	outlines: boolean;
-	wireframe: boolean;
-}
+export type Look = ShadingLook;
 
 /**
  * The default weapon and deco props of one model: loaded once, attached to
@@ -176,7 +175,7 @@ export class PropsRig {
 		root.scale.setScalar(scale);
 		node.add(root);
 		this.roots.push(root);
-		applyShading(root, look.shading, look.outlines, look.wireframe);
+		applyShading(root, look);
 	}
 
 	private mountWeapon(scene: Group, info: WeaponInfo, look: Look): void {
@@ -256,7 +255,7 @@ export class PropsRig {
 
 	setLook(look: Look): void {
 		for (const root of this.roots) {
-			applyShading(root, look.shading, look.outlines, look.wireframe);
+			applyShading(root, look);
 		}
 	}
 

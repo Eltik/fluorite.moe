@@ -22,6 +22,7 @@ import {
 	LockIcon,
 	MoonIcon,
 	PaletteIcon,
+	ScanEyeIcon,
 	SettingsIcon,
 	SunIcon,
 	SunMediumIcon,
@@ -59,6 +60,7 @@ import {
 	ErrorStage,
 	HelpDialog,
 	LoadingCard,
+	SelectionCard,
 	StatsCard,
 	WelcomeHint,
 } from "@/components/studio/ui/overlays";
@@ -70,7 +72,15 @@ import {
 import { SettingsPanel } from "@/components/studio/ui/settings-panel";
 import { ToolbarButton } from "@/components/studio/ui/toolbar-button";
 import { TransportBar } from "@/components/studio/ui/transport";
+import { useSelectedMesh, ViewPanel } from "@/components/studio/ui/view-panel";
+import { ZoomControls } from "@/components/studio/ui/zoom-controls";
 import { useStudioShortcuts } from "@/components/studio/use-shortcuts";
+import {
+	resetViewState,
+	type Selection,
+	setViewState,
+	useViewState,
+} from "@/components/studio/view-state";
 import { Badge } from "@/components/ui/badge";
 import { Popover, PopoverPopup, PopoverTrigger } from "@/components/ui/popover";
 import { toastManager } from "@/components/ui/toast";
@@ -93,6 +103,7 @@ export type FlyoutId =
 	| "animations"
 	| "background"
 	| "lighting"
+	| "view"
 	| "settings";
 
 type LoadState =
@@ -168,6 +179,7 @@ function Studio(): React.ReactElement {
 	const { textLanguage: lang } = useSettings();
 	const themeDark = useHtmlDark();
 	const prefs = usePrefs();
+	const view = useViewState();
 	const mobile = useMediaQuery("max-sm");
 	const touch = useMediaQuery("(pointer: coarse)");
 
@@ -308,6 +320,8 @@ function Studio(): React.ReactElement {
 						loaded.parts.filter((p) => p.hiddenByDefault).map((p) => p.id),
 					),
 				);
+				// The picked mesh belonged to the previous model.
+				setViewState({ selection: null });
 				setModel(loaded);
 				setLoad({ status: "ready" });
 				if (loaded.warnings.length) {
@@ -358,8 +372,36 @@ function Studio(): React.ReactElement {
 		return () => {
 			for (const x of all) x.dispose();
 			all.clear();
+			resetViewState();
 		};
 	}, []);
+
+	// ---------------------------------------------------------- inspect
+
+	const selected = useSelectedMesh(shown, view);
+	const selectedPart = view.selection?.partId ?? null;
+	const handlePick = React.useCallback((selection: Selection | null) => {
+		setViewState({ selection });
+	}, []);
+	const isolateSelected = React.useCallback(() => {
+		if (!shown || !selectedPart) return;
+		setHiddenParts(
+			new Set(
+				shown.parts.filter((p) => p.id !== selectedPart).map((p) => p.id),
+			),
+		);
+	}, [shown, selectedPart]);
+	const hideSelected = React.useCallback(() => {
+		if (!selectedPart) return;
+		setHiddenParts((prev) => {
+			const next = new Set(prev);
+			next.add(selectedPart);
+			return next;
+		});
+		setViewState({ selection: null });
+	}, [selectedPart]);
+	const showZoomControls =
+		prefs.zoomControls === "always" || (prefs.zoomControls === "auto" && touch);
 
 	// ---------------------------------------------------------- animation
 
@@ -522,7 +564,10 @@ function Studio(): React.ReactElement {
 	const screenshot = React.useCallback(async () => {
 		try {
 			const base = shown ? `${shown.key.replace("/", "-")}` : "studio";
-			await stageRef.current?.screenshot(`fluorite-${base}.png`);
+			await stageRef.current?.screenshot(
+				`fluorite-${base}.png`,
+				prefs.captureTransparent,
+			);
 		} catch (error) {
 			toastManager.add({
 				type: "error",
@@ -530,7 +575,7 @@ function Studio(): React.ReactElement {
 				description: errorMessage(error),
 			});
 		}
-	}, [shown]);
+	}, [shown, prefs.captureTransparent]);
 
 	useStudioShortcuts({
 		enabled: !helpOpen,
@@ -542,10 +587,14 @@ function Studio(): React.ReactElement {
 		onShowUi: () => setUiHidden(false),
 		onEscape: () => {
 			if (flyout === "animations") closeAnimations();
+			else if (view.selection) setViewState({ selection: null });
 		},
 		uiHidden,
 		onReset: () => stageRef.current?.resetView(),
 		onPan: (dx, dy) => stageRef.current?.pan(dx, dy),
+		onZoom: (factor) => stageRef.current?.zoomBy(factor),
+		onView: (preset) => stageRef.current?.setView(preset),
+		onHideSelected: hideSelected,
 		onLock: () => setLocked((l) => !l),
 		onFlyout: (f) => {
 			if (f === "animations" && !animation) return;
@@ -586,7 +635,11 @@ function Studio(): React.ReactElement {
 	};
 
 	const stageLabel = shown
-		? `3D view of ${shown.name}. Drag to orbit, right-drag or Shift-drag to pan, scroll to zoom.`
+		? `3D view of ${shown.name}. ${
+				view.panMode
+					? "Drag to pan"
+					: "Drag to orbit, right-drag or Shift-drag to pan"
+			}, scroll to zoom.${view.picking ? " Click a mesh to inspect it." : ""}`
 		: "Empty 3D stage";
 
 	return (
@@ -604,9 +657,11 @@ function Studio(): React.ReactElement {
 					locked={locked}
 					model={model}
 					onContextLost={setContextLost}
+					onPick={handlePick}
 					onPropWarnings={handlePropWarnings}
 					onShown={handleShown}
 					prefs={prefs}
+					view={view}
 					zUpMode={prefs.zUp}
 				/>
 			</div>
@@ -724,10 +779,35 @@ function Studio(): React.ReactElement {
 							))}
 						</div>
 					)}
+					{selected && (
+						<SelectionCard
+							canIsolate={Boolean(selectedPart)}
+							className="pointer-events-auto"
+							info={selected}
+							onClear={() => setViewState({ selection: null })}
+							onHide={hideSelected}
+							onIsolate={isolateSelected}
+						/>
+					)}
 					{prefs.stats && (
 						<StatsCard className="pointer-events-auto" model={shown} />
 					)}
 				</div>
+
+				{/* Right edge: on-screen camera buttons (touch by default). */}
+				{showZoomControls && (
+					<div className="absolute end-3 top-1/2 -translate-y-1/2 sm:end-4">
+						<ZoomControls
+							className="pointer-events-auto"
+							enabled={Boolean(shown)}
+							locked={locked}
+							onPanMode={(panMode) => setViewState({ panMode })}
+							panMode={view.panMode}
+							stage={stageRef}
+							touch={touch}
+						/>
+					</div>
+				)}
 
 				{/* Top-right: help, hide UI, theme, settings. Phones keep only hide
 				    and settings; help and theme move into the settings panel. */}
@@ -940,19 +1020,52 @@ function Studio(): React.ReactElement {
 						>
 							<LightingPanel prefs={prefs} />
 						</Flyout>
+						<Flyout
+							{...flyoutProps("view")}
+							title="View"
+							trigger={
+								<ToolbarButton
+									active={
+										flyout === "view" ||
+										view.picking ||
+										view.panMode ||
+										view.normals
+									}
+									icon={<ScanEyeIcon />}
+									label="View"
+									shortcut="V"
+								/>
+							}
+						>
+							<ViewPanel
+								hiddenParts={hiddenParts}
+								locked={locked}
+								model={shown}
+								onCapture={() => void screenshot()}
+								onHiddenChange={setHiddenParts}
+								onLock={() => setLocked((l) => !l)}
+								prefs={prefs}
+								stage={stageRef}
+								touch={touch}
+								view={view}
+							/>
+						</Flyout>
 						<div
 							aria-hidden="true"
 							className="mx-0.5 h-8 w-px shrink-0 bg-border max-sm:hidden"
 						/>
+						{/* Phones reach Lock and Reset through View and the zoom buttons. */}
 						<ToolbarButton
 							active={locked}
 							aria-pressed={locked}
+							className="max-sm:hidden"
 							icon={locked ? <LockIcon /> : <UnlockIcon />}
 							label={locked ? "Locked" : "Lock"}
 							onClick={() => setLocked((l) => !l)}
 							shortcut="C"
 						/>
 						<ToolbarButton
+							className="max-sm:hidden"
 							icon={<FocusIcon />}
 							label="Reset"
 							onClick={() => stageRef.current?.resetView()}

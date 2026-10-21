@@ -34,6 +34,17 @@ export type ZUpMode = "auto" | "on" | "off";
 
 export const DPR_CAPS = [1, 1.5, 2, 3] as const;
 
+/** Debug surface views drawn instead of the shaded materials. */
+export const SURFACE_IDS = ["shaded", "albedo", "uv"] as const;
+export type SurfaceId = (typeof SURFACE_IDS)[number];
+
+/** On-screen zoom buttons: touch devices only, always, or never. */
+export const ZOOM_CONTROL_MODES = ["auto", "always", "never"] as const;
+export type ZoomControlMode = (typeof ZOOM_CONTROL_MODES)[number];
+
+export const VIEW_TABS = ["camera", "display", "inspect", "capture"] as const;
+export type ViewTab = (typeof VIEW_TABS)[number];
+
 export interface StudioPrefs {
 	background: BackgroundId;
 	customColor: string;
@@ -45,9 +56,22 @@ export interface StudioPrefs {
 	floor: boolean;
 	groundShadow: boolean;
 	wireframe: boolean;
+	/** Draw the wireframe over the shaded model instead of replacing it. */
+	wireframeOverlay: boolean;
 	skeleton: boolean;
+	/** Whole-model bounding box. */
+	bounds: boolean;
+	/** World axes at the origin. */
+	axes: boolean;
+	/** Shaded materials, flat base colour, or a UV checker. */
+	surface: SurfaceId;
 	autoRotate: boolean;
 	stats: boolean;
+	zoomControls: ZoomControlMode;
+	/** Capture without the backdrop (PNG alpha). */
+	captureTransparent: boolean;
+	/** Last tab opened in the View panel. */
+	viewTab: ViewTab;
 	/** Toon mode: the key light follows the camera (else the front view). */
 	lightFollow: boolean;
 	/** Toon mode: soft bloom post pass. */
@@ -85,9 +109,16 @@ export const DEFAULT_PREFS: StudioPrefs = {
 	floor: true,
 	groundShadow: true,
 	wireframe: false,
+	wireframeOverlay: false,
 	skeleton: false,
+	bounds: false,
+	axes: false,
+	surface: "shaded",
 	autoRotate: false,
 	stats: false,
+	zoomControls: "auto",
+	captureTransparent: false,
+	viewTab: "camera",
 	lightFollow: true,
 	bloom: false,
 	extraLights: true,
@@ -145,9 +176,16 @@ function read(): StudioPrefs {
 			floor: bool(p.floor, d.floor),
 			groundShadow: bool(p.groundShadow, d.groundShadow),
 			wireframe: bool(p.wireframe, d.wireframe),
+			wireframeOverlay: bool(p.wireframeOverlay, d.wireframeOverlay),
 			skeleton: bool(p.skeleton, d.skeleton),
+			bounds: bool(p.bounds, d.bounds),
+			axes: bool(p.axes, d.axes),
+			surface: pick(p.surface, SURFACE_IDS, d.surface),
 			autoRotate: bool(p.autoRotate, d.autoRotate),
 			stats: bool(p.stats, d.stats),
+			zoomControls: pick(p.zoomControls, ZOOM_CONTROL_MODES, d.zoomControls),
+			captureTransparent: bool(p.captureTransparent, d.captureTransparent),
+			viewTab: pick(p.viewTab, VIEW_TABS, d.viewTab),
 			lightFollow: bool(p.lightFollow, d.lightFollow),
 			bloom: bool(p.bloom, d.bloom),
 			extraLights: bool(p.extraLights, d.extraLights),
@@ -194,8 +232,14 @@ export function setPrefs(patch: Partial<StudioPrefs>): void {
 
 /** Restores every display preference except the welcome hint and remembered tabs. */
 export function resetPrefs(): void {
-	const { welcomeDismissed, pickerKind, clipTab } = snapshot();
-	setPrefs({ ...DEFAULT_PREFS, welcomeDismissed, pickerKind, clipTab });
+	const { welcomeDismissed, pickerKind, clipTab, viewTab } = snapshot();
+	setPrefs({
+		...DEFAULT_PREFS,
+		welcomeDismissed,
+		pickerKind,
+		clipTab,
+		viewTab,
+	});
 }
 
 function subscribe(listener: () => void): () => void {

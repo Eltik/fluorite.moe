@@ -162,6 +162,10 @@ export function SettingsPanel({
 			</section>
 			<section className="flex flex-col">
 				<PanelHeading>Debug</PanelHeading>
+				<p className="pb-1 text-muted-foreground text-xs">
+					Helpers, normals, surface views and mesh inspection live in the View
+					panel (V).
+				</p>
 				<Row
 					checked={prefs.wireframe}
 					label="Wireframe"
@@ -174,11 +178,13 @@ export function SettingsPanel({
 					hint={rigged ? undefined : "Only rigged models have bones"}
 					label="Skeleton"
 					onChange={(skeleton) => setPrefs({ skeleton })}
+					shortcut="K"
 				/>
 				<Row
 					checked={prefs.stats}
 					label="Performance stats"
 					onChange={(stats) => setPrefs({ stats })}
+					shortcut="⇧S"
 				/>
 			</section>
 			<section className="flex flex-col gap-2">

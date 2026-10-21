@@ -1,8 +1,15 @@
 /** Studio keyboard shortcuts (documented in the help dialog). */
 import * as React from "react";
 import type { AnimationController } from "@/components/studio/animation";
-import { getPrefs, setPrefs } from "@/components/studio/prefs";
+import { getPrefs, SURFACE_IDS, setPrefs } from "@/components/studio/prefs";
 import type { FlyoutId } from "@/components/studio/studio-app";
+import {
+	nextSurface,
+	VIEW_PRESET_KEYS,
+	type ViewPresetId,
+	ZOOM_STEP,
+} from "@/components/studio/view-math";
+import { getViewState, setViewState } from "@/components/studio/view-state";
 
 export interface ShortcutHandlers {
 	enabled: boolean;
@@ -15,9 +22,15 @@ export interface ShortcutHandlers {
 	onReset: () => void;
 	/** Shift + arrow keys: pan the view by a fraction of the frame. */
 	onPan: (dx: number, dy: number) => void;
+	/** = and −: multiply the camera distance. */
+	onZoom: (factor: number) => void;
+	/** Digits 1–6: view presets. */
+	onView: (preset: ViewPresetId) => void;
 	onLock: () => void;
 	onFlyout: (flyout: FlyoutId) => void;
 	onScreenshot: () => void;
+	/** Backspace / Delete with a selection: hide that part. */
+	onHideSelected: () => void;
 	animation: AnimationController | null;
 }
 
@@ -51,7 +64,11 @@ const FLYOUT_KEYS: Record<string, FlyoutId> = {
 	a: "animations",
 	b: "background",
 	l: "lighting",
+	v: "view",
 };
+
+const toggle = (key: "skeleton" | "bounds" | "axes" | "stats") =>
+	setPrefs({ [key]: !getPrefs()[key] });
 
 export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 	const ref = React.useRef(handlers);
@@ -75,6 +92,38 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 				const dx = key === "ArrowLeft" ? -1 : key === "ArrowRight" ? 1 : 0;
 				const dy = key === "ArrowUp" ? -1 : key === "ArrowDown" ? 1 : 0;
 				h.onPan(dx, dy);
+				e.preventDefault();
+				return;
+			}
+			// Shift + letter: the overlay / helper variants of the plain key.
+			if (e.shiftKey && e.key.length === 1) {
+				switch (key) {
+					case "w":
+						setPrefs({ wireframeOverlay: !getPrefs().wireframeOverlay });
+						break;
+					case "g":
+						toggle("axes");
+						break;
+					case "s":
+						toggle("stats");
+						break;
+					case "+":
+					case "=":
+						h.onZoom(ZOOM_STEP);
+						break;
+					case "_":
+					case "-":
+						h.onZoom(1 / ZOOM_STEP);
+						break;
+					default:
+						return;
+				}
+				e.preventDefault();
+				return;
+			}
+			const preset = VIEW_PRESET_KEYS[key];
+			if (preset) {
+				h.onView(preset);
 				e.preventDefault();
 				return;
 			}
@@ -108,6 +157,33 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 					setPrefs({
 						shading: getPrefs().shading === "toon" ? "standard" : "toon",
 					});
+					break;
+				case "u":
+					setPrefs({ surface: nextSurface(SURFACE_IDS, getPrefs().surface) });
+					break;
+				case "k":
+					toggle("skeleton");
+					break;
+				case "x":
+					toggle("bounds");
+					break;
+				case "n":
+					setViewState({ normals: !getViewState().normals });
+					break;
+				case "i":
+					setViewState({ picking: !getViewState().picking });
+					break;
+				case "=":
+				case "+":
+					h.onZoom(ZOOM_STEP);
+					break;
+				case "-":
+					h.onZoom(1 / ZOOM_STEP);
+					break;
+				case "Backspace":
+				case "Delete":
+					if (!getViewState().selection) return;
+					h.onHideSelected();
 					break;
 				case " ":
 					if (!anim || e.target instanceof HTMLButtonElement) return;
