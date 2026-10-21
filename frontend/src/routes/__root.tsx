@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import * as React from "react";
 import { AppShell } from "@/components/shell/app-shell";
+import { VibecodedNotice } from "@/components/shell/vibecoded-notice";
 import { AnchoredToastProvider, ToastProvider } from "@/components/ui/toast";
 import { apiConfigScript } from "@/lib/api";
 import { PREHYDRATION_SCRIPT } from "@/lib/settings";
@@ -83,10 +84,16 @@ function RootLayout(): React.ReactElement {
 	const fullBleed = useMatches({
 		select: (matches) => matches.some((m) => m.staticData?.fullBleed),
 	});
-	if (fullBleed) return <Outlet />;
 	return (
-		<AppShell>
-			<Outlet />
-		</AppShell>
+		<>
+			{fullBleed ? (
+				<Outlet />
+			) : (
+				<AppShell>
+					<Outlet />
+				</AppShell>
+			)}
+			<VibecodedNotice />
+		</>
 	);
 }

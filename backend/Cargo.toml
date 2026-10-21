@@ -2,16 +2,12 @@
 name = "backend"
 version = "0.1.0"
 edition = "2024"
-# Compiles the vendored ACL animation decompressor only with `--features acl`.
+# Compiles the vendored ACL animation decompressor
 build = "vendor/acl/build.rs"
-
-# ── Unified CLI ──────────────────────────────────────────
 
 [[bin]]
 name = "endfield"
 path = "src/bin/endfield.rs"
-
-# ── Standalone utilities ─────────────────────────────────
 
 [[bin]]
 name = "auth-test"
