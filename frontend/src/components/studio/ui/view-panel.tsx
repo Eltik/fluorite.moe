@@ -5,11 +5,14 @@
  */
 import {
 	CameraIcon,
+	CrosshairIcon,
 	EyeOffIcon,
 	FocusIcon,
+	InfoIcon,
 	LockIcon,
 	MousePointerClickIcon,
 	ScanIcon,
+	ScanSearchIcon,
 	UnlockIcon,
 	ZoomInIcon,
 	ZoomOutIcon,
@@ -65,6 +68,12 @@ export interface ViewPanelProps {
 	hiddenParts: ReadonlySet<string>;
 	onHiddenChange: (next: Set<string>) => void;
 	onCapture: () => void;
+	/** Reset the view and the shown parts (F). */
+	onReset: () => void;
+	/** Frame the camera on the selected mesh (.). */
+	onFocus: () => void;
+	/** Show only the selected part and frame it (/). */
+	onIsolateFocus: () => void;
 	/** Phones and tablets: one-finger wording, full-width layout. */
 	touch: boolean;
 }
@@ -129,6 +138,7 @@ function CameraTab({
 	stage,
 	locked,
 	onLock,
+	onReset,
 	touch,
 }: ViewPanelProps): React.ReactElement {
 	const camera = useCameraReadout();
@@ -233,12 +243,13 @@ function CameraTab({
 				<Button
 					className="flex-1"
 					disabled={!model}
-					onClick={() => stage.current?.resetView()}
+					onClick={onReset}
 					size="sm"
+					title="Back to the default view, parts, weapon and props. Display overlays stay."
 					variant="outline"
 				>
 					<FocusIcon aria-hidden="true" />
-					Reset view
+					Reset view & parts
 					<Kbd className="ms-auto h-4 min-w-4 text-[0.625rem]">F</Kbd>
 				</Button>
 				<Button
@@ -411,6 +422,8 @@ function InspectTab({
 	model,
 	hiddenParts,
 	onHiddenChange,
+	onFocus,
+	onIsolateFocus,
 	touch,
 }: ViewPanelProps): React.ReactElement {
 	const info = useSelectedMesh(model, view);
@@ -536,9 +549,28 @@ function InspectTab({
 							)}
 						</dd>
 					</dl>
-					<div className="flex gap-1.5 pt-0.5">
+					<div className="grid grid-cols-2 gap-1.5 pt-0.5">
 						<Button
-							className="flex-1"
+							aria-pressed={view.focus === view.selection?.meshId}
+							onClick={onFocus}
+							size="xs"
+							title="Frame the camera on this mesh (.)"
+							variant="outline"
+						>
+							<CrosshairIcon aria-hidden="true" />
+							Focus
+						</Button>
+						<Button
+							disabled={!partId}
+							onClick={onIsolateFocus}
+							size="xs"
+							title="Show only this part and frame it (/)"
+							variant="outline"
+						>
+							<ScanSearchIcon aria-hidden="true" />
+							Isolate & focus
+						</Button>
+						<Button
 							disabled={!partId}
 							onClick={isolate}
 							size="xs"
@@ -548,7 +580,6 @@ function InspectTab({
 							Isolate
 						</Button>
 						<Button
-							className="flex-1"
 							disabled={!partId}
 							onClick={hide}
 							size="xs"
@@ -557,13 +588,26 @@ function InspectTab({
 							<EyeOffIcon aria-hidden="true" />
 							Hide
 						</Button>
+						<Button
+							aria-pressed={view.inspector}
+							className="col-span-2"
+							onClick={() => setViewState({ inspector: !view.inspector })}
+							size="xs"
+							variant={view.inspector ? "secondary" : "ghost"}
+						>
+							<InfoIcon aria-hidden="true" />
+							{view.inspector
+								? "Hide details"
+								: "Details: geometry, material, textures"}
+						</Button>
 						{model && hiddenParts.size > 0 && (
 							<Button
+								className="col-span-2"
 								onClick={() => onHiddenChange(new Set())}
 								size="xs"
 								variant="ghost"
 							>
-								Show all
+								Show all parts
 							</Button>
 						)}
 					</div>

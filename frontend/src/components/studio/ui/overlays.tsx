@@ -1,9 +1,11 @@
 /** Loading, empty, error, welcome, help and stats overlays. */
 import {
+	CrosshairIcon,
 	EyeOffIcon,
+	InfoIcon,
 	MonitorOffIcon,
 	MousePointer2Icon,
-	ScanIcon,
+	ScanSearchIcon,
 	SparklesIcon,
 	TriangleAlertIcon,
 	XIcon,
@@ -247,7 +249,9 @@ const SHORTCUT_GROUPS: { title: string; items: Shortcut[] }[] = [
 	{
 		title: "Camera",
 		items: [
-			{ keys: ["F"], label: "Reset the view" },
+			{ keys: ["F"], label: "Reset the view and the shown parts" },
+			{ keys: ["."], label: "Focus on the selected mesh" },
+			{ keys: ["/"], label: "Isolate and focus on the selected part" },
 			{ keys: ["1", "…", "6"], label: "Front, back, right, left, top, ¾" },
 			{ keys: ["=", "−"], label: "Zoom in or out" },
 			{ keys: ["Shift", "←↑↓→"], label: "Pan the view" },
@@ -295,11 +299,20 @@ const GESTURES: { input: string; mouse: string; touch: string }[] = [
 		mouse: "Right-drag, or Shift / Ctrl + drag",
 		touch: "Two fingers, or one with pan mode",
 	},
-	{ input: "Zoom", mouse: "Scroll wheel, or = and −", touch: "Pinch, or +/−" },
+	{
+		input: "Zoom",
+		mouse: "Scroll or pinch the trackpad, towards the pointer",
+		touch: "Pinch, or +/−",
+	},
 	{
 		input: "Inspect",
 		mouse: "Click a mesh with Pick on",
 		touch: "Tap a mesh with Pick on",
+	},
+	{
+		input: "Focus",
+		mouse: "Double-click a mesh",
+		touch: "Double-tap a mesh",
 	},
 ];
 
@@ -413,20 +426,30 @@ export function StatsCard({
 
 /**
  * Floating chip for the picked mesh: what it is and the game shader that
- * draws it, with isolate / hide at hand even when the View panel is closed.
+ * draws it, with focus / isolate / hide at hand even when the View panel is
+ * closed, and a toggle for the detail inspector below it.
  */
 export function SelectionCard({
 	info,
 	canIsolate,
-	onIsolate,
+	focused,
+	detailsOpen,
+	onFocus,
+	onIsolateFocus,
 	onHide,
+	onDetails,
 	onClear,
 	className,
 }: {
 	info: MeshInfo;
 	canIsolate: boolean;
-	onIsolate: () => void;
+	/** The camera is framed on this mesh. */
+	focused: boolean;
+	detailsOpen: boolean;
+	onFocus: () => void;
+	onIsolateFocus: () => void;
 	onHide: () => void;
+	onDetails: () => void;
 	onClear: () => void;
 	className?: string;
 }): React.ReactElement {
@@ -464,11 +487,21 @@ export function SelectionCard({
 			</div>
 			<div className="ms-1 flex shrink-0 items-center gap-0.5 border-s ps-1">
 				<IconButton
-					disabled={!canIsolate}
-					label="Isolate this part"
-					onClick={onIsolate}
+					aria-pressed={focused}
+					className={cn(focused && "bg-primary/12 text-primary")}
+					label={focused ? "Focused on this mesh" : "Focus on this mesh"}
+					onClick={onFocus}
+					shortcut="."
 				>
-					<ScanIcon />
+					<CrosshairIcon />
+				</IconButton>
+				<IconButton
+					disabled={!canIsolate}
+					label="Isolate and focus"
+					onClick={onIsolateFocus}
+					shortcut="/"
+				>
+					<ScanSearchIcon />
 				</IconButton>
 				<IconButton
 					disabled={!canIsolate}
@@ -477,6 +510,19 @@ export function SelectionCard({
 					shortcut="⌫"
 				>
 					<EyeOffIcon />
+				</IconButton>
+				<IconButton
+					aria-expanded={detailsOpen}
+					aria-pressed={detailsOpen}
+					className={cn(detailsOpen && "bg-primary/12 text-primary")}
+					label={
+						detailsOpen
+							? "Hide details"
+							: "Details: geometry, material, textures"
+					}
+					onClick={onDetails}
+				>
+					<InfoIcon />
 				</IconButton>
 				<IconButton label="Clear selection" onClick={onClear} shortcut="Esc">
 					<XIcon />

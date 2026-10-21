@@ -17,9 +17,11 @@ import {
 	AxesHelper,
 	Box3,
 	Box3Helper,
+	type Camera,
 	CanvasTexture,
 	Color,
 	type Group,
+	type Intersection,
 	type Mesh,
 	NeutralToneMapping,
 	NoToneMapping,
@@ -79,8 +81,12 @@ import {
 	clampFov,
 	distanceForFov,
 	distanceFromZoom,
+	distanceLimits,
+	dollyTargetTowards,
+	nearPlaneFor,
 	presetDirection,
 	type ViewPresetId,
+	wheelZoomFactor,
 } from "@/components/studio/view-math";
 import {
 	publishCamera,
@@ -122,6 +128,11 @@ export interface StageHandle {
 	setView: (preset: ViewPresetId) => void;
 	/** Vertical field of view; the camera dollies so the subject keeps its size. */
 	setFov: (fov: number) => void;
+	/**
+	 * Frames one mesh of the shown model (posed bounds for skinned meshes)
+	 * from the current direction and orbits around it. False if not found.
+	 */
+	focusOn: (meshId: string) => boolean;
 	screenshot: (filename: string, transparent?: boolean) => Promise<void>;
 }
 
@@ -135,6 +146,8 @@ export interface StageProps {
 	view: ViewState;
 	/** A mesh was picked (or empty space, with null). */
 	onPick: (selection: Selection | null) => void;
+	/** A mesh was double-clicked: select it and frame the camera on it. */
+	onFocus: (selection: Selection) => void;
 	animation: AnimationController | null;
 	handleRef: React.RefObject<StageHandle | null>;
 	/** Called once a model is compiled, attached and framed. */
@@ -573,13 +586,14 @@ function frameCamera(
 	});
 	const { radius } = framing;
 	camera.fov = fov;
-	// Depth range sized to the model (and the stage dome): close-ups stay
-	// crisp, no z-fighting.
-	camera.near = Math.max(radius * 0.01, 0.001);
+	// Depth range sized to the model (and the stage dome); the near plane
+	// then follows the camera in (see CameraSync) so close-ups never clip.
+	camera.near = nearPlaneFor(fit.distance, radius);
 	camera.far = Math.max(radius * 40, 60);
 	camera.updateProjectionMatrix();
-	controls.minDistance = radius * 0.08;
-	controls.maxDistance = radius * 14;
+	const limits = distanceLimits(radius);
+	controls.minDistance = limits.min;
+	controls.maxDistance = limits.max;
 	shadingUniforms.outlineRef.value = fit.distance;
 	void controls.setLookAt(
 		fit.position[0],
@@ -591,6 +605,69 @@ function frameCamera(
 		transition,
 	);
 	if (!direction) controls.saveState();
+}
+
+/** Room around a focused mesh. */
+const FOCUS_MARGIN = 1.25;
+
+/**
+ * World-space bounds of one mesh as it draws right now: skinned meshes are
+ * measured through their current pose, not their bind-space geometry.
+ */
+function meshWorldBox(mesh: Mesh): Box3 | null {
+	const skinned = mesh as SkinnedMesh;
+	mesh.updateWorldMatrix(true, false);
+	if (skinned.isSkinnedMesh) {
+		skinned.skeleton.update();
+		skinned.computeBoundingBox();
+		if (!skinned.boundingBox) return null;
+		return skinned.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
+	}
+	const g = mesh.geometry;
+	if (!g.boundingBox) g.computeBoundingBox();
+	if (!g.boundingBox) return null;
+	return g.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
+}
+
+/**
+ * Frames one mesh from where the camera already is, keeping the lens, and
+ * makes its centre the orbit pivot. The default view (Reset) is untouched.
+ */
+function focusMesh(
+	controls: CameraControls,
+	camera: PerspectiveCamera,
+	mesh: Mesh,
+	viewport: { width: number; height: number },
+	transport: boolean,
+): boolean {
+	const box = meshWorldBox(mesh);
+	if (!box || box.isEmpty()) return false;
+	const target = controls.getTarget(new Vector3());
+	const position = controls.getPosition(new Vector3());
+	const dir = position.sub(target);
+	if (dir.lengthSq() < 1e-12) dir.set(0, 0, 1);
+	dir.normalize();
+	const fit = fitBox({
+		min: box.min.toArray() as Vec3,
+		max: box.max.toArray() as Vec3,
+		direction: dir.toArray() as Vec3,
+		fov: camera.fov,
+		aspect: viewport.width / Math.max(viewport.height, 1),
+		insets: insetsFor(viewport.width, viewport.height, transport),
+		margin: FOCUS_MARGIN,
+	});
+	// Tiny meshes (eyes, buckles) still stop at the dolly limit.
+	const distance = Math.max(fit.distance, controls.minDistance);
+	void controls.setLookAt(
+		fit.target[0] + dir.x * distance,
+		fit.target[1] + dir.y * distance,
+		fit.target[2] + dir.z * distance,
+		fit.target[0],
+		fit.target[1],
+		fit.target[2],
+		true,
+	);
+	return true;
 }
 
 type Reframe = (options: ReframeOptions) => void;
@@ -792,6 +869,38 @@ function visibleMeshes(model: LoadedModel): Mesh[] {
 }
 
 /**
+ * The first visible mesh of the model under a client-space point (skinned
+ * meshes in their current pose), or null for empty space.
+ */
+function raycastModel(
+	raycaster: Raycaster,
+	camera: Camera,
+	el: HTMLElement,
+	model: LoadedModel,
+	clientX: number,
+	clientY: number,
+): Intersection | null {
+	const rect = el.getBoundingClientRect();
+	raycaster.setFromCamera(
+		new Vector2(
+			((clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1,
+			-((clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1,
+		),
+		camera,
+	);
+	const meshes = visibleMeshes(model);
+	for (const mesh of meshes) {
+		const skinned = mesh as SkinnedMesh;
+		if (skinned.isSkinnedMesh) {
+			// Pose-dependent bounds gate the per-triangle test.
+			skinned.computeBoundingBox();
+			skinned.computeBoundingSphere();
+		}
+	}
+	return raycaster.intersectObjects(meshes, false)[0] ?? null;
+}
+
+/**
  * Click-to-select: a press that neither travels nor lingers raycasts the
  * shown model (skinned meshes in their current pose) and reports the mesh
  * under the pointer, or null for empty space.
@@ -800,14 +909,49 @@ function Picker({
 	model,
 	enabled,
 	onPick,
+	onFocus,
 }: {
 	model: LoadedModel | null;
 	enabled: boolean;
 	onPick: (selection: Selection | null) => void;
+	onFocus: (selection: Selection) => void;
 }) {
 	const gl = useThree((s) => s.gl);
 	const camera = useThree((s) => s.camera);
 	const raycaster = React.useMemo(() => new Raycaster(), []);
+	const pick = React.useCallback(
+		(clientX: number, clientY: number): Selection | null => {
+			if (!model) return null;
+			const hit = raycastModel(
+				raycaster,
+				camera,
+				gl.domElement,
+				model,
+				clientX,
+				clientY,
+			);
+			if (!hit) return null;
+			const mesh = hit.object as Mesh;
+			return {
+				partId: partOf(model, mesh)?.id ?? null,
+				meshId: mesh.uuid,
+				materialIndex: hit.face?.materialIndex ?? 0,
+			};
+		},
+		[gl, camera, raycaster, model],
+	);
+	// Double-click frames a mesh whether or not pick mode is on.
+	React.useEffect(() => {
+		if (!model) return;
+		const el = gl.domElement;
+		const onDouble = (e: MouseEvent) => {
+			if (e.button !== 0) return;
+			const selection = pick(e.clientX, e.clientY);
+			if (selection) onFocus(selection);
+		};
+		el.addEventListener("dblclick", onDouble);
+		return () => el.removeEventListener("dblclick", onDouble);
+	}, [gl, model, pick, onFocus]);
 	React.useEffect(() => {
 		if (!enabled || !model) return;
 		const el = gl.domElement;
@@ -831,34 +975,7 @@ function Picker({
 			) {
 				return;
 			}
-			const rect = el.getBoundingClientRect();
-			raycaster.setFromCamera(
-				new Vector2(
-					((e.clientX - rect.left) / rect.width) * 2 - 1,
-					-((e.clientY - rect.top) / rect.height) * 2 + 1,
-				),
-				camera,
-			);
-			const meshes = visibleMeshes(model);
-			for (const mesh of meshes) {
-				const skinned = mesh as SkinnedMesh;
-				if (skinned.isSkinnedMesh) {
-					// Pose-dependent bounds gate the per-triangle test.
-					skinned.computeBoundingBox();
-					skinned.computeBoundingSphere();
-				}
-			}
-			const hit = raycaster.intersectObjects(meshes, false)[0];
-			if (!hit) {
-				onPick(null);
-				return;
-			}
-			const mesh = hit.object as Mesh;
-			onPick({
-				partId: partOf(model, mesh)?.id ?? null,
-				meshId: mesh.uuid,
-				materialIndex: hit.face?.materialIndex ?? 0,
-			});
+			onPick(pick(e.clientX, e.clientY));
 		};
 		const onCancel = () => {
 			down = null;
@@ -871,7 +988,7 @@ function Picker({
 			el.removeEventListener("pointerup", onUp);
 			el.removeEventListener("pointercancel", onCancel);
 		};
-	}, [gl, camera, raycaster, model, enabled, onPick]);
+	}, [gl, model, enabled, onPick, pick]);
 	return null;
 }
 
@@ -967,22 +1084,141 @@ function Axes({ size }: { size: number }) {
 	return <primitive object={helper} position={[0, 0.001 * size, 0]} />;
 }
 
-/** Publishes the camera distance, limits and lens for the View panel. */
+/**
+ * Publishes the camera distance, limits and lens for the View panel, and
+ * slides the near plane in with the camera so a close-up of a face does not
+ * clip through it.
+ */
 function CameraSync({
 	controls,
+	radius,
 }: {
 	controls: React.RefObject<CameraControls | null>;
+	radius: number;
 }) {
 	useFrame(() => {
 		const c = controls.current;
 		if (!c) return;
+		const camera = c.camera as PerspectiveCamera;
+		const near = nearPlaneFor(c.distance, radius);
+		if (Math.abs(near - camera.near) > camera.near * 0.05) {
+			camera.near = near;
+			camera.updateProjectionMatrix();
+		}
 		publishCamera({
 			distance: c.distance,
 			minDistance: c.minDistance,
 			maxDistance: c.maxDistance,
-			fov: (c.camera as PerspectiveCamera).fov,
+			fov: camera.fov,
 		});
 	});
+	return null;
+}
+
+/** The dolly end value camera-controls is damping towards. */
+interface ControlsInternals {
+	_sphericalEnd: { radius: number };
+}
+
+/** How often the surface under the pointer is re-probed during a gesture. */
+const ANCHOR_PROBE_MS = 150;
+
+/**
+ * Wheel and trackpad zoom, replacing camera-controls' wheel handling: a
+ * stronger, device-aware step (see `wheelZoomFactor`), pinch treated as a
+ * dolly rather than a lens zoom, and the orbit target pulled towards what is
+ * under the pointer so zooming goes where you look. The anchor is the model
+ * surface under the pointer (probed a few times a second, since a raycast
+ * through a posed character is not free), so the camera closes in on a face
+ * and stops at the dolly limit instead of passing through the head; over
+ * empty space it is the point on the plane through the target. Pinch on
+ * touch screens stays with camera-controls.
+ */
+function WheelZoom({
+	controls,
+	model,
+}: {
+	controls: React.RefObject<CameraControls | null>;
+	model: LoadedModel | null;
+}) {
+	const gl = useThree((s) => s.gl);
+	const invalidate = useThree((s) => s.invalidate);
+	const raycaster = React.useMemo(() => new Raycaster(), []);
+	const modelRef = React.useRef(model);
+	modelRef.current = model;
+	React.useEffect(() => {
+		const c = controls.current;
+		if (!c) return;
+		c.mouseButtons.wheel = CameraControlsImpl.ACTION.NONE;
+		const el = gl.domElement;
+		const target = new Vector3();
+		const position = new Vector3();
+		const right = new Vector3();
+		const up = new Vector3();
+		const cursor = new Vector3();
+		const anchor = { point: new Vector3(), hit: false, x: 0, y: 0, at: 0 };
+		const probe = (x: number, y: number, now: number): boolean => {
+			const fresh =
+				now - anchor.at < ANCHOR_PROBE_MS &&
+				Math.hypot(x - anchor.x, y - anchor.y) < 6;
+			if (fresh) return anchor.hit;
+			anchor.at = now;
+			anchor.x = x;
+			anchor.y = y;
+			const m = modelRef.current;
+			const hit = m ? raycastModel(raycaster, c.camera, el, m, x, y) : null;
+			anchor.hit = Boolean(hit);
+			if (hit) anchor.point.copy(hit.point);
+			return anchor.hit;
+		};
+		const onWheel = (e: WheelEvent) => {
+			e.preventDefault();
+			if (!c.enabled) return;
+			const factor = wheelZoomFactor(e);
+			if (factor === 1) return;
+			const from = (c as unknown as ControlsInternals)._sphericalEnd.radius;
+			let to = clampDistance(c, from * factor);
+			c.getTarget(target);
+			c.getPosition(position);
+			if (probe(e.clientX, e.clientY, performance.now())) {
+				cursor.copy(anchor.point);
+				// Closing in scales the camera-to-surface gap with the distance;
+				// keep that gap at least the dolly limit.
+				const gap = position.distanceTo(cursor);
+				if (gap > 0) to = Math.max(to, (from * c.minDistance) / gap);
+				to = clampDistance(c, to);
+			} else {
+				// The point under the pointer on the plane through the target.
+				const rect = el.getBoundingClientRect();
+				const nx = ((e.clientX - rect.left) / Math.max(rect.width, 1)) * 2 - 1;
+				const ny = -((e.clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1;
+				const camera = c.camera as PerspectiveCamera;
+				const tanV = Math.tan((camera.fov * Math.PI) / 360);
+				const tanH = tanV * camera.aspect;
+				right.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+				up.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+				const depth = position.distanceTo(target);
+				cursor
+					.copy(target)
+					.addScaledVector(right, nx * tanH * depth)
+					.addScaledVector(up, ny * tanV * depth);
+			}
+			if (to === from) return;
+			const next = dollyTargetTowards(
+				target.toArray() as Vec3,
+				cursor.toArray() as Vec3,
+				to / from,
+			);
+			void c.moveTo(next[0], next[1], next[2], true);
+			void c.dollyTo(to, true);
+			invalidate();
+		};
+		el.addEventListener("wheel", onWheel, { passive: false });
+		return () => {
+			el.removeEventListener("wheel", onWheel);
+			c.mouseButtons.wheel = CameraControlsImpl.ACTION.DOLLY;
+		};
+	}, [gl, controls, invalidate, raycaster]);
 	return null;
 }
 
@@ -1040,19 +1276,41 @@ function HandleBridge({
 	controls,
 	background,
 	reframeRef,
+	shown,
 }: {
 	handleRef: React.RefObject<StageHandle | null>;
 	controls: React.RefObject<CameraControls | null>;
 	background: ResolvedBackground;
 	reframeRef: React.RefObject<Reframe | null>;
+	shown: LoadedModel | null;
 }) {
 	const gl = useThree((s) => s.gl);
 	const scene = useThree((s) => s.scene);
 	const camera = useThree((s) => s.camera);
 	const invalidate = useThree((s) => s.invalidate);
+	const size = useThree((s) => s.size);
+	const sizeRef = React.useRef(size);
+	sizeRef.current = size;
 	React.useImperativeHandle(
 		handleRef,
 		() => ({
+			focusOn: (meshId) => {
+				const c = controls.current;
+				if (!c?.enabled || !shown) return false;
+				const mesh = shown.content.getObjectByProperty("uuid", meshId) as
+					| Mesh
+					| undefined;
+				if (!mesh?.isMesh) return false;
+				const ok = focusMesh(
+					c,
+					camera as PerspectiveCamera,
+					mesh,
+					sizeRef.current,
+					Boolean(shown.clips?.entries.length),
+				);
+				invalidate();
+				return ok;
+			},
 			resetView: () => {
 				const c = controls.current;
 				if (!c) return;
@@ -1145,7 +1403,7 @@ function HandleBridge({
 				window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 			},
 		}),
-		[gl, scene, camera, controls, background, reframeRef, invalidate],
+		[gl, scene, camera, controls, background, reframeRef, invalidate, shown],
 	);
 	return null;
 }
@@ -1314,6 +1572,7 @@ export function Stage({
 	locked,
 	view,
 	onPick,
+	onFocus,
 	animation,
 	handleRef,
 	onShown,
@@ -1458,7 +1717,12 @@ export function Stage({
 				<Bounds dark={background.dark} framing={framing} />
 			)}
 			{shown && prefs.axes && <Axes size={Math.max(radius * 0.6, 0.1)} />}
-			<Picker enabled={view.picking} model={shown} onPick={onPick} />
+			<Picker
+				enabled={view.picking}
+				model={shown}
+				onFocus={onFocus}
+				onPick={onPick}
+			/>
 			{prefs.groundShadow && shown?.rigged && framing && (
 				<ContactBlobs placementKey={framing.version} root={shown.content} />
 			)}
@@ -1489,16 +1753,20 @@ export function Stage({
 					sectionThickness={1}
 				/>
 			)}
+			{/* Touch pinch dollies through camera-controls; wheel and trackpad
+			    go through WheelZoom. The near plane follows in CameraSync. */}
 			<CameraControls
-				dollySpeed={0.6}
+				dollySpeed={1}
+				dollyToCursor
 				makeDefault
 				ref={controls}
 				regress
-				smoothTime={0.2}
+				smoothTime={0.15}
 			/>
 			<ControlsLock controls={controls} locked={locked} />
 			<PanModifiers controls={controls} panMode={view.panMode} />
-			<CameraSync controls={controls} />
+			<WheelZoom controls={controls} model={shown} />
+			<CameraSync controls={controls} radius={radius} />
 			<AutoRotate controls={controls} enabled={prefs.autoRotate && !locked} />
 			<MixerDriver controller={animation} />
 			<Bloom enabled={toon && prefs.bloom} />
@@ -1507,6 +1775,7 @@ export function Stage({
 				controls={controls}
 				handleRef={handleRef}
 				reframeRef={reframeRef}
+				shown={shown}
 			/>
 		</Canvas>
 	);

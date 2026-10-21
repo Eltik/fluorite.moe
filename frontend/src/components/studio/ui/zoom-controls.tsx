@@ -17,6 +17,7 @@ export function ZoomControls({
 	touch,
 	panMode,
 	onPanMode,
+	onReset,
 	className,
 }: {
 	stage: React.RefObject<StageHandle | null>;
@@ -26,6 +27,8 @@ export function ZoomControls({
 	touch: boolean;
 	panMode: boolean;
 	onPanMode: (on: boolean) => void;
+	/** Reset the view and the shown parts. */
+	onReset: () => void;
 	className?: string;
 }): React.ReactElement {
 	const canMove = enabled && !locked;
@@ -56,8 +59,8 @@ export function ZoomControls({
 			<div aria-hidden="true" className="my-0.5 h-px w-5 bg-border" />
 			<IconButton
 				disabled={!enabled}
-				label="Reset view"
-				onClick={() => stage.current?.resetView()}
+				label="Reset view & parts"
+				onClick={onReset}
 				shortcut="F"
 				tooltipSide="left"
 			>

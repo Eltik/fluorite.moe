@@ -22,6 +22,10 @@ export interface ViewState {
 	/** Vertex normals helper (built on demand, so not persisted). */
 	normals: boolean;
 	selection: Selection | null;
+	/** `Object3D.uuid` of the mesh the camera was last framed on, if any. */
+	focus: string | null;
+	/** The detail inspector for the selected mesh is open. */
+	inspector: boolean;
 }
 
 const DEFAULT_VIEW: ViewState = {
@@ -29,6 +33,8 @@ const DEFAULT_VIEW: ViewState = {
 	picking: false,
 	normals: false,
 	selection: null,
+	focus: null,
+	inspector: false,
 };
 
 let view: ViewState = DEFAULT_VIEW;

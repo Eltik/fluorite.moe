@@ -38,9 +38,11 @@ import {
 	studioDetailQuery,
 	UnknownModelError,
 } from "@/components/studio/catalog-source";
+import { describeMeshDetail } from "@/components/studio/inspect";
 import { type LoadedModel, loadModel } from "@/components/studio/load-model";
 import {
 	type BackgroundId,
+	getPrefs,
 	isHexColor,
 	setPrefs,
 	usePrefs,
@@ -53,6 +55,7 @@ import {
 } from "@/components/studio/ui/animations-panel";
 import { GlassCard, IconButton } from "@/components/studio/ui/chrome";
 import { Flyout } from "@/components/studio/ui/flyout";
+import { InspectorCard } from "@/components/studio/ui/inspector";
 import { ModelPicker } from "@/components/studio/ui/model-picker";
 import {
 	ContextLostCard,
@@ -138,6 +141,11 @@ function useHtmlDark(): boolean {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** The parts a model hides out of the box (LOD levels, proxies, VFX). */
+function defaultHidden(model: LoadedModel): Set<string> {
+	return new Set(model.parts.filter((p) => p.hiddenByDefault).map((p) => p.id));
 }
 
 export default function StudioApp(): React.ReactElement {
@@ -315,13 +323,9 @@ function Studio(): React.ReactElement {
 					return;
 				}
 				models.current.add(loaded);
-				setHiddenParts(
-					new Set(
-						loaded.parts.filter((p) => p.hiddenByDefault).map((p) => p.id),
-					),
-				);
+				setHiddenParts(defaultHidden(loaded));
 				// The picked mesh belonged to the previous model.
-				setViewState({ selection: null });
+				setViewState({ selection: null, focus: null });
 				setModel(loaded);
 				setLoad({ status: "ready" });
 				if (loaded.warnings.length) {
@@ -380,17 +384,32 @@ function Studio(): React.ReactElement {
 
 	const selected = useSelectedMesh(shown, view);
 	const selectedPart = view.selection?.partId ?? null;
+	const selectedMeshId = view.selection?.meshId ?? null;
+	// The detail inspector's data, built only while it is open.
+	const meshDetail = React.useMemo(() => {
+		if (!shown || !view.inspector || !view.selection) return null;
+		const mesh = shown.content.getObjectByProperty(
+			"uuid",
+			view.selection.meshId,
+		);
+		if (!mesh || !(mesh as { isMesh?: boolean }).isMesh) return null;
+		return describeMeshDetail(
+			mesh as Parameters<typeof describeMeshDetail>[0],
+			view.selection.materialIndex,
+		);
+	}, [shown, view.inspector, view.selection]);
 	const handlePick = React.useCallback((selection: Selection | null) => {
 		setViewState({ selection });
 	}, []);
-	const isolateSelected = React.useCallback(() => {
-		if (!shown || !selectedPart) return;
-		setHiddenParts(
-			new Set(
-				shown.parts.filter((p) => p.id !== selectedPart).map((p) => p.id),
-			),
-		);
-	}, [shown, selectedPart]);
+	const focusSelection = React.useCallback((selection: Selection) => {
+		setViewState({ selection });
+		if (stageRef.current?.focusOn(selection.meshId)) {
+			setViewState({ focus: selection.meshId });
+		}
+	}, []);
+	const focusSelected = React.useCallback(() => {
+		if (view.selection) focusSelection(view.selection);
+	}, [view.selection, focusSelection]);
 	const hideSelected = React.useCallback(() => {
 		if (!selectedPart) return;
 		setHiddenParts((prev) => {
@@ -400,6 +419,38 @@ function Studio(): React.ReactElement {
 		});
 		setViewState({ selection: null });
 	}, [selectedPart]);
+	/** Solo the selected part and frame it. */
+	const isolateFocusSelected = React.useCallback(() => {
+		if (!shown || !view.selection) return;
+		const part = view.selection.partId;
+		if (part) {
+			setHiddenParts(
+				new Set(shown.parts.filter((p) => p.id !== part).map((p) => p.id)),
+			);
+		}
+		focusSelection(view.selection);
+	}, [shown, view.selection, focusSelection]);
+	// What the Weapon / Props toggles were when this Studio opened, so Reset
+	// can put them back without touching the viewer's saved preference.
+	const sessionProps = React.useRef({
+		showWeapon: prefs.showWeapon,
+		showProps: prefs.showProps,
+	});
+	/**
+	 * Reset: the default camera, the model's default parts, no selection or
+	 * focus, and the session's weapon / props toggles. Display overlays
+	 * (wireframe, skeleton, normals) are preferences and stay as they are.
+	 */
+	const resetAll = React.useCallback(() => {
+		stageRef.current?.resetView();
+		if (shown) setHiddenParts(defaultHidden(shown));
+		setViewState({ selection: null, focus: null });
+		const { showWeapon, showProps } = sessionProps.current;
+		const current = getPrefs();
+		if (current.showWeapon !== showWeapon || current.showProps !== showProps) {
+			setPrefs({ showWeapon, showProps });
+		}
+	}, [shown]);
 	const showZoomControls =
 		prefs.zoomControls === "always" || (prefs.zoomControls === "auto" && touch);
 
@@ -590,11 +641,13 @@ function Studio(): React.ReactElement {
 			else if (view.selection) setViewState({ selection: null });
 		},
 		uiHidden,
-		onReset: () => stageRef.current?.resetView(),
+		onReset: resetAll,
 		onPan: (dx, dy) => stageRef.current?.pan(dx, dy),
 		onZoom: (factor) => stageRef.current?.zoomBy(factor),
 		onView: (preset) => stageRef.current?.setView(preset),
 		onHideSelected: hideSelected,
+		onFocusSelected: focusSelected,
+		onIsolateFocusSelected: isolateFocusSelected,
 		onLock: () => setLocked((l) => !l),
 		onFlyout: (f) => {
 			if (f === "animations" && !animation) return;
@@ -657,6 +710,7 @@ function Studio(): React.ReactElement {
 					locked={locked}
 					model={model}
 					onContextLost={setContextLost}
+					onFocus={focusSelection}
 					onPick={handlePick}
 					onPropWarnings={handlePropWarnings}
 					onShown={handleShown}
@@ -783,10 +837,27 @@ function Studio(): React.ReactElement {
 						<SelectionCard
 							canIsolate={Boolean(selectedPart)}
 							className="pointer-events-auto"
+							detailsOpen={view.inspector}
+							focused={view.focus !== null && view.focus === selectedMeshId}
 							info={selected}
 							onClear={() => setViewState({ selection: null })}
+							onDetails={() => setViewState({ inspector: !view.inspector })}
+							onFocus={focusSelected}
 							onHide={hideSelected}
-							onIsolate={isolateSelected}
+							onIsolateFocus={isolateFocusSelected}
+						/>
+					)}
+					{selected && meshDetail && (
+						<InspectorCard
+							canIsolate={Boolean(selectedPart)}
+							className="pointer-events-auto max-h-[min(52dvh,30rem)]"
+							detail={meshDetail}
+							focused={view.focus !== null && view.focus === selectedMeshId}
+							info={selected}
+							onClose={() => setViewState({ inspector: false })}
+							onFocus={focusSelected}
+							onHide={hideSelected}
+							onIsolateFocus={isolateFocusSelected}
 						/>
 					)}
 					{prefs.stats && (
@@ -802,6 +873,7 @@ function Studio(): React.ReactElement {
 							enabled={Boolean(shown)}
 							locked={locked}
 							onPanMode={(panMode) => setViewState({ panMode })}
+							onReset={resetAll}
 							panMode={view.panMode}
 							stage={stageRef}
 							touch={touch}
@@ -1042,8 +1114,11 @@ function Studio(): React.ReactElement {
 								locked={locked}
 								model={shown}
 								onCapture={() => void screenshot()}
+								onFocus={focusSelected}
 								onHiddenChange={setHiddenParts}
+								onIsolateFocus={isolateFocusSelected}
 								onLock={() => setLocked((l) => !l)}
+								onReset={resetAll}
 								prefs={prefs}
 								stage={stageRef}
 								touch={touch}
@@ -1066,9 +1141,10 @@ function Studio(): React.ReactElement {
 						/>
 						<ToolbarButton
 							className="max-sm:hidden"
+							hint="Reset view & parts"
 							icon={<FocusIcon />}
 							label="Reset"
-							onClick={() => stageRef.current?.resetView()}
+							onClick={resetAll}
 							shortcut="F"
 						/>
 						<ToolbarButton

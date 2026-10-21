@@ -3,10 +3,14 @@ import {
 	clampFov,
 	distanceForFov,
 	distanceFromZoom,
+	distanceLimits,
+	dollyTargetTowards,
+	nearPlaneFor,
 	nextSurface,
 	presetDirection,
 	VIEW_PRESET_IDS,
 	VIEW_PRESET_KEYS,
+	wheelZoomFactor,
 	zoomFromDistance,
 } from "@/components/studio/view-math";
 
@@ -40,6 +44,113 @@ describe("zoom mapping", () => {
 		expect(distanceFromZoom(0.5, 0, 0)).toBe(1);
 		expect(distanceFromZoom(2, 1, 10)).toBe(1);
 		expect(distanceFromZoom(-1, 1, 10)).toBe(10);
+	});
+});
+
+describe("distance limits", () => {
+	test("a 1 m figure can be approached to 2 cm and seen from 14 m", () => {
+		const { min, max } = distanceLimits(1);
+		expect(min).toBeCloseTo(0.02, 9);
+		expect(max).toBeCloseTo(14, 9);
+	});
+
+	test("scale with the model but never closer than 2 cm", () => {
+		expect(distanceLimits(5).min).toBeCloseTo(0.1, 9);
+		expect(distanceLimits(0.3).min).toBeCloseTo(0.02, 9);
+		expect(distanceLimits(0).max).toBeGreaterThan(distanceLimits(0).min);
+	});
+
+	test("the slider spans the whole range on a log scale", () => {
+		const { min, max } = distanceLimits(1);
+		expect(zoomFromDistance(max, min, max)).toBe(0);
+		expect(zoomFromDistance(min, min, max)).toBe(1);
+		expect(zoomFromDistance(Math.sqrt(min * max), min, max)).toBeCloseTo(
+			0.5,
+			9,
+		);
+	});
+});
+
+describe("near plane", () => {
+	test("follows the camera in for close-ups", () => {
+		expect(nearPlaneFor(0.02, 1)).toBeCloseTo(0.001, 9);
+		expect(nearPlaneFor(0.3, 1)).toBeCloseTo(0.01, 9);
+	});
+
+	test("is capped so depth precision holds across the model", () => {
+		expect(nearPlaneFor(100, 1)).toBeCloseTo(0.01, 9);
+		expect(nearPlaneFor(0.0001, 1)).toBeCloseTo(0.0005, 9);
+	});
+
+	test("never drops below a hair for tiny models", () => {
+		expect(nearPlaneFor(0.001, 0.01)).toBeGreaterThanOrEqual(1e-4);
+	});
+});
+
+describe("wheel zoom", () => {
+	const wheel = (deltaY: number, ctrlKey = false, deltaMode = 0) =>
+		wheelZoomFactor({ deltaY, deltaMode, ctrlKey });
+
+	test("scrolling up zooms in, down zooms out, symmetrically", () => {
+		expect(wheel(-100)).toBeLessThan(1);
+		expect(wheel(100)).toBeGreaterThan(1);
+		expect(wheel(-100) * wheel(100)).toBeCloseTo(1, 9);
+	});
+
+	test("one mouse notch is a clear step: about 0.62×", () => {
+		expect(wheel(-100)).toBeCloseTo(0.62, 2);
+	});
+
+	test("small trackpad deltas integrate to the same curve", () => {
+		let d = 1;
+		for (let i = 0; i < 25; i++) d *= wheel(-4);
+		expect(d).toBeCloseTo(wheel(-100), 9);
+	});
+
+	test("a trackpad pinch gets extra gain", () => {
+		expect(wheel(-10, true)).toBeLessThan(wheel(-10));
+		// A doubling pinch (~70 px of deltas) is a clear 2–3× dolly; a long
+		// one (~150 px) goes from full body to a bust.
+		let d = 1;
+		for (let i = 0; i < 14; i++) d *= wheel(-5, true);
+		expect(d).toBeGreaterThan(0.3);
+		expect(d).toBeLessThan(0.45);
+		for (let i = 0; i < 16; i++) d *= wheel(-5, true);
+		expect(d).toBeLessThan(0.15);
+	});
+
+	test("line and page deltas are scaled to pixels", () => {
+		expect(wheel(-3, false, 1)).toBeCloseTo(wheel(-48), 9);
+		expect(wheel(-1, false, 2)).toBeCloseTo(wheel(-400), 9);
+	});
+
+	test("one event is capped, and junk is ignored", () => {
+		expect(wheel(-5000)).toBeCloseTo(wheel(-400), 9);
+		expect(wheel(0)).toBe(1);
+		expect(wheel(Number.NaN)).toBe(1);
+	});
+
+	test("the full 1 m range takes a handful of swipes", () => {
+		const { min, max } = distanceLimits(1);
+		const notches = Math.log(max / min) / -Math.log(wheel(-100));
+		expect(notches).toBeLessThan(16);
+		expect(notches).toBeGreaterThan(8);
+	});
+});
+
+describe("dolly towards the cursor", () => {
+	test("halving the distance moves the target halfway to the cursor point", () => {
+		expect(dollyTargetTowards([0, 0, 0], [2, 0, 4], 0.5)).toEqual([1, 0, 2]);
+	});
+
+	test("zooming out moves the target away from the cursor point", () => {
+		const t = dollyTargetTowards([0, 1, 0], [1, 1, 0], 2);
+		expect(t[0]).toBeCloseTo(-1, 9);
+		expect(t[1]).toBe(1);
+	});
+
+	test("is the identity for an unchanged distance", () => {
+		expect(dollyTargetTowards([3, 2, 1], [9, 9, 9], 1)).toEqual([3, 2, 1]);
 	});
 });
 

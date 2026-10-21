@@ -91,7 +91,84 @@ export function distanceFromZoom(
 }
 
 /** Zoom step for the buttons and keys: a fixed ratio of the distance. */
-export const ZOOM_STEP = 0.8;
+export const ZOOM_STEP = 0.7;
+
+/**
+ * Dolly limits for a model of the given bounding radius: close enough to
+ * fill the frame with a face or a buckle (2% of the radius, never under 2 cm
+ * in model units), far enough to see the whole figure small.
+ */
+export function distanceLimits(radius: number): { min: number; max: number } {
+	const r = Math.max(radius, 1e-3);
+	const min = Math.max(r * 0.02, 0.02);
+	return { min, max: Math.max(r * 14, min * 40) };
+}
+
+/**
+ * Near plane for the current camera distance: a twentieth of the distance,
+ * so close-ups never clip, bounded by the model's depth-precision budget.
+ */
+export function nearPlaneFor(distance: number, radius: number): number {
+	const r = Math.max(radius, 1e-3);
+	const near = Math.min(distance * 0.05, r * 0.01);
+	return Math.max(near, r * 0.0005, 1e-4);
+}
+
+/** What a wheel event carries that matters for zooming. */
+export interface WheelDelta {
+	deltaY: number;
+	/** 0 pixels, 1 lines, 2 pages. */
+	deltaMode: number;
+	/** macOS trackpad pinch arrives as a wheel with ctrlKey set. */
+	ctrlKey: boolean;
+}
+
+/** One mouse-wheel notch in pixels (Chrome and Safari report 100 or so). */
+const NOTCH_PX = 100;
+/** Distance ratio per mouse-wheel notch. */
+const NOTCH_RATIO = 0.62;
+/**
+ * Pinch deltas are small (a few px per event) and a doubling pinch sums to
+ * about 70 px; three times the scroll gain makes that a 2.7× dolly.
+ */
+const PINCH_GAIN = 3;
+/** Caps a single event (page scrolls, inertia bursts) to a sane step. */
+const MAX_PX = 400;
+
+/**
+ * Multiplier for the camera distance from one wheel event (< 1 zooms in).
+ * Scrolling up / pinching out zooms in. A notch is a clear step; trackpad
+ * scrolls add many small steps that integrate to the same curve, and pinch
+ * gets extra gain so one gesture sweeps most of the range.
+ */
+export function wheelZoomFactor(event: WheelDelta): number {
+	let px = event.deltaY;
+	if (event.deltaMode === 1) px *= 16;
+	else if (event.deltaMode === 2) px *= 400;
+	if (!Number.isFinite(px) || px === 0) return 1;
+	px = Math.max(-MAX_PX, Math.min(MAX_PX, px));
+	const gain = event.ctrlKey ? PINCH_GAIN : 1;
+	return NOTCH_RATIO ** (-(px * gain) / NOTCH_PX);
+}
+
+/**
+ * Where the orbit target moves so the point under the cursor stays put while
+ * the distance scales by `scale`: towards that point when zooming in, away
+ * from it when zooming out. `cursor` is the point on the plane through the
+ * target facing the camera.
+ */
+export function dollyTargetTowards(
+	target: Vec3,
+	cursor: Vec3,
+	scale: number,
+): Vec3 {
+	const k = 1 - scale;
+	return [
+		target[0] + (cursor[0] - target[0]) * k,
+		target[1] + (cursor[1] - target[1]) * k,
+		target[2] + (cursor[2] - target[2]) * k,
+	];
+}
 
 /**
  * The camera distance that keeps a subject the same apparent size after a

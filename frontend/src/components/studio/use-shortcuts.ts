@@ -31,6 +31,10 @@ export interface ShortcutHandlers {
 	onScreenshot: () => void;
 	/** Backspace / Delete with a selection: hide that part. */
 	onHideSelected: () => void;
+	/** `.` with a selection: frame the camera on that mesh. */
+	onFocusSelected: () => void;
+	/** `/` with a selection: show only that part and frame it. */
+	onIsolateFocusSelected: () => void;
 	animation: AnimationController | null;
 }
 
@@ -184,6 +188,14 @@ export function useStudioShortcuts(handlers: ShortcutHandlers): void {
 				case "Delete":
 					if (!getViewState().selection) return;
 					h.onHideSelected();
+					break;
+				case ".":
+					if (!getViewState().selection) return;
+					h.onFocusSelected();
+					break;
+				case "/":
+					if (!getViewState().selection) return;
+					h.onIsolateFocusSelected();
 					break;
 				case " ":
 					if (!anim || e.target instanceof HTMLButtonElement) return;
