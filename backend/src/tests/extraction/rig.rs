@@ -455,6 +455,45 @@ mod anim {
         );
     }
 
+    /// Bindings come grouped by attribute; a rotation-only path listed after every position
+    /// still takes its place in the Transform order the groups share (as in Laevatain's
+    /// `interact_receive_gift`, whose tracks were shifted onto the wrong nodes).
+    #[test]
+    fn rotation_only_paths_keep_their_track_slot() {
+        let bindings = vec![
+            binding(10, 1, 4),
+            binding(30, 1, 4),
+            binding(10, 2, 4),
+            binding(20, 2, 4),
+            binding(30, 2, 4),
+            binding(40, 2, 4),
+        ];
+        let order: Vec<(u32, bool)> = anim::transform_bindings(&bindings)
+            .iter()
+            .map(|t| (t.path_hash, t.position))
+            .collect();
+        assert_eq!(
+            order,
+            vec![(10, true), (20, false), (30, true), (40, false)]
+        );
+    }
+
+    /// Contradicting groups (no shared order) fall back to first-seen order.
+    #[test]
+    fn contradicting_binding_groups_fall_back_to_first_seen() {
+        let bindings = vec![
+            binding(10, 1, 4),
+            binding(20, 1, 4),
+            binding(20, 2, 4),
+            binding(10, 2, 4),
+        ];
+        let order: Vec<u32> = anim::transform_bindings(&bindings)
+            .iter()
+            .map(|t| t.path_hash)
+            .collect();
+        assert_eq!(order, vec![10, 20]);
+    }
+
     #[test]
     fn quaternion_keys_stay_in_one_hemisphere() {
         let mut keys = [

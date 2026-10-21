@@ -3,8 +3,10 @@
 //! Endfield clips keep their curves in `m_AclCompressedBuffer` (stock ACL v2.1.0 buffers) and
 //! leave Unity's dense/streamed clip arrays empty. The clip's generic bindings name the
 //! curves: one position (attribute 1), rotation (2) or scale (3) binding per animated
-//! Transform, keyed by the CRC32 of the Transform's path below the Animator. ACL transform
-//! track `i` is the `i`-th distinct Transform path in binding order. `m_ConstantIndexs` /
+//! Transform, keyed by the CRC32 of the Transform's path below the Animator. The bindings are
+//! grouped by attribute (every position, then every rotation, then every scale), each group
+//! in the clip's Transform order, which is also ACL's transform track order; see
+//! [`transform_bindings`]. `m_ConstantIndexs` /
 //! `m_ConstantValues` repeat values already in the ACL output (verified to ~1e-4), so they
 //! are not needed.
 use super::acl::{self, TRANSFORM_STRIDE};
@@ -28,12 +30,20 @@ pub struct TrackBinding {
     pub scale: bool,
 }
 
-/// Group a clip's generic bindings into one entry per Transform path, in first-seen order
-/// (which is ACL's transform track order).
+/// Group a clip's generic bindings into one entry per Transform path, in ACL track order.
+///
+/// The bindings come grouped by attribute (positions, rotations, scales), each group listing
+/// its paths in the clip's Transform order. A path animated on rotation only therefore comes
+/// after every positioned path in binding order, although its track sits between them; the
+/// track order is the one order all groups agree with (a topological merge of the groups,
+/// ties broken by first appearance). Taking first-seen order instead shifts every track
+/// after the first rotation-only path onto the wrong node.
 #[must_use]
 pub fn transform_bindings(bindings: &[Value]) -> Vec<TrackBinding> {
     let mut out: Vec<TrackBinding> = Vec::new();
     let mut index: HashMap<u32, usize> = HashMap::new();
+    // Per attribute group, the track indices (first-seen numbering) in binding order.
+    let mut groups: [Vec<usize>; 3] = Default::default();
     for b in bindings {
         if b.get("typeID").and_then(Value::as_i64) != Some(TYPE_TRANSFORM) {
             continue;
@@ -50,14 +60,49 @@ pub fn transform_bindings(bindings: &[Value]) -> Vec<TrackBinding> {
             });
             out.len() - 1
         });
-        match b.get("attribute").and_then(Value::as_i64) {
-            Some(ATTR_POSITION) => out[i].position = true,
-            Some(ATTR_ROTATION) => out[i].rotation = true,
-            Some(ATTR_SCALE) => out[i].scale = true,
-            _ => {}
+        let (flag, group) = match b.get("attribute").and_then(Value::as_i64) {
+            Some(ATTR_POSITION) => (&mut out[i].position, 0),
+            Some(ATTR_ROTATION) => (&mut out[i].rotation, 1),
+            Some(ATTR_SCALE) => (&mut out[i].scale, 2),
+            _ => continue,
+        };
+        if !*flag {
+            *flag = true;
+            groups[group].push(i);
         }
     }
-    out
+    match merge_orders(out.len(), &groups) {
+        Some(order) => order.into_iter().map(|i| out[i].clone()).collect(),
+        None => out,
+    }
+}
+
+/// The order of `0..n` that keeps every list's relative order, preferring lower indices when
+/// several are free; `None` when the lists contradict each other.
+fn merge_orders(n: usize, lists: &[Vec<usize>]) -> Option<Vec<usize>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for list in lists {
+        for pair in list.windows(2) {
+            next[pair[0]].push(pair[1]);
+            indegree[pair[1]] += 1;
+        }
+    }
+    let mut ready: BinaryHeap<Reverse<usize>> =
+        (0..n).filter(|&i| indegree[i] == 0).map(Reverse).collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &j in &next[i] {
+            indegree[j] -= 1;
+            if indegree[j] == 0 {
+                ready.push(Reverse(j));
+            }
+        }
+    }
+    (order.len() == n).then_some(order)
 }
 
 /// CRC-32 (IEEE), as Unity uses for binding path hashes.
