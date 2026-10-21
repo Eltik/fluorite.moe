@@ -264,20 +264,6 @@ function buildFlatVariant(
 	return Array.isArray(standard) ? standard.map(build) : build(standard);
 }
 
-/**
- * The exporter currently writes vertex normals that sit ~40° off the mesh
- * geometry (the game's, like warfarin's, are within a few degrees of the
- * recomputed ones), which breaks every N·L-driven ramp. Until the exporter
- * is fixed, rebuild them from the triangles for lit character meshes.
- */
-function repairNormals(mesh: Mesh, sources: Material[]): void {
-	const g = mesh.geometry;
-	if (g.userData.normalsRepaired) return;
-	if (!sources.some((m) => nprKind(extrasOf(m)?.shader) !== null)) return;
-	g.computeVertexNormals();
-	g.userData.normalsRepaired = true;
-}
-
 /** Render queue from the extras of the mesh's (first) material, or -1. */
 function renderQueueOf(materials: Material[]): number {
 	for (const m of materials) {
@@ -316,7 +302,6 @@ export function applyShading(
 		const sources = Array.isArray(data.standard)
 			? data.standard
 			: [data.standard];
-		repairNormals(mesh, sources);
 		const queue = renderQueueOf(sources);
 		if (mode === "toon") {
 			if (!data.toon) {
