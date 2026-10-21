@@ -120,6 +120,8 @@ pub struct ModelRig {
     pub roots: Vec<usize>,
     /// A generic Avatar's root motion bone: clips move it themselves.
     pub motion_bone: Option<usize>,
+    /// Skin joints of the model's meshes.
+    pub joints: Vec<usize>,
     /// Name to write for each node in a clip GLB (resolves to the node on the loaded model).
     pub clip_names: Vec<Option<String>>,
     /// Binding path hash → node.
@@ -193,12 +195,25 @@ impl ModelRig {
             })
             .collect();
         let hashes = anim::node_path_hashes(&nodes, anim_root);
+        let mut joints: Vec<usize> = doc
+            .get("skins")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.get("joints").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|j| j.as_u64().map(|j| j as usize))
+            .filter(|&j| j < nodes.len())
+            .collect();
+        joints.sort_unstable();
+        joints.dedup();
         Ok(Self {
             nodes,
             parent,
             anim_root,
             roots,
             motion_bone: None,
+            joints,
             clip_names,
             hashes,
             ambiguous,
@@ -208,6 +223,28 @@ impl ModelRig {
     /// Set the root motion bone by its path hash below the clip root.
     pub fn set_motion_bone(&mut self, path_hash: Option<u32>) {
         self.motion_bone = path_hash.and_then(|h| self.hashes.get(&h).copied());
+    }
+
+    /// The skeleton's root bone: the clip root's child above most skin joints (`Root` above
+    /// `Bip001`), unless that child is a joint itself (then it is the body, not a placement).
+    #[must_use]
+    pub fn skeleton_root(&self) -> Option<usize> {
+        let mut count: HashMap<usize, usize> = HashMap::new();
+        for &j in &self.joints {
+            let mut n = j;
+            while let Some(p) = self.parent[n] {
+                if p == self.anim_root {
+                    *count.entry(n).or_default() += 1;
+                    break;
+                }
+                n = p;
+            }
+        }
+        count
+            .into_iter()
+            .max_by_key(|&(n, c)| (c, std::cmp::Reverse(n)))
+            .map(|(n, _)| n)
+            .filter(|n| self.joints.binary_search(n).is_err())
     }
 
     /// Among the nodes named like the Animator (an NPC wrapper can repeat its model's name),
@@ -329,7 +366,17 @@ pub struct ClipGlb {
     pub root_end: Option<[f32; 3]>,
     /// Whether the clip moves or turns the root ([`ClipGlb::root_node`]'s channels).
     pub root_motion: bool,
+    /// The node carrying the root's placement: the clip root when root-motion channels were
+    /// added, else the node of a root translation track (constant ones included).
     pub root_node: Option<String>,
+}
+
+/// Where a root translation track puts its node (see `clip_glb`).
+struct Placement {
+    start: Option<[f32; 3]>,
+    end: Option<[f32; 3]>,
+    moves: bool,
+    node: Option<String>,
 }
 
 /// Largest error a dropped key may introduce: metres, radians, scale units.
@@ -770,20 +817,38 @@ pub fn clip_glb(
     }
     // Travel already in a Transform track: the clip root's own, or a generic Avatar's root
     // motion bone. Root motion curves are then not added on top.
-    let root_track = tracks
-        .iter()
-        .find(|t| rig.hashes.get(&t.path_hash) == Some(&rig.anim_root))
-        .filter(|t| t.translation.is_some() || t.rotation.is_some())
-        .map(|t| (rig.anim_root, t))
-        .or_else(|| {
-            let bone = rig.motion_bone?;
-            tracks
-                .iter()
-                .find(|t| rig.hashes.get(&t.path_hash) == Some(&bone) && t.translation.is_some())
-                .map(|t| (bone, t))
+    let track_of = |node: usize| {
+        tracks
+            .iter()
+            .find(|t| rig.hashes.get(&t.path_hash) == Some(&node))
+    };
+    let clip_root_track =
+        track_of(rig.anim_root).filter(|t| t.translation.is_some() || t.rotation.is_some());
+    let bone_track = rig
+        .motion_bone
+        .and_then(|bone| track_of(bone).map(|t| (bone, t)))
+        .filter(|(_, t)| t.translation.is_some());
+    // The node whose translation track places the character: the clip root's (humanoid
+    // travel), else the motion bone's (generic travel, or a pose parked at a lineup slot),
+    // even when the clip root has a rotation-only track of its own.
+    let root_translation = clip_root_track
+        .and_then(|t| t.translation.as_ref().map(|k| (rig.anim_root, k)))
+        .or_else(|| bone_track.and_then(|(n, t)| t.translation.as_ref().map(|k| (n, k))));
+    // Without either, a generic clip may still place the skeleton root (a humanoid model's
+    // `Root` parked at a team lineup slot); named, but root motion curves still apply.
+    let skeleton_track = rig
+        .skeleton_root()
+        .filter(|_| root_translation.is_none())
+        .and_then(|n| {
+            track_of(n)
+                .and_then(|t| t.translation.as_ref())
+                .map(|k| (n, k))
         });
     let use_root_motion = root_motion.filter(|rm| {
-        rm.positions.len() == count && rm.rotations.len() == count && root_track.is_none()
+        rm.positions.len() == count
+            && rm.rotations.len() == count
+            && clip_root_track.is_none()
+            && bone_track.is_none()
     });
     let rest_of = |model_node: usize| {
         let n = &rig.nodes[model_node];
@@ -822,6 +887,24 @@ pub fn clip_glb(
             writer.vec3(node, "scale", keys.clone(), tol.scale, rest_s);
         }
     }
+    // A root translation track, in glTF space. It names its node unless it only restates the
+    // rest pose (no channel then): a pose parked off rest still needs its root held in place.
+    let placement = |node: usize, keys: &[[f32; 3]]| {
+        let keys: Vec<[f32; 3]> = keys.iter().map(|&p| convert::position(p)).collect();
+        let moves = !anim::is_constant(&keys, tol.position);
+        let rest = rest_of(node).0;
+        let off_rest = keys.first().is_some_and(|k| {
+            k.iter()
+                .zip(&rest)
+                .any(|(a, b)| (a - b).abs() > tol.position)
+        });
+        Placement {
+            start: keys.first().copied(),
+            end: keys.last().copied(),
+            moves,
+            node: rig.clip_names[node].clone().filter(|_| moves || off_rest),
+        }
+    };
     let (rest_t, rest_r, _) = rest_of(rig.anim_root);
     let mut out = ClipGlb {
         glb: Vec::new(),
@@ -830,7 +913,7 @@ pub fn clip_glb(
         root_start: None,
         root_end: None,
         root_motion: false,
-        root_node: rig.clip_names[rig.anim_root].clone(),
+        root_node: None,
     };
     if let Some(rm) = use_root_motion {
         let positions: Vec<[f32; 3]> = rm
@@ -866,16 +949,22 @@ pub fn clip_glb(
                 writer.rotation(rig.anim_root, rotations, [f32::NAN; 4]);
             }
             out.root_motion = true;
+            out.root_node = rig.clip_names[rig.anim_root].clone();
         }
-    } else if let Some((node, keys)) =
-        root_track.and_then(|(n, t)| t.translation.as_ref().map(|k| (n, k)))
-    {
-        // Root motion carried by a Transform track (local translation of `node`).
-        let keys: Vec<[f32; 3]> = keys.iter().map(|&p| convert::position(p)).collect();
-        out.root_start = keys.first().copied();
-        out.root_end = keys.last().copied();
-        out.root_motion = !anim::is_constant(&keys, tol.position);
-        out.root_node = rig.clip_names[node].clone();
+    } else if let Some((node, keys)) = root_translation {
+        // Root placement carried by a Transform track (local translation of `node`).
+        let p = placement(node, keys);
+        (out.root_start, out.root_end) = (p.start, p.end);
+        out.root_motion = p.moves;
+        out.root_node = p.node;
+    }
+    if let Some((node, keys)) = skeleton_track.filter(|_| !out.root_motion) {
+        let p = placement(node, keys);
+        if p.node.is_some() {
+            (out.root_start, out.root_end) = (p.start, p.end);
+            out.root_motion = p.moves;
+            out.root_node = p.node;
+        }
     }
     let (samplers, mut channels) = writer.finish();
     out.stats.channels = channels.len();
@@ -1042,6 +1131,8 @@ pub struct ClipEntry {
     /// Whether the clip moves/turns `rootNode` (humanoid: the clip root's root-motion channels;
     /// generic: the Avatar's root motion bone). Hold its position at `rootStart` to play in place.
     pub root_motion: bool,
+    /// The node placing the character: set whenever the root carries a translation track,
+    /// even a constant one (a generic pose parked at a lineup slot), not only when it travels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1343,7 +1434,7 @@ pub fn export_entity(
             humanoid,
             size: built.glb.len() as u64,
             root_motion: built.root_motion,
-            root_node: built.root_node.filter(|_| built.root_motion),
+            root_node: built.root_node,
             root_start: built.root_start.map(round4),
             root_end: built.root_end.map(round4),
         });
@@ -1556,6 +1647,139 @@ mod tests {
         assert!(out.root_motion);
         assert_eq!(out.root_node.as_deref(), Some("Bip001"));
         assert_eq!(out.root_end, Some([0.0, 1.0, 2.0]));
+    }
+
+    #[test]
+    fn parked_constant_root_is_named() {
+        let mut rig = ModelRig::from_document(&model()).unwrap();
+        rig.set_motion_bone(Some(crc32(b"Bip001")));
+        let track = NodeTrack {
+            path_hash: crc32(b"Bip001"),
+            translation: Some(vec![[-0.9, 0.0, -1.2]; 2]),
+            ..NodeTrack::default()
+        };
+        let timing = ClipTiming {
+            samples: 2,
+            rate: 30.0,
+        };
+        let out = clip_glb(&rig, "x", timing, &[track], None, TOLERANCE, json!({})).unwrap();
+        assert!(!out.root_motion);
+        assert_eq!(out.root_node.as_deref(), Some("Bip001"));
+        let parked = convert::position([-0.9, 0.0, -1.2]);
+        assert_eq!(out.root_start, Some(parked));
+        assert_eq!(out.root_end, Some(parked));
+        // Constant at the rest pose: nothing to hold, no channel, no node.
+        let track = NodeTrack {
+            path_hash: crc32(b"Bip001"),
+            translation: Some(vec![[0.0, 1.0, 0.0]; 2]),
+            rotation: Some(vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.5f32.sin(), 0.5f32.cos()],
+            ]),
+            ..NodeTrack::default()
+        };
+        let out = clip_glb(&rig, "x", timing, &[track], None, TOLERANCE, json!({})).unwrap();
+        assert!(!out.root_motion && out.root_node.is_none());
+    }
+
+    #[test]
+    fn motion_bone_is_found_beside_clip_root_rotation() {
+        let mut rig = ModelRig::from_document(&model()).unwrap();
+        rig.set_motion_bone(Some(crc32(b"Bip001")));
+        let turn = [0.0, 0.0, 0.5f32.sin(), 0.5f32.cos()];
+        let tracks = [
+            // The clip root's own rotation-only track.
+            NodeTrack {
+                path_hash: rig
+                    .hashes
+                    .iter()
+                    .find(|&(_, &n)| n == rig.anim_root)
+                    .map(|(&h, _)| h)
+                    .unwrap(),
+                rotation: Some(vec![[0.0, 0.0, 0.0, 1.0], turn]),
+                ..NodeTrack::default()
+            },
+            NodeTrack {
+                path_hash: crc32(b"Bip001"),
+                translation: Some(vec![[1.9, 0.0, -1.5]; 2]),
+                ..NodeTrack::default()
+            },
+        ];
+        let timing = ClipTiming {
+            samples: 2,
+            rate: 30.0,
+        };
+        let out = clip_glb(&rig, "x", timing, &tracks, None, TOLERANCE, json!({})).unwrap();
+        assert!(!out.root_motion);
+        assert_eq!(out.root_node.as_deref(), Some("Bip001"));
+        assert_eq!(out.root_start, Some(convert::position([1.9, 0.0, -1.5])));
+    }
+
+    #[test]
+    fn parked_skeleton_root_is_named_without_a_motion_bone() {
+        // A humanoid model (no motion bone): clip root ─ Root ─ Bip001 (the skin's joint).
+        let doc = json!({
+            "scene": 0,
+            "scenes": [{"nodes": [0, 3]}],
+            "asset": {"extras": {"animators": [{"node": "root"}]}},
+            "nodes": [
+                {"name": "root", "children": [1]},
+                {"name": "Root", "children": [2]},
+                {"name": "Bip001", "translation": [0.0, 1.0, 0.0]},
+                {"name": "Body", "skin": 0, "mesh": 0}
+            ],
+            "skins": [{"joints": [2]}]
+        });
+        let rig = ModelRig::from_document(&doc).unwrap();
+        assert_eq!(rig.skeleton_root(), Some(1));
+        let track = NodeTrack {
+            path_hash: crc32(b"Root"),
+            translation: Some(vec![[-0.9, 0.0, -1.2]; 2]),
+            ..NodeTrack::default()
+        };
+        // Still root motion curves do not hide the parked bone.
+        let rm = RootMotion {
+            positions: vec![[0.0; 3]; 2],
+            rotations: vec![[0.0, 0.0, 0.0, 1.0]; 2],
+        };
+        let timing = ClipTiming {
+            samples: 2,
+            rate: 30.0,
+        };
+        let out = clip_glb(&rig, "x", timing, &[track], Some(&rm), TOLERANCE, json!({})).unwrap();
+        assert!(!out.root_motion);
+        assert_eq!(out.root_node.as_deref(), Some("Root"));
+        assert_eq!(out.root_start, Some(convert::position([-0.9, 0.0, -1.2])));
+        // A joint directly below the clip root is the body, never a placement.
+        assert_eq!(
+            ModelRig::from_document(&model()).unwrap().skeleton_root(),
+            None
+        );
+    }
+
+    #[test]
+    fn still_root_motion_curves_name_no_root() {
+        let rig = ModelRig::from_document(&model()).unwrap();
+        let track = NodeTrack {
+            path_hash: crc32(b"Bip001"),
+            rotation: Some(vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.5f32.sin(), 0.5f32.cos()],
+            ]),
+            ..NodeTrack::default()
+        };
+        let rm = RootMotion {
+            positions: vec![[0.0; 3]; 2],
+            rotations: vec![[0.0, 0.0, 0.0, 1.0]; 2],
+        };
+        let timing = ClipTiming {
+            samples: 2,
+            rate: 30.0,
+        };
+        let out = clip_glb(&rig, "x", timing, &[track], Some(&rm), TOLERANCE, json!({})).unwrap();
+        assert!(!out.root_motion);
+        assert!(out.root_node.is_none());
+        assert!(out.root_start.is_some());
     }
 
     #[test]
