@@ -426,3 +426,45 @@ fn empty_compressed_mesh_falls_back_to_vertex_data() {
     assert_eq!(mesh.positions[1], [1.0, 0.0, 0.0]);
     assert_eq!(mesh.submeshes, vec![vec![0, 1, 2]]);
 }
+
+#[test]
+fn packed_normal_channel_decodes_octahedral() {
+    // (0.6, 0, -0.8) folds to octahedral (1, 4/7); the upper 12 bits (tangent frame) are set
+    // and must be ignored.
+    let folded = 511 | 292 << 10 | 0xfff << 20;
+    // A word from Si's S_actor_jsspsi_cloth_01_lod0, whose averaged face normal is
+    // (-0.558, -0.190, -0.808).
+    let words: [u32; 3] = [0, folded, 0xeb1a_e640];
+    let positions = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let data: Vec<u8> = positions
+        .iter()
+        .zip(words)
+        .flat_map(|(p, w)| {
+            p.iter()
+                .flat_map(|f| f.to_le_bytes())
+                .chain(w.to_le_bytes())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let object = json!({
+        "m_Name": "packed_normals",
+        "m_IndexFormat": 0,
+        "m_IndexBuffer": [0, 0, 1, 0, 2, 0],
+        "m_SubMeshes": [{"firstByte": 0, "indexCount": 3, "topology": 0, "baseVertex": 0}],
+        "m_VertexData": {
+            "m_VertexCount": 3,
+            "m_Channels": [
+                {"stream": 0, "offset": 0, "format": 0, "dimension": 3},
+                // High nibble 3: one packed 32-bit word.
+                {"stream": 0, "offset": 12, "format": 0, "dimension": 0x31},
+            ],
+            "m_DataSize": data,
+        },
+        "m_CompressedMesh": {"m_Vertices": empty_vector(), "m_Triangles": empty_vector()},
+    });
+    let mesh = decode_mesh(&object, &HashMap::new()).unwrap();
+    let normals = mesh.normals.unwrap();
+    assert_close(&normals[0], &[0.0, 0.0, 1.0], 1e-6);
+    assert_close(&normals[1], &[0.6, 0.0, -0.8], 2e-3);
+    assert_close(&normals[2], &[-0.558, -0.190, -0.808], 5e-3);
+}

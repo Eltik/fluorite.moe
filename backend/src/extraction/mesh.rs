@@ -117,25 +117,37 @@ pub(crate) fn decode_scalar(format: usize, data: &[u8]) -> Result<f32, String> {
         _ => unreachable!(),
     })
 }
-/// Channel `dimension` high nibble marking a vector packed into one 32-bit word.
-const PACKED_10_10_10: usize = 3;
+/// Channel `dimension` high nibble marking a normal packed into one 32-bit word.
+const PACKED_NORMAL: usize = 3;
 
-/// Decode a normal packed as three signed-normalized 10-bit fields (x low, z high).
+/// Decode a normal packed into one 32-bit word: an octahedral encoding with x in bits 0–9
+/// and y in bits 10–19, both signed-normalized. The upper bits hold the tangent frame
+/// (bit 31 is the bitangent sign) and are ignored.
 ///
-/// Verified against fixtures: decoded normals are ~unit length and agree with averaged
-/// face normals (median cosine 0.8–0.96), unlike octahedral or unsigned variants.
+/// Verified against Endfield meshes: decoded normals agree with averaged face normals to a
+/// median of under 1°. Reading the word as three 10-bit components instead is 35–50° off.
 pub(crate) fn packed_normal(data: &[u8]) -> Result<[f32; 3], String> {
     let word = u32::from_le_bytes(read_at(data, 0, 4)?.try_into().unwrap());
     let snorm = |v: u32| {
         let v = ((v & 0x3ff) as i32 ^ 0x200) - 0x200;
         (v as f32 / 511.0).max(-1.0)
     };
-    let n = [snorm(word), snorm(word >> 10), snorm(word >> 20)];
-    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    Ok(octahedral_unit(snorm(word), snorm(word >> 10)))
+}
+
+/// The unit vector of an octahedral encoding with both coordinates in [-1, 1].
+pub(crate) fn octahedral_unit(x: f32, y: f32) -> [f32; 3] {
+    let z = 1.0 - x.abs() - y.abs();
+    let [x, y] = if z < 0.0 {
+        [(1.0 - y.abs()).copysign(x), (1.0 - x.abs()).copysign(y)]
+    } else {
+        [x, y]
+    };
+    let length = (x * x + y * y + z * z).sqrt();
     if length < 1e-6 {
-        return Ok([0.0, 1.0, 0.0]);
+        return [0.0, 0.0, 1.0];
     }
-    Ok(n.map(|c| c / length))
+    [x / length, y / length, z / length]
 }
 fn channel_values(
     data: &[u8],
@@ -598,7 +610,7 @@ pub fn decode_mesh(
                 offset: index_field(o, "offset")?,
                 format: index_field(o, "format")?,
                 dimension: raw_dimension & 0x0f,
-                packed: raw_dimension >> 4 == PACKED_10_10_10,
+                packed: raw_dimension >> 4 == PACKED_NORMAL,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
