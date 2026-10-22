@@ -1253,7 +1253,7 @@ pub fn export_entity(
     let mut written: HashMap<String, (usize, usize)> = HashMap::new();
     let mut seen_objects: HashSet<(String, i64)> = HashSet::new();
     let mut order: Vec<&(String, String, i64)> = job.sources.iter().collect();
-    // Load each bundle once.
+    // Sorted by bundle, so that every bundle is loaded once.
     order.sort_by(|a, b| (&a.1, &a.0, a.2).cmp(&(&b.1, &b.0, b.2)));
     for (container, cab, path_id) in order {
         if !seen_objects.insert((cab.to_ascii_lowercase(), *path_id)) {

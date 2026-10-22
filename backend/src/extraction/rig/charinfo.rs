@@ -212,7 +212,6 @@ pub fn flatten_controller(controller: &Value, refs: &ControllerRefs<'_>) -> Opti
         full.split_once('.')
             .map_or(full.to_string(), |(_, rest)| rest.to_string())
     };
-    // Parameter names and types.
     let mut params: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut param_types: HashMap<u64, i64> = HashMap::new();
     if let Some(values) = ctrl.get("m_Values").map(data) {

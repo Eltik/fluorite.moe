@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
-use super::paths::{Root, extension, resolve_async, sanitize};
+use super::paths::{Root, extension, parse_root, sanitize};
 
 pub const DEFAULT_CACHE: &str = "public, max-age=3600";
 /// Exported models (GLBs, clip and charinfo JSON) are rewritten in place under the same URL
@@ -36,13 +36,17 @@ pub async fn file(
     UrlPath((root, path)): UrlPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let root = Root::parse(&root)?;
+    let root = parse_root(&root)?;
     let rel = sanitize(&path)?;
     if rel.is_empty() {
         return Err(ApiError::bad_request("missing file path"));
     }
-    let abs = resolve_async(root.dir(&state.config.output), rel).await?;
-    serve_file(&abs, &headers, cache_control(root)).await
+    // The root decides where the bytes come from: the bucket when it is configured for
+    // it, the local output directory otherwise.
+    state
+        .storage
+        .serve(root, &rel, &headers, cache_control(root))
+        .await
 }
 
 /// Content type for a file name, by extension.

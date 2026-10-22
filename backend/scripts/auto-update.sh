@@ -3,8 +3,12 @@
 # under cron (no TTY) it only appends to the log.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+. "$HERE/env.sh"
+load_env "$HERE/../.env"
 
 LOG=./data/logs/update.log
 mkdir -p ./data/logs
@@ -13,12 +17,39 @@ if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 10485760 ]; then
 fi
 printf '\n===== %s =====\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >> "$LOG"
 
+STATE=./data/update-state.json
+stamp() {
+  if [ -f "$1" ]; then
+    cksum < "$1" | awk '{ print $1, $2 }'
+  else
+    echo "none"
+  fi
+}
+
+sync_bucket() {
+  [ -n "${S3_ENDPOINT:-${CLOUDFLARE_S3_API:-}}" ] || return 0
+  [ -n "${S3_BULK_SYNC:-}" ] || return 0
+  ./scripts/sync-s3.sh >> "$LOG" 2>&1 || echo "s3 sync failed, see $LOG" >> "$LOG"
+}
+
+# Whether a run that exited with $1 calls for a sync: it succeeded, and the state
+# file changed from $2 (or S3_SYNC_ALWAYS is set).
+sync_wanted() {
+  [ "$1" = 0 ] || return 1
+  [ "$2" != "$(stamp "$STATE")" ] || [ -n "${S3_SYNC_ALWAYS:-}" ]
+}
+
 if [ ! -t 1 ]; then
+  before=$(stamp "$STATE")
+  rc=0
   {
-    cargo build --release --bin endfield -q
+    cargo build --release --bin endfield -q || exit 1
     ./target/release/endfield update "$@"
-  } >> "$LOG" 2>&1
-  exit
+  } >> "$LOG" 2>&1 || rc=$?
+  if sync_wanted "$rc" "$before"; then
+    sync_bucket
+  fi
+  exit "$rc"
 fi
 
 # ── Interactive: render @progress lines as a bar ─────────
@@ -64,14 +95,13 @@ draw() {
     fi
     local counts="$done_n/$total"
     case "$phase" in
-      # Download phases report MiB.
       chk|sort) counts="$(fmt_gb "$done_n")/$(fmt_gb "$total") GB" ;;
     esac
     line="$(phase_title "$phase") $bar $(printf '%3d' "$pct")% $counts $(fmt_secs "$elapsed")$eta"
   else
     line="$(phase_title "$phase") ${SPIN:tick % 4:1} $(fmt_secs "$elapsed")"
   fi
-  # Label goes last and is clipped so the line never wraps (bar glyphs count as 1 column).
+  # The label goes last and is clipped so the line never wraps (bar glyphs count as 1 column).
   local room=$(( cols - ${#line} - 3 ))
   if (( room > 4 )) && [ -n "$label" ]; then
     line+="  ${label:0:room}"
@@ -79,7 +109,6 @@ draw() {
   printf '\r\033[K%s' "$line"
 }
 
-# Print a message above the bar without leaving a stale bar behind.
 say() {
   printf '\r\033[K%s\n' "$1"
   draw
@@ -93,6 +122,8 @@ if ! cargo build --release --bin endfield -q >> "$LOG" 2>&1; then
   say "build failed, see $LOG"
   exit 1
 fi
+
+before=$(stamp "$STATE")
 
 # A ticker shares the pipe so the bar keeps moving while the binary is busy;
 # the binary's exit status comes through as a final `@exit` line.
@@ -136,4 +167,7 @@ status=0
 } || status=$?
 
 printf '\r\033[K'
+if sync_wanted "$status" "$before"; then
+  sync_bucket
+fi
 exit "$status"

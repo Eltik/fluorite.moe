@@ -19,7 +19,7 @@ path = "src/bin/fluorite-api.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "net", "signal", "sync", "io-util", "process"] }
-reqwest = { version = "0.13.2", features = ["json", "query"] }
+reqwest = { version = "0.13.2", features = ["json", "query", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 clap = { version = "4", features = ["derive"] }
@@ -43,6 +43,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 httpdate = "1"
+sha2 = "0.10"
+hmac = "0.12"
+dotenvy = { version = "0.15.7", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

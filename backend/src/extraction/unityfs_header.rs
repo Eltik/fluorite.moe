@@ -204,7 +204,6 @@ pub fn iter_bundles(data: &[u8], mut callback: impl FnMut(usize, &[u8])) {
             break;
         }
 
-        // Parse header to get bundle_size
         match parse_header(&data[offset..]) {
             Ok(header) => {
                 let bundle_size = header.bundle_size as usize;

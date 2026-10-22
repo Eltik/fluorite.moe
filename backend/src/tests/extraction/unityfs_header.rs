@@ -17,7 +17,6 @@ fn parse_header_too_short() {
 
 #[test]
 fn parse_header_valid_minimal() {
-    // Build a minimal UnityFS header
     let mut buf = Vec::new();
     buf.extend_from_slice(b"UnityFS\0"); // magic (8 bytes)
     buf.extend_from_slice(&6u32.to_be_bytes()); // format_version = 6

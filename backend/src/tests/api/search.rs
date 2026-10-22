@@ -184,3 +184,59 @@ async fn index_rebuilds_when_models_index_changes() {
     }
     panic!("index was not rebuilt after models/index.json changed");
 }
+
+#[tokio::test]
+async fn the_search_covers_the_roots_that_are_in_the_bucket() {
+    // The roots that live in the bucket are indexed from its listing: the local
+    // copies are not needed for the search to find them.
+    let (endpoint, store, _log) = crate::tests::core::s3::mock_endpoint().await;
+    {
+        let mut store = store.lock().unwrap();
+        store.insert(
+            "fluorite/textures/ui/Pelica.png".to_string(),
+            b"PNG-DATA".to_vec(),
+        );
+        store.insert(
+            "fluorite/meshes/chars/pelica.glb".to_string(),
+            b"GLB-DATA".to_vec(),
+        );
+    }
+
+    let fx = Fixture::new();
+    let settings = crate::core::s3::S3Settings::from_env(crate::tests::core::s3::env(&[
+        ("S3_ENDPOINT", endpoint.as_str()),
+        ("S3_BUCKET", "assets"),
+        ("S3_ACCESS_KEY_ID", "AKID"),
+        ("S3_SECRET_ACCESS_KEY", "secret"),
+        ("S3_PREFIX", "fluorite"),
+        ("S3_ROOTS", "textures,meshes"),
+    ]))
+    .unwrap()
+    .unwrap();
+    let config = crate::api::config::S3Config {
+        settings,
+        mode: crate::api::config::S3Mode::Proxy,
+        thumbs: false,
+    };
+    let storage =
+        crate::api::storage::Storage::new(fx.output().to_path_buf(), Some(&config)).unwrap();
+
+    let remote = storage.list_remote_roots().await;
+    assert_eq!(remote.len(), 2, "both roots are listed");
+
+    let index = SearchIndex::build_with_remote(&fx.output(), &remote);
+    assert_eq!(index.count(Root::Textures), 1, "the bucket, not the disk");
+    assert_eq!(index.count(Root::Meshes), 1);
+
+    let (total, hits) = index.search("pelica", None, None, 0, 10);
+    assert_eq!(total, 2, "{hits:?}");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec!["ui/Pelica.png".to_string(), "chars/pelica.glb".to_string()]
+    );
+    assert!(
+        hits.iter().all(|h| h.size > 0),
+        "the size comes from the listing: {hits:?}"
+    );
+}

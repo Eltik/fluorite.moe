@@ -3,7 +3,9 @@
 /PLANS
 CLAUDE.md
 backend/data/
+backend/.env
 /tasks
 **/target/
 *.exe
 .playwright-mcp/
+docs/

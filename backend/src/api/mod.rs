@@ -13,6 +13,7 @@ pub mod i18n;
 pub mod paths;
 pub mod search;
 pub mod status;
+pub mod storage;
 pub mod story;
 pub mod tables;
 pub mod thumbs;
@@ -47,6 +48,9 @@ pub struct AppState {
     pub thumbs: thumbs::ThumbLimiter,
     pub catalog: catalog::Catalog,
     pub audio: audio::AudioState,
+    /// Where file bytes come from: the local output directory, or a bucket for the
+    /// roots configured for one.
+    pub storage: storage::Storage,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -55,6 +59,8 @@ impl AppState {
     /// Build state without starting any background work (the index starts empty).
     pub fn new(config: Config) -> SharedState {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let storage = storage::Storage::new(config.output.clone(), config.s3.as_ref())
+            .unwrap_or_else(|e| panic!("storage: {e}"));
         Arc::new(Self {
             config,
             index: search::IndexHandle::new(),
@@ -65,6 +71,7 @@ impl AppState {
             thumbs: thumbs::ThumbLimiter::new(threads),
             catalog: catalog::Catalog::new(),
             audio: audio::AudioState::new(),
+            storage,
         })
     }
 }
@@ -189,6 +196,10 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         state.config.output.display(),
         state.config.cache_dir.display()
     );
+    match &state.config.s3 {
+        Some(s3) => tracing::info!("storage: {}", s3.describe()),
+        None => tracing::info!("storage: the local disk (no bucket configured)"),
+    }
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

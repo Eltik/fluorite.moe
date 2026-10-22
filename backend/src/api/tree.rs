@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
-use super::paths::{Root, is_hidden, resolve, sanitize};
+use super::paths::{is_hidden, parse_root, resolve, sanitize};
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 1000;
@@ -245,10 +245,31 @@ pub async fn tree(
     UrlPath(root): UrlPath<String>,
     Query(q): Query<TreeQuery>,
 ) -> ApiResult<Json<TreeResponse>> {
-    let root = Root::parse(&root)?;
+    let root = parse_root(&root)?;
     let rel = sanitize(&q.path)?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = q.offset;
+
+    // A root that lives in the bucket is listed there; the child counts of a remote
+    // listing are not fetched (the browser asks for them when it opens a directory).
+    if state.storage.is_remote(root) {
+        let listing = state.storage.list_remote(root, &rel).await?;
+        let entries = listing
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|e| tree_entry(e, &rel, None))
+            .collect();
+        return Ok(Json(TreeResponse {
+            root: root.name(),
+            path: rel,
+            entries,
+            total: listing.len(),
+            offset,
+            limit,
+        }));
+    }
+
     // Held by the blocking task, so a client that disconnects still counts until it ends.
     let permit = state
         .tree
@@ -274,29 +295,12 @@ pub async fn tree(
             .skip(offset)
             .take(limit)
             .map(|e| {
-                let path = if rel.is_empty() {
-                    e.name.clone()
+                let children = if e.is_dir {
+                    st.tree.counts.get(&dir.join(&e.name)).ok()
                 } else {
-                    format!("{rel}/{}", e.name)
+                    None
                 };
-                if e.is_dir {
-                    let children = st.tree.counts.get(&dir.join(&e.name)).ok();
-                    TreeEntry {
-                        name: e.name.clone(),
-                        path,
-                        kind: "dir",
-                        size: None,
-                        children,
-                    }
-                } else {
-                    TreeEntry {
-                        name: e.name.clone(),
-                        path,
-                        kind: "file",
-                        size: Some(e.size),
-                        children: None,
-                    }
-                }
+                tree_entry(e, &rel, children)
             })
             .collect();
         Ok(Json(TreeResponse {
@@ -310,4 +314,30 @@ pub async fn tree(
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+/// One listing entry, with its path relative to the root.
+fn tree_entry(entry: &DirEntry, rel: &str, children: Option<usize>) -> TreeEntry {
+    let path = if rel.is_empty() {
+        entry.name.clone()
+    } else {
+        format!("{rel}/{}", entry.name)
+    };
+    if entry.is_dir {
+        TreeEntry {
+            name: entry.name.clone(),
+            path,
+            kind: "dir",
+            size: None,
+            children,
+        }
+    } else {
+        TreeEntry {
+            name: entry.name.clone(),
+            path,
+            kind: "file",
+            size: Some(entry.size),
+            children: None,
+        }
+    }
 }

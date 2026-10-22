@@ -6,6 +6,7 @@
 //!   extract-file  — extract a single .chk by name
 //!   decrypt       — extract BLC-catalogued VFS directories (tables, json, lua, audio, video)
 //!   update        — incremental extraction of everything that changed upstream
+//!   publish       — copy the local roots into an S3-compatible bucket
 //!   repair        — flip textures extracted before the orientation fix, in place
 //!   health        — check the update run log for staleness and regressions
 //!   schema-gen    — regenerate the MemoryPack schema from the client's IL2CPP files
@@ -13,6 +14,7 @@
 //!   scan          — scan for asset names/paths
 //!   survey        — survey all Unity objects, types, counts
 use backend::core::endfield::config::resolve_game_config;
+use backend::core::s3::{PublishOptions, PublishReport, S3Settings};
 use backend::extraction::blc::{self, DirExtractResult};
 use backend::extraction::gamedata::{self, GamedataStats};
 use backend::extraction::health;
@@ -142,6 +144,24 @@ enum Commands {
         #[arg(long)]
         no_schema: bool,
     },
+    /// Publish the roots that live in an S3-compatible bucket into it
+    ///
+    /// The settings are the `S3_*` and `CLOUDFLARE_*` variables the API reads, so the bucket the
+    /// API serves and the bucket the unpacker fills are the same one.
+    Publish {
+        /// Output directory
+        #[arg(long, default_value = "./output")]
+        output: String,
+        /// Report what would be uploaded, upload nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete the objects that are gone locally (only with a complete local tree)
+        #[arg(long)]
+        prune: bool,
+        /// Remove the local copy of a file once it is in the bucket
+        #[arg(long)]
+        remove_local: bool,
+    },
     /// Generate, validate and install the MemoryPack schema for the current client, then
     /// re-decode JsonData; exit 2 if it would decode fewer files, 3 if the client is unreadable
     SchemaGen {
@@ -203,6 +223,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The configuration lives in `backend/.env`; the variables of the environment
+    // win over the file.
+    backend::envfile::load();
+
     let cli = Cli::parse();
     // A CDN connection can stall without closing; the read timeout turns that into an error
     // the download retry loop can recover from instead of hanging the run forever.
@@ -267,6 +291,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     skip_dirs: skip_dir_hashes(&skip_dir, no_voice),
                     progress,
                     no_schema,
+                },
+            )
+            .await
+        }
+        Commands::Publish {
+            output,
+            dry_run,
+            prune,
+            remove_local,
+        } => {
+            cmd_publish(
+                Path::new(&output),
+                PublishOptions {
+                    dry_run,
+                    prune,
+                    remove_local,
                 },
             )
             .await
@@ -878,6 +918,11 @@ async fn cmd_update(
             "up to date ({} / res {})",
             config.version, config.res_version
         );
+        if !check {
+            // Whatever is still on the disk and not in the bucket is published, so a run
+            // whose publish failed is picked up by the next one.
+            publish_after_update(output).await?;
+        }
         return Ok(());
     }
     if check {
@@ -948,12 +993,31 @@ async fn cmd_update(
         update::save_state(state_path, &state)?;
     }
     fs::create_dir_all(output)?;
+    // The new files go into the bucket right away, so the site serves them without a
+    // separate sync step. A run with failures is not published: a half-written file
+    // must not overwrite the good object in the bucket.
+    let publish = if failures == 0 {
+        match publish_after_update(output).await {
+            Ok(report) => report,
+            Err(error) => {
+                println!("publish failed: {error}");
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut line = serde_json::json!({"at": Utc::now().to_rfc3339(), "version": resolved.config.version, "res_version": resolved.config.res_version,
         "chk_dirty": chk.dirty, "chk_ok": chk.ok, "chk_failed": chk.failed, "sort_chks": sort.chks, "sort_moved": sort.moved, "sort_failed": sort.failed, "blc_dirty": blc.dirty, "blc_ok": blc.ok, "blc_failed": blc.failed,
         "tex_extracted": chk.tex_extracted, "tex_failed": chk.tex_failed, "mesh_exported": chk.mesh_exported, "mesh_failed": chk.mesh_failed,
         "lua_decrypted": blc.lua_decrypted, "memorypack_decoded": blc.memorypack_decoded, "memorypack_failed": blc.memorypack_failed,
         "schema_version": schema_version, "schema_regenerated": schema.regenerated,
         "duration_secs": started.elapsed().as_secs_f64()});
+    if let Some(report) = &publish {
+        line["published"] = serde_json::json!(report.uploaded);
+        line["publish_bytes"] = serde_json::json!(report.bytes);
+        line["publish_skipped"] = serde_json::json!(report.skipped);
+    }
     if !blc.memorypack_by_schema.is_empty() {
         line["memorypack_schemas"] = serde_json::json!(blc.memorypack_by_schema);
     }
@@ -1444,6 +1508,64 @@ fn install_blc_group(
         fs::remove_dir_all(legacy)?;
     }
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════
+// publish — copy the local roots into the bucket
+// ═══════════════════════════════════════════════════════════
+
+/// Publish the roots that live in a bucket into it.
+///
+/// The settings come from the `S3_*` and `CLOUDFLARE_*` variables the API reads as well, so the
+/// bucket the API serves and the bucket the unpacker fills are the same one. Without
+/// those variables there is nothing to publish into, and the run says so instead of
+/// failing.
+async fn cmd_publish(
+    output: &Path,
+    options: PublishOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if publish_roots(output, options).await?.is_none() {
+        println!("no S3 settings: set S3_ENDPOINT and friends to publish");
+    }
+    Ok(())
+}
+
+/// Publish the roots into the bucket after an update, when one is configured.
+///
+/// The update writes the assets locally; this puts the new ones into the bucket right
+/// away, so the site serves them without a separate sync step. A bucket that is not
+/// configured is not an error: the assets simply stay on the disk.
+async fn publish_after_update(
+    output: &Path,
+) -> Result<Option<PublishReport>, Box<dyn std::error::Error>> {
+    publish_roots(output, PublishOptions::default()).await
+}
+
+/// Publish the roots into the bucket, with the options the settings and the caller
+/// agree on. `None` when no bucket is configured; an error when a file could not be
+/// published.
+async fn publish_roots(
+    output: &Path,
+    options: PublishOptions,
+) -> Result<Option<PublishReport>, Box<dyn std::error::Error>> {
+    let Some(settings) = S3Settings::from_env(backend::envfile::var)? else {
+        return Ok(None);
+    };
+    println!("publish: {}", settings.describe());
+    let options = PublishOptions {
+        // The setting keeps the local copy by default; the flag asks for the opposite.
+        remove_local: options.remove_local || !settings.keep_local,
+        ..options
+    };
+    let report = backend::core::s3::publish(&settings, output, &options).await?;
+    for error in &report.errors {
+        eprintln!("  {error}");
+    }
+    println!("publish: {}", report.summary());
+    if report.failed > 0 {
+        return Err(format!("{} files could not be published", report.failed).into());
+    }
+    Ok(Some(report))
 }
 
 // ═══════════════════════════════════════════════════════════

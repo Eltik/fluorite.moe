@@ -13,7 +13,6 @@ fn is_valid_header_zeroes_invalid() {
 
 #[test]
 fn is_valid_header_correct_pair() {
-    // Build a valid header checksum pair
     let a_raw: u32 = 0x12345678;
     let a = a_raw ^ HEADER_XOR_A;
     let xored = a_raw;

@@ -12,6 +12,13 @@ cd fluorite.moe/backend
 cargo build --release
 ```
 
+The configuration of the whole project is one file, `backend/.env`;
+`backend/.env.example` is the template with every variable and its default.
+
+For a production deployment on a VPS — the API, the web server, the reverse
+proxy, pm2 or systemd, and the bucket — see
+[docs/deployment.md](docs/deployment.md).
+
 ## How It Works
 
 1. **Config Resolution** queries the Hypergryph launcher API to get the current game version, CDN URLs, and resource manifest.
@@ -403,6 +410,20 @@ TLS, HSTS and compression of HTML; the API already compresses its JSON.
 
 ### Configuration
 
+Everything lives in one file, `backend/.env`; `backend/.env.example` is the
+template with every variable and its default. The API, the unpacker and the
+scripts all read it — the Rust binaries load it themselves, the shell scripts
+source it — so one file configures the whole project:
+
+```bash
+cp backend/.env.example backend/.env   # then fill in the blanks
+```
+
+A variable that is already in the environment wins over the file, so a systemd
+`Environment=`, a `FOO=1 ./endfield` or a `docker run -e` overrides it without
+anyone having to edit the file. `FLUORITE_ENV_FILE` points the binaries at a
+file somewhere else.
+
 **fluorite-api** (see `backend/src/api/config.rs`):
 
 | Variable | Default | Meaning |
@@ -434,6 +455,131 @@ the API on its own origin instead (e.g. behind a CDN), set
 `FLUORITE_PUBLIC_API_URL=https://api.example` and `FLUORITE_PROXY=0`. The CSP follows
 that value automatically.
 
+### S3 storage
+
+The API can read the heavy roots from an S3-compatible bucket instead of the local
+disk: Cloudflare R2, Backblaze B2, DigitalOcean Spaces, or a bucket of your own
+(SeaweedFS, Garage, MinIO) on a spare machine.
+It is off by default — with no `S3_*` variable set, every root is read from
+`<output>` exactly as before.
+
+[docs/s3-providers.md](docs/s3-providers.md) compares the services for this
+project's data (68 GB in 167 k objects), has a recipe per provider, and has the
+routes that need neither a card nor a budget — the bucket on your own hardware,
+reached through a Cloudflare Tunnel;
+[docs/oracle-cloud-s3.md](docs/oracle-cloud-s3.md) is the free-tier route with
+MinIO on an Oracle A1.
+
+The names are the ones the storage service uses for itself, so the values from a
+dashboard can be pasted in as they are. `backend/.env.example` lists them all.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `S3_TYPE` | from the endpoint | The service: `cloudflare`, `b2`, `wasabi`, `digitalocean`, `aws`, `minio`, `seaweedfs`, `s3` |
+| `S3_ENDPOINT` | unset | Endpoint, e.g. `https://<account>.r2.cloudflarestorage.com` |
+| `S3_BUCKET` | unset | Bucket name |
+| `S3_ACCESS_KEY_ID` | unset | Access key |
+| `S3_SECRET_ACCESS_KEY` | unset | Secret key |
+| `S3_REGION` | from the provider | Signing region (`auto` for R2, `us-east-1` elsewhere) |
+| `S3_SESSION_TOKEN` | unset | Token of temporary (STS) credentials |
+| `S3_PREFIX` | `fluorite` | Key prefix inside the bucket |
+| `S3_ROOTS` | `textures,meshes,models` | Roots served from the bucket |
+| `S3_MODE` | `proxy` | `proxy` streams the object, `redirect` answers `302` |
+| `S3_PUBLIC_BASE_URL` | unset | Public base URL of the bucket; needed by redirect mode |
+| `S3_THUMBS` | `1` | Serve pre-generated thumbnails from the bucket (`0` disables it) |
+| `S3_PATH_STYLE` | `1` | `0` addresses the bucket as a host prefix instead of a path segment |
+| `S3_CACHE_CONTROL` | unset | `Cache-Control` the objects are stored with |
+| `S3_KEEP_LOCAL` | `1` | `0` removes the local copy of a file once it is in the bucket |
+
+For Cloudflare R2 the dashboard names are read as well, so the values of the
+account can be pasted in unchanged:
+
+| Variable | Meaning |
+|---|---|
+| `CLOUDFLARE_ACCOUNT_ID` | The account id; it builds the endpoint when `CLOUDFLARE_S3_API` is not given |
+| `CLOUDFLARE_S3_API` | The endpoint of the account |
+| `CLOUDFLARE_API_ACCESS_KEY` | The R2 access key id |
+| `CLOUDFLARE_API_SECRET_KEY` | The R2 secret access key |
+
+The generic `S3_*` name wins when both are set, and the endpoint is guessed from
+its host when `S3_TYPE` is not given.
+
+The first four are required together: a half-filled configuration is a startup
+error, not a silent fallback to the disk.
+
+**The keys.** The bucket mirrors the output directory: the key of
+`textures/ui/logo.png` is `fluorite/textures/ui/logo.png` (below `S3_PREFIX`), so
+the sync is a plain directory mirror and the API needs no mapping table.
+`gamedata` stays on the disk: it is 1.5 M tiny JSON files, and a bucket of that
+many objects is slow to list and expensive to keep.
+
+**The two modes.** `proxy` (the default) asks the bucket for the object and streams
+it back, so the bucket can stay private. `redirect` answers `302` with the object's
+public URL, so the bytes never travel through the server; it needs
+`S3_PUBLIC_BASE_URL` and a bucket (or a CDN in front of it) that serves
+them.
+
+**The fallback.** A read that fails — the bucket is empty, unreachable, not synced
+yet — logs a warning and serves the local copy instead, so the site keeps working
+while the bucket catches up.
+
+**What still needs the disk.** The file explorer, the images and the search index
+work from the bucket: the index is built from the listing of the bucket when a root
+is in it, so the search finds the files it does not have on the disk. The
+*catalog* (the operators, the weapons, the enemies) still looks at the local
+`textures`, `meshes` and `models` roots: it checks which mesh folder and which
+icon file exists, which is a local lookup. Keep those three roots on the disk
+until the catalog reads the bucket too.
+
+**The publisher.** The unpacker fills the bucket itself: `endfield update` writes
+the new files to the disk and puts them in the bucket right away, so an update
+reaches the site without a second tool. The same run can be repeated by hand:
+
+```bash
+cd backend
+target/release/endfield publish --dry-run   # what would be uploaded
+target/release/endfield publish             # upload it
+target/release/endfield publish --remove-local   # and drop the local copy
+```
+
+The settings come from `backend/.env`, which the binary reads itself.
+
+A file is uploaded when the bucket has no object for it, when the sizes differ, or
+when the local file is newer than the object — so a run with nothing to do costs
+one listing and no traffic. `--prune` deletes the objects that are gone locally
+(only with a complete local tree), `--remove-local` deletes the local copy of
+what was uploaded, which is what keeps the disk small.
+
+**The bulk sync.** `backend/scripts/sync-s3.sh` mirrors the configured roots into the
+bucket with `rclone`; it reads the same variables as the API and guesses the
+provider from the endpoint (override with `S3_TYPE`). It is the tool for the
+*first* fill of a bucket — tens of thousands of files at once — while the
+publisher is the tool for everything after it.
+
+```bash
+cd backend
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+S3_BUCKET=assets \
+S3_PREFIX=fluorite \
+S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \
+  scripts/sync-s3.sh --dry-run     # report what would change
+  scripts/sync-s3.sh               # upload
+  scripts/sync-s3.sh --delete      # also remove what is gone locally
+```
+
+By default the sync only adds and overwrites, so an interrupted extraction can
+never delete the good copy in the bucket; `--delete` turns it into a full mirror.
+The thumbnail cache is mirrored too, under `fluorite/thumbs/`, so the servers
+share the thumbnails they generated instead of generating them again.
+
+`scripts/auto-update.sh` publishes after an update that changed something (the
+update state file is the signal, so an up-to-date check does not list the whole
+bucket every fifteen minutes). `S3_SYNC_ALWAYS=1` forces it on every run,
+and `S3_BULK_SYNC=1` adds the `rclone` mirror on top of it.
+
+A complete walkthrough — Oracle Cloud (Always Free Ampere A1), MinIO, the tunnel,
+the users and the policies — is in [docs/oracle-cloud-s3.md](docs/oracle-cloud-s3.md).
+
 **Ports and caching.** `:3000` web (public, via the reverse proxy), `:8787` API
 (loopback only unless the API is published separately). Hashed bundles under
 `/assets/` are `immutable` for a year; HTML is not cached. API responses carry their own
@@ -454,6 +600,11 @@ answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy)
   hourly). Watch it with `du -sh`; to reclaim space, stop the API, delete it, and start
   the API again (entries are regenerated on demand). Keep it off the output volume if
   that is near full.
+- [ ] **Bucket publish**: with an S3 backend, `endfield update` publishes the new
+  files into the bucket on its own. `backend/scripts/sync-s3.sh` is the bulk fill of
+  a fresh bucket (`S3_BULK_SYNC=1` runs it after an update). Run
+  `endfield publish --dry-run` by hand after a manual extraction, and check
+  `backend/data/logs/sync-s3.log` when a file is missing from the bucket.
 - [ ] **Schema regeneration**: `update` regenerates the MemoryPack schema when the
   client binary changes. If `health` warns about MemoryPack, run `endfield schema-gen`
   (see [above](#endfield-schema-gen)).
@@ -461,7 +612,10 @@ answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy)
   then `systemctl restart fluorite-web`). A new API binary needs
   `cargo build --release --bin fluorite-api` and a restart of `fluorite-api`.
 - [ ] **Disk**: the output is ~80 GB and grows with each game version; keep headroom
-  for `update` (see [Fixing an existing output](#fixing-an-existing-output)).
+  for `update` (see [Fixing an existing output](#fixing-an-existing-output)). With an
+  S3 backend the heavy roots can be deleted from the disk once the bucket has them:
+  the API falls back to the local copy, and re-extracts them if the bucket is
+  unreachable.
 
 ## Project Structure
 
@@ -479,13 +633,19 @@ backend/
 │   │   ├── endfield/
 │   │   │   ├── config.rs       # Game config resolution
 │   │   │   └── constants.rs    # App codes, channels, endpoints
-│   │   └── hypergryph/
-│   │       ├── account_service.rs  # OAuth2 login, token management
-│   │       ├── binding.rs      # Account binding/roles
-│   │       ├── launcher.rs     # Launcher API (versions, resources)
-│   │       ├── launcher_web.rs # Launcher web endpoints
-│   │       ├── u8.rs           # U8 platform (server list, channel tokens)
-│   │       └── webview.rs      # Webview API (gacha, character data)
+│   │   ├── hypergryph/
+│   │   │   ├── account_service.rs  # OAuth2 login, token management
+│   │   │   ├── binding.rs      # Account binding/roles
+│   │   │   ├── launcher.rs     # Launcher API (versions, resources)
+│   │   │   ├── launcher_web.rs # Launcher web endpoints
+│   │   │   ├── u8.rs           # U8 platform (server list, channel tokens)
+│   │   │   └── webview.rs      # Webview API (gacha, character data)
+│   │   ├── roots.rs            # The read-only sub-trees of the output
+│   │   └── s3/
+│   │       ├── client.rs       # S3 client: head, get, list, put, delete
+│   │       ├── provider.rs     # The services the API knows (R2, B2, MinIO, ...)
+│   │       ├── publish.rs      # Publisher: local tree → bucket
+│   │       └── settings.rs     # The S3_* variables
 │   └── extraction/
 │       ├── blc.rs              # BLC catalog parser + ChaCha20 VFS extraction
 │       ├── chacha20.rs         # ChaCha20 (RFC7539) cipher

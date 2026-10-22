@@ -4,72 +4,11 @@ use std::path::{Path, PathBuf};
 
 use super::error::{ApiError, ApiResult};
 
-/// A named read-only sub-tree of the output directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Root {
-    Textures,
-    Meshes,
-    Gamedata,
-    Tables,
-    Jsondata,
-    Lua,
-    Audio,
-    Models,
-}
+pub use crate::core::roots::Root;
 
-impl Root {
-    pub const ALL: [Root; 8] = [
-        Root::Textures,
-        Root::Meshes,
-        Root::Gamedata,
-        Root::Tables,
-        Root::Jsondata,
-        Root::Lua,
-        Root::Audio,
-        Root::Models,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Root::Textures => "textures",
-            Root::Meshes => "meshes",
-            Root::Gamedata => "gamedata",
-            Root::Tables => "tables",
-            Root::Jsondata => "jsondata",
-            Root::Lua => "lua",
-            Root::Audio => "audio",
-            Root::Models => "models",
-        }
-    }
-
-    /// Directory relative to the output dir.
-    pub fn rel_dir(self) -> &'static str {
-        match self {
-            Root::Textures => "textures",
-            Root::Meshes => "meshes",
-            Root::Gamedata => "gamedata",
-            Root::Tables => "decrypted/Table/TableCfg",
-            Root::Jsondata => "decrypted/JsonData/Json",
-            Root::Lua => "decrypted/Lua/LuaScripts",
-            Root::Audio => "decrypted/Audio",
-            Root::Models => "models",
-        }
-    }
-
-    pub fn parse(name: &str) -> ApiResult<Root> {
-        Root::ALL
-            .into_iter()
-            .find(|r| r.name() == name)
-            .ok_or_else(|| ApiError::not_found(format!("unknown root {name:?}")))
-    }
-
-    pub fn index(self) -> usize {
-        self as usize
-    }
-
-    pub fn dir(self, output: &Path) -> PathBuf {
-        output.join(self.rel_dir())
-    }
+/// The root with that name, or a 404: the name comes from the request path.
+pub fn parse_root(name: &str) -> ApiResult<Root> {
+    Root::parse(name).ok_or_else(|| ApiError::not_found(format!("unknown root {name:?}")))
 }
 
 /// Whether a single file or directory name is invisible to clients.

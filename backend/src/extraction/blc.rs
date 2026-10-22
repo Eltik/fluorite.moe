@@ -613,7 +613,6 @@ fn extract_chunk_files(
                 std::fs::write(&out_path, lua.as_deref().unwrap_or(&decrypted))?;
                 lua_done = lua.is_some();
 
-                // Parse SparkBuffer .bytes → JSON
                 if is_sparkbuffer {
                     match sparkbuffer::parse_sparkbuffer(&decrypted) {
                         Ok(json_val) => {
@@ -710,7 +709,6 @@ pub async fn extract_directory_from(
         return Ok(result);
     }
 
-    // Group files by chunk MD5
     let memorypack = blc.group_cfg_name == memorypack::JSON_DATA_GROUP;
     let mut chunks_needed: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, f) in blc.files.iter().enumerate() {

@@ -9,6 +9,7 @@
 //! Queries are split on whitespace; every token must occur in the lowercased
 //! root-relative path. Directory matches are computed once per query as a bitmask.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -22,6 +23,7 @@ use tokio::sync::{Semaphore, watch};
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
 use super::paths::{Root, extension, is_hidden};
+use super::storage::RemoteFile;
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
@@ -133,6 +135,9 @@ struct Segment {
     dirs: Vec<Dir>,
     entries: Vec<Entry>,
     counts: [usize; Root::ALL.len()],
+    /// The size of the entries, when the listing gave it (the roots in the bucket).
+    /// Empty for the local ones: there the size is stat'ed when a hit is served.
+    sizes: Vec<u64>,
 }
 
 impl Segment {
@@ -295,6 +300,54 @@ fn scan_dir(queue: &WorkQueue, seg: &mut Segment, root: Root, abs: &Path, rel: &
     }
 }
 
+/// Fill a segment from the listing of a root in the bucket: the files, grouped by the
+/// directory they are in.
+///
+/// The listing holds the paths relative to the root, so the directories are the same
+/// paths the walk on the disk would produce.
+fn scan_listing(seg: &mut Segment, root: Root, files: &[RemoteFile]) {
+    let mut dirs: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
+    for file in files {
+        let (dir, name) = match file.path.rsplit_once('/') {
+            Some((dir, name)) => (dir, name),
+            None => ("", file.path.as_str()),
+        };
+        if name.is_empty() || is_hidden(name) {
+            continue;
+        }
+        dirs.entry(dir).or_default().push((name, file.size));
+    }
+    for (dir, files) in dirs {
+        let rel = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let (Some(span), Ok(index), Ok(len)) = (
+            seg.intern(&rel),
+            u32::try_from(seg.dirs.len()),
+            u32::try_from(rel.len()),
+        ) else {
+            continue;
+        };
+        seg.dirs.push(Dir { span, len });
+        for (name, size) in files {
+            let (Ok(name_len), Some(name_span)) = (u16::try_from(name.len()), seg.intern(name))
+            else {
+                continue;
+            };
+            seg.entries.push(Entry {
+                dir: index,
+                name: name_span,
+                name_len,
+                root: root as u8,
+            });
+            seg.sizes.push(size);
+            seg.counts[root.index()] += 1;
+        }
+    }
+}
+
 impl SearchIndex {
     pub fn len(&self) -> usize {
         self.segments.iter().map(|s| s.entries.len()).sum()
@@ -316,19 +369,33 @@ impl SearchIndex {
     /// Walk every root under `output` with a pool of threads sharing a directory queue.
     /// Each thread's output becomes one segment as-is (no merge copy). Blocking.
     pub fn build(output: &Path) -> SearchIndex {
+        Self::build_with_remote(output, &[])
+    }
+
+    /// The same, with the roots that live in a bucket indexed from its listing
+    /// instead of from the disk.
+    ///
+    /// A root that is in the bucket is not walked on the disk: the listing is the
+    /// truth for it, and the local copy (if it is still there) would only duplicate
+    /// every entry.
+    pub fn build_with_remote(output: &Path, remote: &[(Root, Vec<RemoteFile>)]) -> SearchIndex {
         let started = Instant::now();
+        let in_bucket: HashSet<Root> = remote.iter().map(|(root, _)| *root).collect();
         let queue = WorkQueue {
             items: Mutex::new(Vec::new()),
             pending: AtomicUsize::new(0),
         };
         for root in Root::ALL {
+            if in_bucket.contains(&root) {
+                continue;
+            }
             let dir = root.dir(output);
             if dir.is_dir() {
                 queue.push((root, dir, String::new()));
             }
         }
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
-        let segments: Vec<Segment> = std::thread::scope(|s| {
+        let mut segments: Vec<Segment> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     s.spawn(|| {
@@ -359,6 +426,21 @@ impl SearchIndex {
                 .collect()
         });
 
+        // The roots that live in the bucket: one segment each, built from the
+        // listing instead of from the disk.
+        for (root, files) in remote {
+            let mut seg = Segment::default();
+            scan_listing(&mut seg, *root, files);
+            if seg.entries.is_empty() {
+                continue;
+            }
+            seg.arena.shrink_to_fit();
+            seg.dirs.shrink_to_fit();
+            seg.entries.shrink_to_fit();
+            seg.sizes.shrink_to_fit();
+            segments.push(seg);
+        }
+
         let mut counts = [0; Root::ALL.len()];
         for seg in &segments {
             for (total, n) in counts.iter_mut().zip(seg.counts) {
@@ -380,8 +462,10 @@ impl SearchIndex {
         let root = Root::ALL[e.root as usize];
         let name = seg.name_str(e);
         let path = format!("{}{}", seg.dir_str(seg.dir_of(e)), name);
-        let size =
-            std::fs::symlink_metadata(root.dir(&self.output).join(&path)).map_or(0, |m| m.len());
+        // The listing of a bucket root knows the size; a local file is stat'ed.
+        let size = seg.sizes.get(idx as usize).copied().unwrap_or_else(|| {
+            std::fs::symlink_metadata(root.dir(&self.output).join(&path)).map_or(0, |m| m.len())
+        });
         Hit {
             root: root.name(),
             name: name.to_string(),
@@ -544,7 +628,12 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 async fn rebuild(state: &SharedState, reason: &str) {
     let output = state.config.output.clone();
-    match tokio::task::spawn_blocking(move || SearchIndex::build(&output)).await {
+    // The roots that live in the bucket are listed first: the index is built from
+    // that listing instead of from the disk for them.
+    let remote = state.storage.list_remote_roots().await;
+    match tokio::task::spawn_blocking(move || SearchIndex::build_with_remote(&output, &remote))
+        .await
+    {
         Ok(index) => {
             tracing::info!(
                 "search index built ({reason}): {} files, {:.1} MiB, {} ms",
@@ -621,7 +710,7 @@ pub async fn search(
         return Err(ApiError::bad_request("query parameter q is required"));
     }
     let root = match q.root.as_deref().filter(|r| !r.is_empty()) {
-        Some(r) => Some(Root::parse(r).map_err(|_| ApiError::bad_request("unknown root"))?),
+        Some(r) => Some(Root::parse(r).ok_or_else(|| ApiError::bad_request("unknown root"))?),
         None => None,
     };
     let ext = q

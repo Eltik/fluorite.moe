@@ -428,7 +428,6 @@ pub fn process_vfs_at(
     let container = &data[offset..];
     let (vfs, output) = process_vfs(container)?;
 
-    // Compute total bytes consumed by this container
     let header_end = if vfs.header.enc_flags >= 7 { 48 } else { 40 };
     let mut bi_size = vfs.header.compressed_blocks_info_size as usize;
     if (vfs.header.flags & 0x200) != 0 {
@@ -474,7 +473,6 @@ pub fn process_all_vfs(data: &[u8]) -> Result<Vec<VfsContainerResult>, Box<dyn s
                 pos += consumed;
             }
             Err(_) => {
-                // Skip this header and keep scanning
                 pos += 8;
             }
         }

@@ -98,8 +98,6 @@ run() {
   fi
 }
 
-# ---- API checks -------------------------------------------------------------
-
 OP_ID=""
 OP_ICON=""
 
@@ -183,8 +181,6 @@ c_traversal() {
   ! grep -q '^root:' "$BODY" || { ERR="leaked /etc/passwd"; return 1; }
 }
 
-# ---- Web checks -------------------------------------------------------------
-
 # These two routes 307 to their canonical search-param URL, so ask for it directly.
 web_page() {
   fetch "$WEB$1" 20 && expect_status 200 || return 1
@@ -203,8 +199,6 @@ w_audio() { web_page /audio; }
 w_textures() { web_page '/textures?dir='; }
 w_tables() { web_page /tables; }
 w_browse() { web_page '/browse/gamedata?path='; }
-
-# ---- Run --------------------------------------------------------------------
 
 if [ "$RUN_API" = 1 ]; then
   echo "API $API"

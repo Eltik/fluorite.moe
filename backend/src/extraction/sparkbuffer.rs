@@ -484,11 +484,9 @@ impl<'a> SparkReader<'a> {
         let root_def_offset = self.read_i32()?;
         let data_offset = self.read_i32()?;
 
-        // Read type definitions
         self.seek_to(type_def_offset as u64);
         self.read_type_definitions()?;
 
-        // Read root definition
         self.seek_to(root_def_offset as u64);
         let root_type = self.read_spark_type()?;
         let _root_name = self.read_string()?;
@@ -515,7 +513,6 @@ impl<'a> SparkReader<'a> {
             }
         }
 
-        // Read data
         self.seek_to(data_offset as u64);
         match root_type {
             SparkType::Bean => self.read_bean_value(root_type_hash.unwrap_or(0), false),

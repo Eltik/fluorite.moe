@@ -46,9 +46,9 @@ fn hidden_rules() {
 #[test]
 fn roots_parse() {
     for r in Root::ALL {
-        assert_eq!(Root::parse(r.name()).unwrap(), r);
+        assert_eq!(Root::parse(r.name()), Some(r));
     }
-    assert!(Root::parse("etc").is_err());
+    assert!(Root::parse("etc").is_none());
 }
 
 #[tokio::test]

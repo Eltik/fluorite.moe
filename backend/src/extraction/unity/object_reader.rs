@@ -221,7 +221,7 @@ fn read_array(
     // the loop will still read exactly `size` elements (failing on EOF if data is short).
     const MAX_INITIAL_CAP: usize = 1024;
 
-    // Check if this is a map (element type is "pair")
+    // The element type "pair" makes it a map.
     let result = if element_node.type_name == "pair" {
         let [first, second] = element_node.children.as_slice() else {
             return Err(invalid_data("pair node does not have two children"));

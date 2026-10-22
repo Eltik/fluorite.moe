@@ -501,7 +501,6 @@ fn parse_cd_entries(buf: &[u8], expected_count: u64) -> Vec<ZipEntry> {
             disk_number: disk_number_32,
         };
 
-        // Parse extra field for ZIP64 extensions
         let extra_start = pos + 46 + filename_len;
         let extra_data = &buf[extra_start..extra_start + extra_len];
         resolve_zip64_extra(
