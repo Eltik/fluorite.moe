@@ -7,7 +7,9 @@
  *    upstream status (206, 304, ...) pass through untouched. Set
  *    `FLUORITE_PROXY=0` to disable it when the API is published on its own origin.
  * 2. Security headers on every page response, with a CSP whose fetch / image /
- *    media sources include the public API origin.
+ *    media sources include the public API origin and the bucket's CDN
+ *    (`FLUORITE_ASSETS_URL`, falling back to `S3_PUBLIC_BASE_URL`): the API
+ *    redirects `/files/*` there when the files live in a bucket.
  */
 import handler, { createServerEntry } from "@tanstack/react-start/server-entry";
 import { publicApiUrl, upstreamApiUrl } from "@/lib/api";
@@ -100,10 +102,21 @@ function originOf(base: string): string | null {
 	}
 }
 
+/** The CDN origins `/files/*` redirects to; space- or comma-separated. */
+function assetOrigins(): string[] {
+	const list = env.FLUORITE_ASSETS_URL ?? env.S3_PUBLIC_BASE_URL ?? "";
+	return list
+		.split(/[\s,]+/)
+		.map(originOf)
+		.filter((origin): origin is string => origin !== null);
+}
+
 function contentSecurityPolicy(): string {
-	const api = originOf(publicApiUrl());
+	const remote = [originOf(publicApiUrl()), ...assetOrigins()].filter(
+		(origin): origin is string => origin !== null,
+	);
 	const withApi = (...sources: string[]) =>
-		[...sources, ...(api ? [api] : [])].join(" ");
+		[...sources, ...new Set(remote)].join(" ");
 	return [
 		"default-src 'self'",
 		// Inline: the pre-hydration theme script, the API config and Start's

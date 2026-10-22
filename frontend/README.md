@@ -34,6 +34,7 @@ works for any deployment. The root route renders it into the page
 | `PORT` / `HOST` | `3000` / all interfaces | Listen address of `bun run start` (also `NITRO_PORT` / `NITRO_HOST`) |
 | `FLUORITE_API_URL` | `http://127.0.0.1:8787` | Where the server reaches the API: SSR data fetches and the proxy |
 | `FLUORITE_PUBLIC_API_URL` | same origin in production, `FLUORITE_API_URL` in dev | API base the browser uses. Empty means "this origin" |
+| `FLUORITE_ASSETS_URL` | `S3_PUBLIC_BASE_URL` | Bucket CDN origin(s) the CSP allows; the API redirects `/files/*` there |
 | `FLUORITE_PROXY` | on | `0` turns off the same-origin proxy |
 | `VITE_API_URL` | unset | Build-time fallback for both API URLs (old dev setups) |
 

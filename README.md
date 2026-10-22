@@ -453,6 +453,7 @@ file somewhere else.
 | `PORT` / `HOST` | `3000` / all interfaces | Listen address of the production server |
 | `FLUORITE_API_URL` | `http://127.0.0.1:8787` | Where the web server reaches the API (SSR and proxy) |
 | `FLUORITE_PUBLIC_API_URL` | same origin (prod), `FLUORITE_API_URL` (dev) | API base handed to browsers |
+| `FLUORITE_ASSETS_URL` | `S3_PUBLIC_BASE_URL` | Bucket CDN the CSP allows; the API redirects `/files/*` there |
 | `FLUORITE_PROXY` | on | `0` disables the `/api`, `/files`, `/thumb`, `/audio/*` proxy |
 | `VITE_API_URL` | unset | Build-time fallback for both API URLs |
 

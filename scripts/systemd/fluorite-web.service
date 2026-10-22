@@ -22,6 +22,9 @@ Environment=FLUORITE_API_URL=http://127.0.0.1:8787
 # Unset: browsers use this origin (proxy). Set to e.g. https://api.fluorite.moe to
 # send them straight to a separately published API (and FLUORITE_PROXY=0).
 #Environment=FLUORITE_PUBLIC_API_URL=https://api.fluorite.moe
+# The bucket's CDN (S3_PUBLIC_BASE_URL of backend/.env): the API redirects /files/* there,
+# so the page's CSP must allow it or every texture and model on a detail page is blocked.
+#Environment=FLUORITE_ASSETS_URL=https://assets.example.com
 Restart=on-failure
 RestartSec=5
 
