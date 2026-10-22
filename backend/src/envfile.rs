@@ -56,7 +56,10 @@ pub fn load() {
 /// line, so every variable after it would otherwise go missing without a word.
 fn read(path: &Path) {
     if let Err(error) = dotenvy::from_path(path) {
-        eprintln!("{}: {error} (the lines after it were not read)", path.display());
+        eprintln!(
+            "{}: {error} (the lines after it were not read)",
+            path.display()
+        );
     }
 }
 

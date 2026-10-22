@@ -305,10 +305,17 @@ async fn fetch_global_range_counting(
     Ok(result)
 }
 
-/// Attempts per range request; the CDN occasionally drops a connection mid-body.
-const FETCH_ATTEMPTS: u32 = 5;
-/// Delay before the first retry, doubled after each failed attempt.
-const FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+/// Consecutive range requests that may fail without receiving a byte before giving up. An
+/// attempt that appends to the body resets this count, so a slow link that keeps making progress
+/// is never cut off.
+const FETCH_STALLED_ATTEMPTS: u32 = 8;
+/// Range requests allowed in total, progress or not, so a server that drips a few bytes per
+/// connection cannot keep a fetch looping forever.
+const FETCH_MAX_REQUESTS: u32 = 64;
+/// Delay before the first retry, and again after any attempt that made progress.
+const FETCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound for the retry delay, which doubles after each attempt without progress.
+const FETCH_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A failed range request, split by whether trying again can help.
 enum FetchError {
@@ -317,7 +324,8 @@ enum FetchError {
 }
 
 /// Fetch `start..=end_inclusive`, retrying transient failures and resuming after the bytes
-/// already received so a dropped connection does not restart a large chunk.
+/// already received so a dropped connection does not restart a large chunk. Only attempts that
+/// receive nothing count against [`FETCH_STALLED_ATTEMPTS`]; [`FETCH_MAX_REQUESTS`] caps the total.
 pub(crate) async fn fetch_range(
     client: &Client,
     url: &str,
@@ -328,8 +336,10 @@ pub(crate) async fn fetch_range(
     let total = (end_inclusive - start + 1) as usize;
     let mut body = Vec::with_capacity(total);
     let mut delay = FETCH_RETRY_DELAY;
-    for attempt in 1..=FETCH_ATTEMPTS {
-        let from = start + body.len() as u64;
+    let mut stalled = 0;
+    for attempt in 1..=FETCH_MAX_REQUESTS {
+        let received = body.len();
+        let from = start + received as u64;
         let error = match fetch_range_into(client, url, from, end_inclusive, downloaded, &mut body)
             .await
         {
@@ -339,20 +349,44 @@ pub(crate) async fn fetch_range(
             }
             Err(error) => error,
         };
+        let progressed = body.len() > received;
+        if progressed {
+            stalled = 0;
+            delay = FETCH_RETRY_DELAY;
+        } else {
+            stalled += 1;
+        }
         match error {
-            FetchError::Transient(message) if attempt < FETCH_ATTEMPTS => {
+            FetchError::Transient(message)
+                if stalled < FETCH_STALLED_ATTEMPTS && attempt < FETCH_MAX_REQUESTS =>
+            {
                 eprintln!(
-                    "  retrying range {start}-{end_inclusive} ({attempt}/{FETCH_ATTEMPTS}): {message}"
+                    "  retrying range {start}-{end_inclusive} (attempt {attempt}, {stalled}/{FETCH_STALLED_ATTEMPTS} without progress): {message}"
                 );
                 tokio::time::sleep(delay).await;
-                delay *= 2;
+                if !progressed {
+                    delay = (delay * 2).min(FETCH_MAX_RETRY_DELAY);
+                }
             }
             FetchError::Transient(message) | FetchError::Fatal(message) => {
                 return Err(format!("{message} (range {start}-{end_inclusive} on {url})").into());
             }
         }
     }
-    unreachable!("the last attempt always returns")
+    unreachable!("the last request always returns")
+}
+
+/// Render `error` followed by each of its sources, joined by ": ". Request errors from reqwest
+/// keep the useful part (a timeout or a reset connection) in the source chain, not the top level.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// One request for `from..=end_inclusive`, appending the received bytes to `body`.
@@ -369,7 +403,7 @@ async fn fetch_range_into(
         .header("Range", format!("bytes={from}-{end_inclusive}"))
         .send()
         .await
-        .map_err(|e| FetchError::Transient(e.to_string()))?;
+        .map_err(|e| FetchError::Transient(error_chain(&e)))?;
     let status = resp.status();
     if status != 206 {
         let message = format!("expected HTTP 206, got {status}");
@@ -382,7 +416,7 @@ async fn fetch_range_into(
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| FetchError::Transient(e.to_string()))?
+        .map_err(|e| FetchError::Transient(error_chain(&e)))?
     {
         if let Some(downloaded) = downloaded {
             downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);

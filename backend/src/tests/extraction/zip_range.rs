@@ -1,4 +1,4 @@
-use crate::extraction::zip_range::{ZipEntry, fetch_range};
+use crate::extraction::zip_range::{ZipEntry, error_chain, fetch_range};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // UNTESTABLE: from_split_archive, extract, extract_raw — require network
@@ -82,4 +82,40 @@ async fn fetch_range_does_not_retry_client_errors() {
     let error = fetch_range(&client, &url, 0, 9, None).await.unwrap_err();
     assert!(error.to_string().contains("404"), "{error}");
     assert_eq!(server.await.unwrap().len(), 1);
+}
+
+/// An error with an optional cause, for building source chains.
+#[derive(Debug)]
+struct Chained(&'static str, Option<Box<Chained>>);
+
+impl std::fmt::Display for Chained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Chained {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.1.as_deref().map(|e| e as _)
+    }
+}
+
+#[test]
+fn error_chain_without_a_source_is_the_message() {
+    assert_eq!(error_chain(&Chained("timed out", None)), "timed out");
+}
+
+#[test]
+fn error_chain_joins_every_source() {
+    let error = Chained(
+        "error decoding response body",
+        Some(Box::new(Chained(
+            "request or response body error",
+            Some(Box::new(Chained("operation timed out", None))),
+        ))),
+    );
+    assert_eq!(
+        error_chain(&error),
+        "error decoding response body: request or response body error: operation timed out"
+    );
 }

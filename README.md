@@ -209,6 +209,8 @@ cargo run --release --bin endfield -- update --check
 | `--no-voice` | Shorthand for `--skip-dir AudioChinese,AudioEnglish,AudioJapanese,AudioKorean` (~6.5 GB of voice packages), with the same fingerprint behaviour |
 | `--no-schema` | Don't regenerate the MemoryPack schema even if the client binary changed |
 
+`FLUORITE_DOWNLOAD_CONCURRENCY` (default `4`) sets how many `.chk` chunks download at once; lower it to `1` or `2` on a slow link so each download finishes before the CDN stalls it.
+
 Exit codes: `0` success or up to date, `1` some entries failed (they are retried next run; the version fingerprint only advances after a clean run), `10` update available (`--check` only). A lock file next to the state prevents overlapping runs. Each run appends a summary line to `<output>/update-log.jsonl`: version and `res_version`, chunk/sort/BLC counts (`chk_dirty`, `chk_ok`, `chk_failed`, `sort_*`, `blc_*`), asset counts from the chunk phase (`tex_extracted`, `tex_failed`, `mesh_exported`, `mesh_failed`), decode counts summed over the BLC directories it extracted (`lua_decrypted`, `memorypack_decoded`, `memorypack_failed`, and `memorypack_schemas`, which counts decoded files per schema), the game version of the newest MemoryPack schema in use (`schema_version`), `schema_regenerated` plus `schema_decoded`/`schema_failed` (JsonData totals after re-decoding) or `schema_error` when a regeneration was attempted, and `duration_secs`.
 
 After the BLC phase, if the archive's `GameAssembly.dll` (CRC32 and size) differs from the one recorded in the state (`memorypack_client`), `update` runs the `schema-gen` flow below. A failed or refused regeneration doesn't fail the update. It logs `schema_error` and keeps the current schemas, `health` warns, and the next run tries again.
@@ -548,7 +550,9 @@ A file is uploaded when the bucket has no object for it, when the sizes differ, 
 when the local file is newer than the object — so a run with nothing to do costs
 one listing and no traffic. `--prune` deletes the objects that are gone locally
 (only with a complete local tree), `--remove-local` deletes the local copy of
-what was uploaded, which is what keeps the disk small.
+what was uploaded, which is what keeps the disk small. With `S3_KEEP_LOCAL=0`,
+`endfield update` publishes and removes each chunk's files as soon as the chunk is
+extracted, so the disk only needs room for one chunk's output.
 
 **The bulk sync.** `backend/scripts/sync-s3.sh` mirrors the configured roots into the
 bucket with `rclone`; it reads the same variables as the API and guesses the

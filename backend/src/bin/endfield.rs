@@ -457,6 +457,8 @@ struct ExtractModes {
 
 /// Per-kind output directories under the extraction output root.
 struct OutputDirs {
+    /// The output root the per-kind directories live under.
+    root: PathBuf,
     gamedata: PathBuf,
     textures: PathBuf,
     meshes: PathBuf,
@@ -465,6 +467,7 @@ struct OutputDirs {
 impl OutputDirs {
     fn new(output: &Path) -> Self {
         Self {
+            root: output.to_path_buf(),
             gamedata: output.join("gamedata"),
             textures: output.join("textures"),
             meshes: output.join("meshes"),
@@ -820,7 +823,28 @@ fn compressed_total<'a>(cd: &ZipCentralDirectory, names: impl Iterator<Item = &'
 /// One finished chunk download: its name, the caller's data, and the bytes or an error.
 type ChunkDownload<T> = (String, T, Result<Vec<u8>, String>);
 
-/// Download chunks as spawned tasks (at most 4 in flight), yielded in input order.
+/// Chunks downloaded at once when `FLUORITE_DOWNLOAD_CONCURRENCY` is not set.
+const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 4;
+
+/// How many chunks download at once: `FLUORITE_DOWNLOAD_CONCURRENCY`, or the default when it
+/// is not set or not a positive integer.
+fn download_concurrency() -> usize {
+    let Some(value) = backend::envfile::var("FLUORITE_DOWNLOAD_CONCURRENCY") else {
+        return DEFAULT_DOWNLOAD_CONCURRENCY;
+    };
+    match value.trim().parse::<usize>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            eprintln!(
+                "warning: FLUORITE_DOWNLOAD_CONCURRENCY={value} is not a positive integer, using {DEFAULT_DOWNLOAD_CONCURRENCY}"
+            );
+            DEFAULT_DOWNLOAD_CONCURRENCY
+        }
+    }
+}
+
+/// Download chunks as spawned tasks (at most [`download_concurrency`] in flight), yielded in
+/// input order.
 ///
 /// Spawning keeps downloads progressing while the caller decodes the current chunk; memory
 /// stays bounded to the in-flight window.
@@ -833,6 +857,7 @@ fn download_chunks<T: Send + 'static>(
     let client = client.clone();
     let cd = Arc::clone(cd);
     let downloaded = Arc::clone(&progress.downloaded);
+    let concurrency = download_concurrency();
     stream::iter(chunks.into_iter().map(move |(name, extra)| {
         let client = client.clone();
         let cd = Arc::clone(&cd);
@@ -844,7 +869,7 @@ fn download_chunks<T: Send + 'static>(
             (name, extra, result)
         })
     }))
-    .buffered(4)
+    .buffered(concurrency)
 }
 
 struct UpdateOptions {
@@ -1102,6 +1127,10 @@ struct ChunkCounts {
 }
 
 /// Download and extract every dirty chunk, checkpointing the state after each one.
+///
+/// When a bucket is configured and the local copies are not kept, each chunk's files are
+/// published and removed as soon as it is extracted, so the disk only holds one chunk's
+/// output at a time.
 async fn extract_dirty_chunks(
     ctx: &UpdateContext<'_>,
     state: &mut UpdateState,
@@ -1120,6 +1149,7 @@ async fn extract_dirty_chunks(
         mesh_failed: 0,
     };
     let mut stats = ExtractStats::default();
+    let publish_settings = chunk_publish_settings();
     let mut progress = DownloadProgress::start(
         ctx.progress,
         "chk",
@@ -1162,10 +1192,13 @@ async fn extract_dirty_chunks(
         });
         match result {
             Ok(()) => {
-                state.chk.insert(name, digest);
+                state.chk.insert(name.clone(), digest);
                 // Checkpoint per chk so an interrupted run resumes instead of starting over.
                 update::save_state(ctx.state_path, state)?;
                 counts.ok += 1;
+                if let Some(settings) = &publish_settings {
+                    publish_chunk(settings, &out_dirs.root, &name).await;
+                }
             }
             Err(failure) => {
                 println!("  {name}: {failure}");
@@ -1528,6 +1561,46 @@ async fn cmd_publish(
         println!("no S3 settings: set S3_ENDPOINT and friends to publish");
     }
     Ok(())
+}
+
+/// The bucket settings when each chunk is to be published as soon as it is extracted: a
+/// bucket is configured and the local copies are removed. `None` otherwise, and when the
+/// settings are invalid (the publish at the end of the run reports that error).
+fn chunk_publish_settings() -> Option<S3Settings> {
+    match S3Settings::from_env(backend::envfile::var) {
+        Ok(Some(settings)) if !settings.keep_local => Some(settings),
+        Ok(_) => None,
+        Err(error) => {
+            eprintln!("warning: not publishing per chunk: {error}");
+            None
+        }
+    }
+}
+
+/// Publish and remove the files one chunk wrote. A failure only warns: the files stay on
+/// the disk and the publish at the end of the run retries them.
+async fn publish_chunk(settings: &S3Settings, output: &Path, name: &str) {
+    let options = PublishOptions {
+        remove_local: true,
+        ..Default::default()
+    };
+    match backend::core::s3::publish(settings, output, &options).await {
+        Ok(report) => {
+            println!("  {name}: published {}", report.summary());
+            for error in &report.errors {
+                eprintln!("  {error}");
+            }
+            if report.failed > 0 {
+                eprintln!(
+                    "  warning: {name}: {} files could not be published, the end of the run retries them",
+                    report.failed
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("  warning: {name}: publish failed, the end of the run retries it: {error}");
+        }
+    }
 }
 
 /// Publish the roots into the bucket after an update, when one is configured.
