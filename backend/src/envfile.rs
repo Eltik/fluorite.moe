@@ -41,14 +41,22 @@ pub fn load() {
     // An empty variable is the same as no variable: the template of the `.env`
     // has it empty, and it must not stop the file from being read.
     if let Some(path) = std::env::var_os(FILE_VARIABLE).filter(|p| !p.is_empty()) {
-        let _ = dotenvy::from_path(path);
+        read(Path::new(&path));
         return;
     }
     for path in candidates() {
         if path.is_file() {
-            let _ = dotenvy::from_path(path);
+            read(&path);
             return;
         }
+    }
+}
+
+/// Read one file, and say so when it is malformed: the parser stops at the first bad
+/// line, so every variable after it would otherwise go missing without a word.
+fn read(path: &Path) {
+    if let Err(error) = dotenvy::from_path(path) {
+        eprintln!("{}: {error} (the lines after it were not read)", path.display());
     }
 }
 
