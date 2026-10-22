@@ -492,6 +492,7 @@ dashboard can be pasted in as they are. `backend/.env.example` lists them all.
 | `S3_PATH_STYLE` | `1` | `0` addresses the bucket as a host prefix instead of a path segment |
 | `S3_CACHE_CONTROL` | unset | `Cache-Control` the objects are stored with |
 | `S3_KEEP_LOCAL` | `1` | `0` removes the local copy of a file once it is in the bucket |
+| `S3_UPLOAD_CONCURRENCY` | `16` | How many files the publisher uploads (and prunes) at once |
 
 For Cloudflare R2 the dashboard names are read as well, so the values of the
 account can be pasted in unchanged:
@@ -550,7 +551,8 @@ A file is uploaded when the bucket has no object for it, when the sizes differ, 
 when the local file is newer than the object — so a run with nothing to do costs
 one listing and no traffic. `--prune` deletes the objects that are gone locally
 (only with a complete local tree), `--remove-local` deletes the local copy of
-what was uploaded, which is what keeps the disk small. With `S3_KEEP_LOCAL=0`,
+what was uploaded and of what the bucket already held, which is what keeps the
+disk small. With `S3_KEEP_LOCAL=0`,
 `endfield update` publishes and removes each chunk's files as soon as the chunk is
 extracted, so the disk only needs room for one chunk's output.
 

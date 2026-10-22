@@ -101,6 +101,22 @@ fn an_unknown_root_or_mode_is_an_error() {
 }
 
 #[test]
+fn the_upload_concurrency_is_a_positive_number() {
+    let cfg = S3Config::from_env(env(&base(&[]))).unwrap().unwrap();
+    assert_eq!(cfg.settings.upload_concurrency, 16, "the default");
+
+    let cfg = S3Config::from_env(env(&base(&[("S3_UPLOAD_CONCURRENCY", "4")])))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cfg.settings.upload_concurrency, 4);
+
+    for value in ["0", "abc"] {
+        let err = S3Config::from_env(env(&base(&[("S3_UPLOAD_CONCURRENCY", value)]))).unwrap_err();
+        assert!(err.contains("S3_UPLOAD_CONCURRENCY"), "{err}");
+    }
+}
+
+#[test]
 fn the_bucket_mirrors_the_local_layout() {
     let cfg = S3Config::from_env(env(&base(&[]))).unwrap().unwrap();
     let storage = Storage::new(std::env::temp_dir(), Some(&cfg)).unwrap();

@@ -102,6 +102,13 @@ async fn handle(State((store, log)): State<(Store, Log)>, req: Request<Body>) ->
     }
     match *req.method() {
         Method::PUT => {
+            if key.contains(FLAKY) {
+                let mut failed = FAILED_ONCE.lock().unwrap();
+                if !failed.contains(&key) {
+                    failed.push(key);
+                    return empty(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
             let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
                 .await
                 .unwrap_or_default();
@@ -225,11 +232,17 @@ fn list(store: &Store, query: &str) -> Response {
         .unwrap()
 }
 
-/// The entity tag of an object: the mock does not compute an MD5, the tests only need
-/// something stable.
+/// The entity tag of an object: the MD5 of its bytes, like a single upload gets it.
 fn etag(bytes: &[u8]) -> String {
-    format!("{:032x}", bytes.len())
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(bytes))
 }
+
+/// The part of a key that makes its first upload fail with `503`, like a busy service.
+pub const FLAKY: &str = "flaky-once";
+
+/// The keys whose first upload already failed.
+static FAILED_ONCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The time an object was stored, as the bucket writes it.
 fn now() -> String {

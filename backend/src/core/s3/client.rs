@@ -14,6 +14,7 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -31,6 +32,12 @@ const MAX_KEYS: u32 = 1000;
 const READ_CHUNK: usize = 1 << 20;
 /// The signing region when none is given: the default of S3.
 const DEFAULT_REGION: &str = "us-east-1";
+/// How long a write may go without an answer before it is given up as stalled.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest upload that still counts as progress, in bytes per second: an upload
+/// gets [`STALL_TIMEOUT`] plus the time its file takes at this rate, so a large file on
+/// a busy link is not cut off.
+const MIN_UPLOAD_RATE: u64 = 64 * 1024;
 
 /// Credentials for a bucket. `session_token` is only set for temporary (STS) keys.
 #[derive(Clone)]
@@ -45,6 +52,8 @@ pub struct Credentials {
 pub struct S3Error {
     pub status: u16,
     pub message: String,
+    /// The local file could not be read: asking the service again does not help.
+    local: bool,
 }
 
 impl S3Error {
@@ -52,6 +61,17 @@ impl S3Error {
         Self {
             status: 404,
             message: format!("object not found: {key}"),
+            local: false,
+        }
+    }
+
+    /// Whether the same call may succeed when it is made again: the service was busy
+    /// (`429`) or failing (`5xx`), or its answer never came (a connection, a timeout).
+    pub fn is_transient(&self) -> bool {
+        match self.status {
+            0 => !self.local,
+            429 => true,
+            status => (500..600).contains(&status),
         }
     }
 
@@ -61,12 +81,21 @@ impl S3Error {
         Self {
             status: 0,
             message: message.to_string(),
+            local: false,
         }
     }
 
     /// A local file that could not be read for an upload.
     fn file(path: &Path, error: std::io::Error) -> Self {
-        Self::transport(format!("{}: {error}", path.display()))
+        Self {
+            local: true,
+            ..Self::transport(format!("{}: {error}", path.display()))
+        }
+    }
+
+    /// A write that got no answer within `budget`.
+    fn stalled(budget: Duration) -> Self {
+        Self::transport(format!("no answer within {}s", budget.as_secs()))
     }
 }
 
@@ -443,10 +472,16 @@ impl S3Client {
             .map_err(|e| S3Error::file(path, e))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
 
-        let res = self
-            .send(reqwest::Method::PUT, key, &[], &extra, &hash, Some(body))
-            .await?;
-        let res = successful(res).await?;
+        // A stalled upload must not hang the publish; the budget grows with the file.
+        let budget = STALL_TIMEOUT + Duration::from_secs(meta.len() / MIN_UPLOAD_RATE);
+        let res = tokio::time::timeout(budget, async {
+            let res = self
+                .send(reqwest::Method::PUT, key, &[], &extra, &hash, Some(body))
+                .await?;
+            successful(res).await
+        })
+        .await
+        .map_err(|_| S3Error::stalled(budget))??;
         Ok(ObjectMeta {
             size: meta.len(),
             etag: etag_of(&res),
@@ -459,9 +494,12 @@ impl S3Client {
     /// A missing object is not an error: the bucket ends up in the wanted state either
     /// way.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
-        let res = self
-            .send_empty(reqwest::Method::DELETE, key, &[], &[])
-            .await?;
+        let res = tokio::time::timeout(
+            STALL_TIMEOUT,
+            self.send_empty(reqwest::Method::DELETE, key, &[], &[]),
+        )
+        .await
+        .map_err(|_| S3Error::stalled(STALL_TIMEOUT))??;
         if res.status().as_u16() == 404 {
             return Ok(());
         }
@@ -529,7 +567,11 @@ async fn error_from_response(res: reqwest::Response) -> S3Error {
     let message = xml_text(&body, "Message")
         .or_else(|| xml_text(&body, "message"))
         .unwrap_or_else(|| body.chars().take(200).collect());
-    S3Error { status, message }
+    S3Error {
+        status,
+        message,
+        local: false,
+    }
 }
 
 /// Percent-encode an object key for a public URL (path segments keep their slashes).

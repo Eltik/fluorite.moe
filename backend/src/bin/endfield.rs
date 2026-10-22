@@ -980,7 +980,18 @@ async fn cmd_update(
 
     let plan = plan_chunks(&resolved.cd, &state, force, modes);
     state.chk.retain(|name, _| plan.existing.contains(name));
-    let chk = extract_dirty_chunks(&ctx, &mut state, &out_dirs, modes, plan.dirty).await?;
+    // The legacy sort below needs the flat PNGs on the disk, so a run that has some to
+    // sort keeps every file until the end.
+    let publish_per_chunk = plan.sort.is_empty();
+    let chk = extract_dirty_chunks(
+        &ctx,
+        &mut state,
+        &out_dirs,
+        modes,
+        plan.dirty,
+        publish_per_chunk,
+    )
+    .await?;
     let sort = sort_legacy_chunks(&ctx, &mut state, &out_dirs.textures, plan.sort).await?;
     if !no_textures {
         clean_texture_outputs(
@@ -1128,15 +1139,19 @@ struct ChunkCounts {
 
 /// Download and extract every dirty chunk, checkpointing the state after each one.
 ///
-/// When a bucket is configured and the local copies are not kept, each chunk's files are
+/// When a bucket is configured, the local copies are not kept and `publish_per_chunk` is
+/// set (the run has no legacy textures to sort afterwards), each chunk's files are
 /// published and removed as soon as it is extracted, so the disk only holds one chunk's
-/// output at a time.
+/// output at a time. That stops at the first chunk that fails to extract: it may have
+/// left partial files, which the walk of the whole root would publish. A failed download
+/// writes nothing and does not stop it.
 async fn extract_dirty_chunks(
     ctx: &UpdateContext<'_>,
     state: &mut UpdateState,
     out_dirs: &OutputDirs,
     modes: ExtractModes,
     dirty: Vec<(String, (String, bool))>,
+    publish_per_chunk: bool,
 ) -> Result<ChunkCounts, Box<dyn std::error::Error>> {
     let cd = &ctx.resolved.cd;
     let mut counts = ChunkCounts {
@@ -1149,7 +1164,11 @@ async fn extract_dirty_chunks(
         mesh_failed: 0,
     };
     let mut stats = ExtractStats::default();
-    let publish_settings = chunk_publish_settings();
+    let mut publish_settings = chunk_publish_settings();
+    if publish_settings.is_some() && !publish_per_chunk {
+        println!("  not publishing per chunk: legacy textures are sorted after the extraction");
+        publish_settings = None;
+    }
     let mut progress = DownloadProgress::start(
         ctx.progress,
         "chk",
@@ -1203,6 +1222,11 @@ async fn extract_dirty_chunks(
             Err(failure) => {
                 println!("  {name}: {failure}");
                 counts.failed += 1;
+                if publish_settings.take().is_some() {
+                    println!(
+                        "  not publishing per chunk any more: {name} failed and may have left partial files"
+                    );
+                }
             }
         }
     }

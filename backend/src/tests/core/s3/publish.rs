@@ -3,7 +3,7 @@
 
 use crate::core::s3::{PublishOptions, S3Settings};
 
-use super::{env, mock_endpoint};
+use super::{FLAKY, env, mock_endpoint};
 
 /// The settings of the mock endpoint, with the prefix and the roots of the deployment.
 fn settings(endpoint: &str) -> S3Settings {
@@ -258,5 +258,173 @@ async fn the_prune_is_off_by_default() {
             .unwrap()
             .contains_key("fluorite/textures/icon.png"),
         "an object is not deleted without the prune"
+    );
+}
+
+#[tokio::test]
+async fn the_local_copy_goes_away_when_the_bucket_already_has_it() {
+    let (endpoint, store, _log) = mock_endpoint().await;
+    let tree = Tree::new("remove-later");
+    // The first run keeps the local copies.
+    crate::core::s3::publish(&settings(&endpoint), &tree.dir, &PublishOptions::default())
+        .await
+        .unwrap();
+
+    // The second one has nothing to upload, but the files can still go.
+    let report = crate::core::s3::publish(
+        &settings(&endpoint),
+        &tree.dir,
+        &PublishOptions {
+            remove_local: true,
+            ..PublishOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.uploaded, 0);
+    assert_eq!(report.skipped, 2);
+    assert_eq!(report.removed, 2);
+    assert!(!tree.path("textures/icon.png").exists());
+    assert!(!tree.path("textures/ui/logo.png").exists());
+    assert!(
+        !tree.path("textures/ui").exists(),
+        "the directory it emptied is gone too"
+    );
+    assert_eq!(
+        store.lock().unwrap().len(),
+        2,
+        "the objects are still in the bucket"
+    );
+}
+
+#[tokio::test]
+async fn many_files_are_uploaded_side_by_side() {
+    let (endpoint, store, _log) = mock_endpoint().await;
+    let tree = Tree::new("many");
+    std::fs::create_dir_all(tree.path("textures/many")).unwrap();
+    for i in 0..48 {
+        std::fs::write(tree.path(&format!("textures/many/{i}.png")), b"PNG").unwrap();
+    }
+    let settings = S3Settings::from_env(env(&[
+        ("S3_ENDPOINT", endpoint.as_str()),
+        ("S3_BUCKET", "assets"),
+        ("S3_ACCESS_KEY_ID", "AKID"),
+        ("S3_SECRET_ACCESS_KEY", "secret"),
+        ("S3_PREFIX", "fluorite"),
+        ("S3_ROOTS", "textures"),
+        ("S3_UPLOAD_CONCURRENCY", "8"),
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(settings.upload_concurrency, 8);
+
+    let report = crate::core::s3::publish(&settings, &tree.dir, &PublishOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(report.uploaded, 50);
+    assert_eq!(report.bytes, 8 + 8 + 48 * 3);
+    assert_eq!(report.failed, 0);
+    let store = store.lock().unwrap();
+    assert_eq!(store.len(), 50, "every file is in the bucket");
+    assert_eq!(
+        store
+            .get("fluorite/textures/many/47.png")
+            .map(Vec::as_slice),
+        Some(&b"PNG"[..])
+    );
+}
+
+#[tokio::test]
+async fn a_local_copy_that_differs_from_the_object_is_uploaded_again() {
+    let (endpoint, store, _log) = mock_endpoint().await;
+    let tree = Tree::new("differs");
+    crate::core::s3::publish(&settings(&endpoint), &tree.dir, &PublishOptions::default())
+        .await
+        .unwrap();
+
+    // The object changed behind the publisher's back: same size, newer, other bytes.
+    // Only the hash tells, and the local copy must not go on the size alone.
+    store.lock().unwrap().insert(
+        "fluorite/textures/icon.png".to_string(),
+        b"png-icon".to_vec(),
+    );
+    let report = crate::core::s3::publish(
+        &settings(&endpoint),
+        &tree.dir,
+        &PublishOptions {
+            remove_local: true,
+            ..PublishOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.uploaded, 1, "the changed object is uploaded again");
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.removed, 2);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get("fluorite/textures/icon.png")
+            .map(Vec::as_slice),
+        Some(&b"PNG-ICON"[..]),
+        "the bucket holds the local bytes again"
+    );
+}
+
+#[tokio::test]
+async fn the_prune_refuses_to_run_while_the_local_copies_go() {
+    // Without the local copies the prune would see nothing on the disk and empty the
+    // bucket.
+    let (endpoint, store, log) = mock_endpoint().await;
+    let tree = Tree::new("prune-remove");
+    crate::core::s3::publish(&settings(&endpoint), &tree.dir, &PublishOptions::default())
+        .await
+        .unwrap();
+    let requests = log.lock().unwrap().len();
+
+    let err = crate::core::s3::publish(
+        &settings(&endpoint),
+        &tree.dir,
+        &PublishOptions {
+            prune: true,
+            remove_local: true,
+            ..PublishOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.contains("--prune"), "{err}");
+    assert_eq!(
+        log.lock().unwrap().len(),
+        requests,
+        "the bucket was not asked"
+    );
+    assert_eq!(store.lock().unwrap().len(), 2);
+    assert!(tree.path("textures/icon.png").exists());
+}
+
+#[tokio::test]
+async fn a_busy_service_is_asked_again() {
+    let (endpoint, store, _log) = mock_endpoint().await;
+    let tree = Tree::new("flaky");
+    std::fs::write(tree.path(&format!("textures/{FLAKY}.png")), b"PNG").unwrap();
+
+    let report =
+        crate::core::s3::publish(&settings(&endpoint), &tree.dir, &PublishOptions::default())
+            .await
+            .unwrap();
+
+    assert_eq!(report.failed, 0, "{:?}", report.errors);
+    assert_eq!(report.uploaded, 3);
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .contains_key(&format!("fluorite/textures/{FLAKY}.png"))
     );
 }

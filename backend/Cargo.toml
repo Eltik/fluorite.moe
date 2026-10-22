@@ -44,6 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 httpdate = "1"
 sha2 = "0.10"
+md-5 = "0.10"
 hmac = "0.12"
 dotenvy = { version = "0.15.7", default-features = false }
 

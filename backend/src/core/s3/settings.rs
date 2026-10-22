@@ -15,6 +15,9 @@ pub const DEFAULT_PREFIX: &str = "fluorite";
 /// The roots that live in the bucket, when `S3_ROOTS` is not set: the heavy ones.
 const DEFAULT_ROOTS: [Root; 3] = [Root::Textures, Root::Meshes, Root::Models];
 
+/// How many objects are uploaded at once, when `S3_UPLOAD_CONCURRENCY` is not set.
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 16;
+
 /// The object storage settings, read from the `S3_*` and `CLOUDFLARE_*` variables.
 ///
 /// The API serves the roots that live in the bucket and the unpacker publishes into it,
@@ -37,6 +40,7 @@ const DEFAULT_ROOTS: [Root; 3] = [Root::Textures, Root::Meshes, Root::Models];
 /// | `S3_PUBLIC_BASE_URL` | none |
 /// | `S3_CACHE_CONTROL` | none |
 /// | `S3_KEEP_LOCAL` | `1` (keep the local copy of an uploaded file) |
+/// | `S3_UPLOAD_CONCURRENCY` | `16` |
 #[derive(Clone)]
 pub struct S3Settings {
     /// Endpoint URL, e.g. `https://<account>.r2.cloudflarestorage.com`.
@@ -57,6 +61,8 @@ pub struct S3Settings {
     pub cache_control: Option<String>,
     /// Keep the local copy of a file after it was uploaded.
     pub keep_local: bool,
+    /// How many objects are uploaded (and pruned) at once.
+    pub upload_concurrency: usize,
     /// Address the bucket as a path segment (`/<bucket>/<key>`) instead of a host prefix.
     pub path_style: bool,
 }
@@ -74,6 +80,7 @@ impl std::fmt::Debug for S3Settings {
             .field("public_base_url", &self.public_base_url)
             .field("cache_control", &self.cache_control)
             .field("keep_local", &self.keep_local)
+            .field("upload_concurrency", &self.upload_concurrency)
             .field("path_style", &self.path_style)
             .field("access_key_id", &self.credentials.access_key_id)
             .field("secret_access_key", &"<redacted>")
@@ -145,6 +152,10 @@ impl S3Settings {
             Some(list) => parse_roots(&list)?,
             None => DEFAULT_ROOTS.to_vec(),
         };
+        let upload_concurrency = match var("S3_UPLOAD_CONCURRENCY") {
+            Some(value) => parse_concurrency(&value)?,
+            None => DEFAULT_UPLOAD_CONCURRENCY,
+        };
 
         let provider = named.unwrap_or_else(|| Provider::detect(&endpoint));
 
@@ -169,6 +180,7 @@ impl S3Settings {
             public_base_url: var("S3_PUBLIC_BASE_URL"),
             cache_control: var("S3_CACHE_CONTROL"),
             keep_local: flag_opt(&var, "S3_KEEP_LOCAL").unwrap_or(true),
+            upload_concurrency,
             path_style,
         }))
     }
@@ -249,6 +261,16 @@ fn parse_roots(list: &str) -> Result<Vec<Root>, String> {
         .filter(|name| !name.is_empty())
         .map(|name| Root::parse(name).ok_or_else(|| format!("S3_ROOTS: {name:?} is not a root")))
         .collect()
+}
+
+/// The number in `S3_UPLOAD_CONCURRENCY`: a whole number above zero.
+fn parse_concurrency(value: &str) -> Result<usize, String> {
+    value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| format!("S3_UPLOAD_CONCURRENCY: {value:?} is not a positive number"))
 }
 
 /// Read a boolean variable (`1`/`0`, `true`/`false`, `on`/`off`), or `None` when it is
