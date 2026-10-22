@@ -43,6 +43,13 @@ impl Tables {
     }
 }
 
+/// Icon for an item: `itemicon/<iconId>`, else `walleticon/<iconId>` (currencies like
+/// `item_spaceship_intelligence` only ship there).
+fn item_icon(env: &Env, icon_id: &str) -> Option<String> {
+    env.ui("itemicon", icon_id)
+        .or_else(|| env.ui("walleticon", icon_id))
+}
+
 pub fn base(t: &Tables, env: &Env) -> Vec<BaseItem> {
     let names = t.type_names();
     let mut items: Vec<BaseItem> = t
@@ -58,7 +65,7 @@ pub fn base(t: &Tables, env: &Env) -> Vec<BaseItem> {
                 &it.kind,
                 names.get(it.kind.as_str()).copied().unwrap_or_default(),
             )],
-            icon: env.ui("itemicon", &it.icon_id),
+            icon: item_icon(env, &it.icon_id),
             has_model: false,
             type_code: Some(it.kind.clone()).filter(|s| !s.is_empty()),
         })
@@ -133,10 +140,11 @@ pub fn detail(t: &Tables, env: &Env, texts: &Texts, id: &str) -> Option<Value> {
         None
     };
     let mut art = BTreeMap::new();
-    for (key, dir) in [("icon", "itemicon"), ("iconBig", "itemiconbig")] {
-        if let Some(p) = env.ui(dir, &it.icon_id) {
-            art.insert(key, p);
-        }
+    if let Some(p) = item_icon(env, &it.icon_id) {
+        art.insert("icon", p);
+    }
+    if let Some(p) = env.ui("itemiconbig", &it.icon_id) {
+        art.insert("iconBig", p);
     }
     let d = ItemDetail {
         kind: "items",

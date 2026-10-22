@@ -648,6 +648,30 @@ pub struct Npc {
 
 map_table!(NpcTable, "NpcTable", Npc);
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NpcPrefabChar {
+    pub template_id: String,
+    pub corresponding_char_id: String,
+}
+
+// Keyed by `templateId` (an NPC's `dataKey`, e.g. `npc_chr_0004_pelica`).
+map_table!(
+    NpcPrefabCorrespondingCharTable,
+    "NpcPrefabCorrespondingCharTable",
+    NpcPrefabChar
+);
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SnsChat {
+    pub chat_id: String,
+    pub icon: String,
+}
+
+// Keyed by `chatId`, which matches an NPC's `npcGroupId` for one-on-one chats.
+map_table!(SnsChatTable, "SNSChatTable", SnsChat);
+
 // ── Facilities ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]

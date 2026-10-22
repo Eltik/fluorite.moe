@@ -756,6 +756,129 @@ async fn other_details() {
     );
 }
 
+/// Merges `rows` into the fixture table `name` and writes the sprites under `UI/`.
+fn extend_fixture(fx: &Fixture, name: &str, rows: Value, sprites: &[&str]) {
+    let path = fx
+        .output()
+        .join(format!("decrypted/Table/TableCfg/{name}.json"));
+    let mut table: Value = std::fs::read(&path)
+        .map(|b| serde_json::from_slice(&b).unwrap())
+        .unwrap_or_else(|_| json!({}));
+    for (k, v) in rows.as_object().unwrap() {
+        table[k] = v.clone();
+    }
+    std::fs::write(&path, serde_json::to_vec(&table).unwrap()).unwrap();
+    for p in sprites {
+        let p = fx.output().join(format!("{UI}/{p}"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"png").unwrap();
+    }
+}
+
+/// NPC portraits fall back to the operator stand-in table, the SNS chat avatar, and name
+/// tokens matched across `charicon/`, `charremoteicon/` and `charroundicon/`.
+#[tokio::test]
+async fn npc_icon_fallbacks() {
+    let fx = catalog_fixture();
+    extend_fixture(
+        &fx,
+        "NpcTable",
+        json!({
+            "npc_0004_perlica_g01_i001": { "npcId": "npc_0004_perlica_g01_i001",
+                "dataKey": "npc_chr_0004_pelica", "npcGroupId": "npc_0004_perlica_g01" },
+            "npc_suosi_g01": { "npcId": "npc_suosi_g01",
+                "dataKey": "npc_gentleman_rfg_b_05", "npcGroupId": "npc_gentleman_rfg_b_05_g01" },
+            "kelao": { "npcId": "kelao", "dataKey": "npc_kelao", "npcGroupId": "kelao_g01" },
+            "npc_andrew_x": { "npcId": "npc_andrew_x", "dataKey": "npc_spl_andrew_01" }
+        }),
+        &[
+            "charremoteicon/icon_npc_1004_kelao.png",
+            "charroundicon/icon_sns_npc_kelao_01.png",
+            "charroundicon/icon_sns_npc_suosi_01.png",
+            "charroundicon/icon_sns_npc_andrew_01.png",
+            "charroundicon/icon_sns_npc_group.png",
+        ],
+    );
+    extend_fixture(
+        &fx,
+        "NpcPrefabCorrespondingCharTable",
+        json!({ "npc_chr_0004_pelica": { "correspondingCharId": "chr_0004_pelica",
+            "templateId": "npc_chr_0004_pelica" } }),
+        &[],
+    );
+    extend_fixture(
+        &fx,
+        "SNSChatTable",
+        json!({ "npc_gentleman_rfg_b_05_g01": { "chatId": "npc_gentleman_rfg_b_05_g01",
+            "icon": "icon_sns_npc_suosi_01" } }),
+        &[],
+    );
+    let app = fx.app();
+    let ui = "beyond/dynamicassets/gameplay/ui/sprites";
+
+    let v = body_json(get(&app, "/api/catalog/npcs").await).await;
+    let icon = |id: &str| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap()["icon"]
+            .clone()
+    };
+    assert_eq!(
+        icon("npc_0004_perlica_g01_i001"),
+        format!("{ui}/charicon/icon_chr_0004_pelica.png")
+    );
+    assert_eq!(
+        icon("npc_suosi_g01"),
+        format!("{ui}/charroundicon/icon_sns_npc_suosi_01.png")
+    );
+    // `charremoteicon/` wins over `charroundicon/` for the same name.
+    assert_eq!(
+        icon("kelao"),
+        format!("{ui}/charremoteicon/icon_npc_1004_kelao.png")
+    );
+    assert_eq!(
+        icon("npc_andrew_x"),
+        format!("{ui}/charroundicon/icon_sns_npc_andrew_01.png")
+    );
+
+    let v = body_json(get(&app, "/api/catalog/npcs/kelao").await).await;
+    assert_eq!(
+        v["icon"],
+        format!("{ui}/charremoteicon/icon_npc_1004_kelao.png")
+    );
+}
+
+/// Item icons missing from `itemicon/` fall back to `walleticon/`.
+#[tokio::test]
+async fn item_icon_falls_back_to_walleticon() {
+    let fx = catalog_fixture();
+    extend_fixture(
+        &fx,
+        "ItemTable",
+        json!({ "item_spaceship_intelligence": { "id": "item_spaceship_intelligence",
+            "rarity": 3, "type": "Gold", "iconId": "item_spaceship_intelligence" } }),
+        &["walleticon/item_spaceship_intelligence.png"],
+    );
+    let app = fx.app();
+    let path =
+        "beyond/dynamicassets/gameplay/ui/sprites/walleticon/item_spaceship_intelligence.png";
+
+    let v = body_json(get(&app, "/api/catalog/items").await).await;
+    let item = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "item_spaceship_intelligence")
+        .unwrap();
+    assert_eq!(item["icon"], path);
+
+    let v = body_json(get(&app, "/api/catalog/items/item_spaceship_intelligence").await).await;
+    assert_eq!(v["art"]["icon"], path);
+}
+
 #[tokio::test]
 async fn story_endpoints() {
     let fx = catalog_fixture();
