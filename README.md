@@ -404,7 +404,7 @@ scripts/serve.sh --rebuild     # force both builds
 For a server, `scripts/systemd/` has example units: `fluorite-api.service`,
 `fluorite-web.service`, and `fluorite-update.service` + `.timer` (the systemd
 equivalent of the cron line under [Scheduling](#scheduling)). They assume a checkout
-at `/srv/fluorite.moe` and a `fluorite` user; adjust paths and build both parts once
+at `/var/www/fluorite.moe` and run as root; adjust paths and build both parts once
 before enabling them. Put a reverse proxy (Caddy, nginx) in front of the web port for
 TLS, HSTS and compression of HTML; the API already compresses its JSON.
 

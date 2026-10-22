@@ -1,7 +1,7 @@
 # fluorite-api: read-only HTTP API over the extracted output.
 # Install: copy to /etc/systemd/system/, adjust paths/User, then
 #   systemctl daemon-reload && systemctl enable --now fluorite-api
-# Build first: (cd /srv/fluorite.moe/backend && cargo build --release --bin fluorite-api)
+# Build first: (cd /var/www/fluorite.moe/backend && cargo build --release --bin fluorite-api)
 [Unit]
 Description=fluorite.moe API
 After=network-online.target
@@ -9,15 +9,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=fluorite
-Group=fluorite
-WorkingDirectory=/srv/fluorite.moe/backend
-ExecStart=/srv/fluorite.moe/backend/target/release/fluorite-api
+User=root
+Group=root
+WorkingDirectory=/var/www/fluorite.moe/backend
+ExecStart=/var/www/fluorite.moe/backend/target/release/fluorite-api
 Environment=FLUORITE_API_ADDR=127.0.0.1:8787
-Environment=FLUORITE_OUTPUT=/srv/fluorite.moe/backend/output
+Environment=FLUORITE_OUTPUT=/var/www/fluorite.moe/backend/output
 # Derived caches (thumbnails, transcoded audio, search index). Must be writable.
 Environment=FLUORITE_CACHE_DIR=/var/cache/fluorite
-Environment=FLUORITE_STATE=/srv/fluorite.moe/backend/data/update-state.json
+Environment=FLUORITE_STATE=/var/www/fluorite.moe/backend/data/update-state.json
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
@@ -28,7 +28,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 CacheDirectory=fluorite
-ReadOnlyPaths=/srv/fluorite.moe/backend/output /srv/fluorite.moe/backend/data
+ReadOnlyPaths=/var/www/fluorite.moe/backend/output /var/www/fluorite.moe/backend/data
 
 [Install]
 WantedBy=multi-user.target
