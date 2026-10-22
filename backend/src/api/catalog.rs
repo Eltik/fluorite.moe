@@ -4,8 +4,9 @@
 //! Caching works in three layers:
 //! 1. [`tables::TableCache`]: each table JSON parsed once into typed structs on a blocking
 //!    thread, re-parsed when its size/mtime changes.
-//! 2. Per-kind *base* lists (language independent: ids, codes, icon paths verified on disk,
-//!    model availability), memoized on the identity of the tables they were built from.
+//! 2. Per-kind *base* lists (language independent: ids, codes, icon paths verified on disk
+//!    or in the bucket's listing, model availability), memoized on the identity of the
+//!    tables and the listing they were built from.
 //! 3. Per-(kind, lang, gender) resolved lists, memoized on the base list and the i18n maps
 //!    (which [`crate::api::i18n::I18nCache`] invalidates by mtime). LRU-bounded.
 //!
@@ -34,7 +35,7 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use self::assets::{MeshIndex, RigIndex};
+use self::assets::{Files, MeshIndex, OutputFiles, RigIndex, RootFiles, Roots};
 use self::tables::{AnyArc, HyperlinkTextTable, RichTextStyleTable, TableCache};
 use self::text::{Gender, Markup, TermDef, TextRef, Texts};
 use super::SharedState;
@@ -353,8 +354,8 @@ pub fn sort_id(items: &mut [BaseItem]) {
 /// Paths and file-system indexes used while building (blocking context).
 #[derive(Clone)]
 pub struct Env {
-    pub output: PathBuf,
-    pub textures: PathBuf,
+    pub output: OutputFiles,
+    pub textures: RootFiles,
     pub meshes: Arc<MeshIndex>,
     pub rig: Arc<RigIndex>,
 }
@@ -374,7 +375,13 @@ pub struct Catalog {
     lists: Memo<(Kind, String, Gender), ResolvedList>,
     markup: Memo<(), Markup>,
     meshes: std::sync::Mutex<Option<(MeshStamp, Arc<MeshIndex>)>>,
-    rig: std::sync::Mutex<Option<(Option<SystemTime>, Arc<RigIndex>)>>,
+    rig: std::sync::Mutex<Option<(RigStamp, Arc<RigIndex>)>>,
+    /// Held while the rigged-model index loads, so concurrent requests load it once.
+    rig_flight: tokio::sync::Mutex<()>,
+    /// The index built when `index.json` could not be read, and when.
+    rig_failed: std::sync::Mutex<Option<(RigStamp, Instant, Arc<RigIndex>)>>,
+    /// [`RIG_RETRY`] in milliseconds (tests shorten it).
+    rig_retry_ms: std::sync::atomic::AtomicU64,
     pub story: crate::api::story::StoryCache,
 }
 
@@ -393,8 +400,24 @@ impl Catalog {
             markup: Memo::new(1, Some(Duration::from_secs(300))),
             meshes: std::sync::Mutex::new(None),
             rig: std::sync::Mutex::new(None),
+            rig_flight: tokio::sync::Mutex::new(()),
+            rig_failed: std::sync::Mutex::new(None),
+            rig_retry_ms: std::sync::atomic::AtomicU64::new(RIG_RETRY.as_millis() as u64),
             story: crate::api::story::StoryCache::new(),
         }
+    }
+
+    /// How long an index built without its `index.json` is used before reading again.
+    fn rig_retry(&self) -> Duration {
+        Duration::from_millis(self.rig_retry_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Change that delay (tests).
+    pub fn set_rig_retry(&self, delay: Duration) {
+        self.rig_retry_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -403,13 +426,36 @@ pub fn tables_dir(state: &SharedState) -> PathBuf {
 }
 
 /// When the mesh index was last valid: mtimes of `update-log.jsonl` (every extraction
-/// appends to it) and of the meshes root.
-type MeshStamp = [Option<SystemTime>; 2];
+/// appends to it) and of the meshes root, and the generation of the bucket's listing.
+type MeshStamp = ([Option<SystemTime>; 2], u64);
 
-/// Mesh index (rebuilt when [`MeshStamp`] changes) and rigged-model index (by the mtime of
-/// `models/index.json`).
+/// When the rigged-model index was last valid: the mtime of `models/index.json` and the
+/// generation of the bucket's listing.
+type RigStamp = (Option<SystemTime>, u64);
+
+/// The output tree as the catalog sees it: the roots that live in the bucket through its
+/// last listing, the others on the local disk.
+///
+/// Until the first listing lands (it can take a minute for a large bucket) every root is
+/// read from the local disk, rather than holding requests: the caches are keyed on the
+/// listing's generation, so they are rebuilt from the bucket as soon as it is there.
+pub fn output_files(state: &SharedState) -> OutputFiles {
+    OutputFiles {
+        dir: state.config.output.clone(),
+        view: state.storage.view(),
+    }
+}
+
+/// How long a rigged-model index whose `index.json` could not be read from the bucket
+/// is used before the read is tried again.
+const RIG_RETRY: Duration = Duration::from_secs(30);
+
+/// Mesh index (rebuilt when [`MeshStamp`] changes) and rigged-model index (by
+/// [`RigStamp`]).
 pub async fn env(state: &SharedState) -> ApiResult<Env> {
     let output = state.config.output.clone();
+    let files = output_files(state);
+    let generation = files.view.generation;
     let cat = &state.catalog;
     let watched = [
         state.config.update_log(),
@@ -419,7 +465,7 @@ pub async fn env(state: &SharedState) -> ApiResult<Env> {
     let [log, meshes_dir, rig_index] =
         blocking(move || watched.map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()))
             .await?;
-    let mesh_stamp = [log, meshes_dir];
+    let mesh_stamp = ([log, meshes_dir], generation);
     let cached = cat
         .meshes
         .lock()
@@ -430,37 +476,85 @@ pub async fn env(state: &SharedState) -> ApiResult<Env> {
     let meshes = match cached {
         Some(m) => m,
         None => {
-            let dir = Root::Meshes.dir(&output);
+            let meshes = files.root_files(Root::Meshes);
             let started = Instant::now();
-            let m = Arc::new(blocking(move || MeshIndex::build(&dir)).await?);
+            let m = Arc::new(blocking(move || MeshIndex::build(&meshes)).await?);
             tracing::debug!("mesh index built in {} ms", started.elapsed().as_millis());
             *cat.meshes.lock().unwrap_or_else(|e| e.into_inner()) = Some((mesh_stamp, m.clone()));
             m
         }
     };
-    let stamp = rig_index;
-    let cached = cat
-        .rig
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .filter(|(s, _)| *s == stamp)
-        .map(|(_, r)| r.clone());
-    let rig = match cached {
-        Some(r) => r,
-        None => {
-            let out = output.clone();
-            let r = Arc::new(blocking(move || RigIndex::load(&out)).await?);
-            *cat.rig.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, r.clone()));
-            r
-        }
-    };
+    let rig = rig_index_for(state, &files, (rig_index, generation)).await?;
     Ok(Env {
-        textures: Root::Textures.dir(&output),
-        output,
+        textures: files.root_files(Root::Textures),
+        output: files,
         meshes,
         rig,
     })
+}
+
+/// The rigged-model index for `stamp`, loaded once however many requests ask for it.
+///
+/// An index whose `index.json` the bucket failed to give is not cached: it is used for
+/// [`RIG_RETRY`] (the GLBs at their default paths are still found), then read again.
+async fn rig_index_for(
+    state: &SharedState,
+    files: &OutputFiles,
+    stamp: RigStamp,
+) -> ApiResult<Arc<RigIndex>> {
+    let cat = &state.catalog;
+    let cached = || {
+        cat.rig
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(s, _)| *s == stamp)
+            .map(|(_, r)| r.clone())
+    };
+    if let Some(r) = cached() {
+        return Ok(r);
+    }
+    let _flight = cat.rig_flight.lock().await;
+    if let Some(r) = cached() {
+        return Ok(r);
+    }
+    {
+        let failed = cat.rig_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((s, at, r)) = failed.as_ref()
+            && *s == stamp
+            && at.elapsed() < cat.rig_retry()
+        {
+            return Ok(r.clone());
+        }
+    }
+    let out = state.config.output.clone();
+    let models = files.root_files(Root::Models);
+    let (rig, complete) = blocking(move || match &models {
+        RootFiles::Disk(_) => (RigIndex::load(&out), true),
+        // The bucket's copy of `index.json` (or the local one): its listing generation
+        // stands in for the mtime.
+        RootFiles::Bucket { .. } if models.has_file("index.json") => {
+            let stamp = Some(stamp.0.unwrap_or(SystemTime::UNIX_EPOCH));
+            match RigIndex::try_load_from(&models, stamp) {
+                Some(rig) => (rig, true),
+                None => {
+                    tracing::warn!("rigged models: index.json could not be read; retrying later");
+                    (RigIndex::load_from(&models, stamp), false)
+                }
+            }
+        }
+        RootFiles::Bucket { .. } => (RigIndex::default(), true),
+    })
+    .await?;
+    let rig = Arc::new(rig);
+    if complete {
+        *cat.rig.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, rig.clone()));
+        *cat.rig_failed.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    } else {
+        *cat.rig_failed.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((stamp, Instant::now(), rig.clone()));
+    }
+    Ok(rig)
 }
 
 /// Style colors and glossary terms (with verified icon paths).
@@ -475,11 +569,12 @@ async fn markup(state: &SharedState) -> ApiResult<Arc<Markup>> {
         .tables
         .get_or_default::<HyperlinkTextTable>(&dir)
         .await?;
-    let deps = vec![dep(&styles), dep(&links)];
+    let files = output_files(state);
+    let deps = vec![dep(&styles), dep(&links), dep(&files.view)];
     if let Some(m) = cat.markup.get(&(), &deps) {
         return Ok(m);
     }
-    let textures = Root::Textures.dir(&state.config.output);
+    let textures = files.root_files(Root::Textures);
     let m = Arc::new(
         blocking(move || Markup {
             styles: styles
@@ -550,9 +645,10 @@ async fn base(state: &SharedState, kind: Kind) -> ApiResult<Arc<Vec<BaseItem>>> 
         ($m:ident) => {{
             let t = $m::Tables::load(&cat.tables, &dir).await?;
             let mut deps = t.deps();
-            // `hasModel` reads both indexes.
+            // `hasModel` reads both indexes, and the icons the bucket's listing.
             deps.push(dep(&env.meshes));
             deps.push(dep(&env.rig));
+            deps.push(dep(&env.output.view));
             cat.bases
                 .get_or_build(kind, deps, || async move {
                     let started = Instant::now();

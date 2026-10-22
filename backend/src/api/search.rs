@@ -23,7 +23,7 @@ use tokio::sync::{Semaphore, watch};
 use super::SharedState;
 use super::error::{ApiError, ApiResult};
 use super::paths::{Root, extension, is_hidden};
-use super::storage::RemoteFile;
+use super::storage::{Listing, RemoteFile};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 500;
@@ -378,7 +378,7 @@ impl SearchIndex {
     /// A root that is in the bucket is not walked on the disk: the listing is the
     /// truth for it, and the local copy (if it is still there) would only duplicate
     /// every entry.
-    pub fn build_with_remote(output: &Path, remote: &[(Root, Vec<RemoteFile>)]) -> SearchIndex {
+    pub fn build_with_remote(output: &Path, remote: &[(Root, Arc<Listing>)]) -> SearchIndex {
         let started = Instant::now();
         let in_bucket: HashSet<Root> = remote.iter().map(|(root, _)| *root).collect();
         let queue = WorkQueue {
@@ -428,9 +428,9 @@ impl SearchIndex {
 
         // The roots that live in the bucket: one segment each, built from the
         // listing instead of from the disk.
-        for (root, files) in remote {
+        for (root, listing) in remote {
             let mut seg = Segment::default();
-            scan_listing(&mut seg, *root, files);
+            scan_listing(&mut seg, *root, listing.files());
             if seg.entries.is_empty() {
                 continue;
             }
@@ -627,10 +627,25 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 }
 
 async fn rebuild(state: &SharedState, reason: &str) {
-    let output = state.config.output.clone();
     // The roots that live in the bucket are listed first: the index is built from
     // that listing instead of from the disk for them.
     let remote = state.storage.list_remote_roots().await;
+    build(state, remote, reason).await;
+}
+
+/// List the bucket again and rebuild the index only when the listing changed: files a
+/// publish uploaded after the last re-index (or a publish that stopped halfway) show up
+/// without waiting for the next game update.
+async fn relist(state: &SharedState) {
+    let before = state.storage.view().generation;
+    let remote = state.storage.list_remote_roots().await;
+    if state.storage.view().generation != before {
+        build(state, remote, "bucket changed").await;
+    }
+}
+
+async fn build(state: &SharedState, remote: Vec<(Root, Arc<Listing>)>, reason: &str) {
+    let output = state.config.output.clone();
     match tokio::task::spawn_blocking(move || SearchIndex::build_with_remote(&output, &remote))
         .await
     {
@@ -649,6 +664,9 @@ async fn rebuild(state: &SharedState, reason: &str) {
 
 /// Build the index now, then rebuild whenever `update-log.jsonl` or `models/index.json`
 /// changes (polled; the model exporter writes the latter without logging an update).
+///
+/// With a bucket, it is also listed again every `bucket_relist` (checked at each poll),
+/// and the index rebuilt when the listing changed.
 pub fn spawn_maintenance(state: SharedState) {
     tokio::spawn(async move {
         let watched = [
@@ -663,8 +681,10 @@ pub fn spawn_maintenance(state: SharedState) {
                     .unwrap_or_default()
             }
         };
+        let relist_every = state.config.s3.as_ref().and(state.config.bucket_relist);
         let mut seen = stamp().await;
         rebuild(&state, "startup").await;
+        let mut listed = Instant::now();
         let mut tick = tokio::time::interval(state.config.index_poll);
         tick.tick().await;
         loop {
@@ -678,6 +698,10 @@ pub fn spawn_maintenance(state: SharedState) {
                 };
                 seen = now;
                 rebuild(&state, reason).await;
+                listed = Instant::now();
+            } else if relist_every.is_some_and(|every| listed.elapsed() >= every) {
+                relist(&state).await;
+                listed = Instant::now();
             }
         }
     });

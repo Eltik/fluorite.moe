@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::assets::{self, ModelInfo, UI, model_info};
+use super::assets::{self, Files, ModelInfo, UI, model_info};
 use super::tables::*;
 use super::text::Texts;
 use super::{BaseItem, BaseTag, Env, TagName, dep, finish_detail, sort_id};
@@ -57,13 +57,10 @@ fn npc_icon(
 
 /// `icon_npc_1001_andrew` → `andrew`, for every NPC sprite in `charicon/`.
 fn npc_icon_names(env: &Env) -> HashMap<String, String> {
-    let dir = env.textures.join(UI).join("charicon");
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return HashMap::new();
-    };
-    rd.flatten()
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|f| {
+    env.textures
+        .entries(&format!("{UI}/charicon"))
+        .into_iter()
+        .filter_map(|(f, _)| {
             let stem = f.strip_suffix(".png")?.strip_prefix("icon_npc_")?;
             let name = stem.rsplit('_').next()?;
             Some((name.to_ascii_lowercase(), format!("icon_npc_{stem}")))

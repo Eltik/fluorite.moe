@@ -18,11 +18,17 @@
 //! When a remote read fails, the local file is used instead, so a bucket that is
 //! unreachable (or not yet synced) degrades to the old behaviour instead of erroring.
 //!
+//! The catalog asks whether an icon or a model exists without asking the bucket: every
+//! re-index (and a timer, `FLUORITE_BUCKET_RELIST_SECS`) lists the remote roots once,
+//! and that listing (a [`BucketView`]) is what the catalog consults until the next one
+//! that differs. Until the first listing lands, the catalog reads the local disk.
+//!
 //! The endpoint tells the service apart (Cloudflare R2, Backblaze B2, a MinIO on the
 //! local disk, ...); the provider supplies the settings that are not given, and a
 //! service that is not known still works as a plain S3 endpoint.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,6 +65,131 @@ pub struct RemoteFile {
     pub size: u64,
 }
 
+/// The files of a root in the bucket, sorted by path: what the last listing found there.
+pub struct Listing {
+    files: Vec<RemoteFile>,
+    /// The key prefix of the root (`fluorite/textures/`).
+    prefix: String,
+    client: Arc<S3Client>,
+    /// The number of files, their total size and a hash of their paths and sizes: two
+    /// listings with the same one hold the same files.
+    fingerprint: (usize, u64, u64),
+    /// The files read through [`Listing::read`], kept as long as the listing is current.
+    reads: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+}
+
+impl Listing {
+    fn new(mut files: Vec<RemoteFile>, prefix: String, client: Arc<S3Client>) -> Self {
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        let mut hasher = DefaultHasher::new();
+        for file in &files {
+            file.path.hash(&mut hasher);
+            file.size.hash(&mut hasher);
+        }
+        let total = files.iter().map(|f| f.size).sum();
+        Self {
+            fingerprint: (files.len(), total, hasher.finish()),
+            files,
+            prefix,
+            client,
+            reads: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Every file of the root, sorted by path.
+    pub fn files(&self) -> &[RemoteFile] {
+        &self.files
+    }
+
+    /// The size of a file, or `None` when the listing does not have it.
+    pub fn size(&self, rel: &str) -> Option<u64> {
+        self.files
+            .binary_search_by(|f| f.path.as_str().cmp(rel))
+            .ok()
+            .map(|i| self.files[i].size)
+    }
+
+    /// The entries directly below a directory (`""` is the root): the name and whether it
+    /// is a directory.
+    pub fn entries(&self, dir: &str) -> Vec<(String, bool)> {
+        let dir = dir.trim_end_matches('/');
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut out = Vec::new();
+        let mut i = self
+            .files
+            .partition_point(|f| f.path.as_str() < prefix.as_str());
+        while let Some(rest) = self.files.get(i).and_then(|f| f.path.strip_prefix(&prefix)) {
+            match rest.split_once('/') {
+                Some((name, _)) => {
+                    // The paths below a directory sort next to each other: skip them all.
+                    let below = format!("{prefix}{name}/");
+                    out.push((name.to_string(), true));
+                    i += self.files[i..].partition_point(|f| {
+                        f.path.as_str() < below.as_str() || f.path.starts_with(&below)
+                    });
+                }
+                None => {
+                    out.push((rest.to_string(), false));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Read a whole file of the root from the bucket; a stalled read is an error.
+    pub async fn fetch(&self, rel: &str) -> ApiResult<Vec<u8>> {
+        let key = format!("{}{rel}", self.prefix);
+        self.client.get_bytes(&key).await.map_err(s3_error)
+    }
+
+    /// The same from a blocking thread (the catalog builders run on one), remembered
+    /// until the next listing replaces this one.
+    pub fn read(&self, rel: &str) -> Option<Arc<Vec<u8>>> {
+        if let Some(bytes) = self.lock_reads().get(rel) {
+            return Some(bytes.clone());
+        }
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let bytes = match handle.block_on(self.fetch(rel)) {
+            Ok(bytes) => Arc::new(bytes),
+            Err(err) => {
+                tracing::warn!("bucket read failed for {}{rel}: {err:?}", self.prefix);
+                return None;
+            }
+        };
+        self.lock_reads().insert(rel.to_string(), bytes.clone());
+        Some(bytes)
+    }
+
+    fn lock_reads(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Vec<u8>>>> {
+        self.reads.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// What the bucket held at the last listing: one [`Listing`] per remote root.
+///
+/// A root whose listing failed keeps the previous one, and a root that was never listed
+/// is not in it (the catalog then looks at the local disk, as without a bucket). The
+/// view is only replaced when a listing differs from the one it holds.
+#[derive(Default)]
+pub struct BucketView {
+    roots: HashMap<Root, Arc<Listing>>,
+    /// Counts the views that differed from the one before, so that a cache built from
+    /// one view can tell it is stale. `0` is the view before the first listing.
+    pub generation: u64,
+}
+
+impl BucketView {
+    /// The listing of a root, when it lives in the bucket and was listed.
+    pub fn listing(&self, root: Root) -> Option<&Arc<Listing>> {
+        self.roots.get(&root)
+    }
+}
+
 /// A cached directory listing and the moment it was read.
 type CachedListing = (Instant, Arc<Vec<DirEntry>>);
 
@@ -93,6 +224,8 @@ impl Remote {
 pub struct Storage {
     output: PathBuf,
     remote: Option<Remote>,
+    /// The listing of the remote roots, replaced when a new listing differs.
+    view: Mutex<Arc<BucketView>>,
 }
 
 impl Storage {
@@ -109,7 +242,11 @@ impl Storage {
             }),
             None => None,
         };
-        Ok(Self { output, remote })
+        Ok(Self {
+            output,
+            remote,
+            view: Mutex::new(Arc::new(BucketView::default())),
+        })
     }
 
     /// The bucket, or the error a bucket operation answers with when there is none.
@@ -124,6 +261,12 @@ impl Storage {
         self.remote
             .as_ref()
             .is_some_and(|r| r.settings.roots.contains(&root))
+    }
+
+    /// What the bucket held at the last listing. Before the first one it is empty, and
+    /// the catalog reads the local disk.
+    pub fn view(&self) -> Arc<BucketView> {
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Whether pre-generated thumbnails are served from the bucket.
@@ -403,9 +546,9 @@ impl Storage {
 
     /// Every file of a root in the bucket, listed in one pass.
     ///
-    /// The listing is not cached: it is the whole tree of a root, and it is read once
-    /// per build of the search index.
-    async fn list_root(&self, root: Root) -> ApiResult<Vec<RemoteFile>> {
+    /// The listing is read once per build of the search index, and kept as the
+    /// [`BucketView`] the catalog consults until the next one.
+    async fn list_root(&self, root: Root) -> ApiResult<Listing> {
         let remote = self.remote()?;
         let prefix = remote.settings.root_prefix(root);
         // Without a delimiter the bucket answers with every object below the prefix.
@@ -428,29 +571,50 @@ impl Storage {
                 })
             })
             .collect();
-        Ok(files)
+        Ok(Listing::new(files, prefix, remote.client.clone()))
     }
 
-    /// The files of every root that is served from the bucket.
+    /// The files of every root that is served from the bucket, which also become the
+    /// new [`BucketView`] when they differ from it.
     ///
     /// A root whose listing fails is left out: the index then knows nothing about it,
     /// while the files themselves are still served (the bucket is asked per request).
-    pub async fn list_remote_roots(&self) -> Vec<(Root, Vec<RemoteFile>)> {
+    /// The view keeps the previous listing of that root. A root whose files did not
+    /// change keeps its previous listing too (and the files read through it), so a
+    /// listing that finds nothing new leaves the view and the caches built on it alone.
+    pub async fn list_remote_roots(&self) -> Vec<(Root, Arc<Listing>)> {
         let Some(remote) = self.remote.as_ref() else {
             return Vec::new();
         };
-        let mut out: Vec<(Root, Vec<RemoteFile>)> = Vec::new();
+        let current = self.view();
+        let mut out: Vec<(Root, Arc<Listing>)> = Vec::new();
+        let mut changed = false;
         for root in &remote.settings.roots {
             match self.list_root(*root).await {
-                Ok(files) => {
-                    tracing::info!(
-                        "search index: {root:?} lists {} files in the bucket",
-                        files.len()
-                    );
-                    out.push((*root, files));
-                }
+                Ok(listing) => match current.listing(*root) {
+                    Some(old) if old.fingerprint == listing.fingerprint => {
+                        out.push((*root, old.clone()));
+                    }
+                    _ => {
+                        tracing::info!(
+                            "search index: {root:?} lists {} files in the bucket",
+                            listing.files().len()
+                        );
+                        changed = true;
+                        out.push((*root, Arc::new(listing)));
+                    }
+                },
                 Err(e) => tracing::warn!("search index: listing {root:?} failed: {e:?}"),
             }
+        }
+        if changed {
+            let mut view = self.view.lock().unwrap_or_else(|p| p.into_inner());
+            let mut roots = view.roots.clone();
+            roots.extend(out.iter().cloned());
+            *view = Arc::new(BucketView {
+                roots,
+                generation: view.generation + 1,
+            });
         }
         out
     }

@@ -161,6 +161,10 @@ enum Commands {
         /// Remove the local copy of a file once it is in the bucket
         #[arg(long)]
         remove_local: bool,
+        /// Update state file whose lock the publish takes, so it never runs beside an
+        /// update or a model build
+        #[arg(long, default_value = "./data/update-state.json")]
+        state: String,
     },
     /// Generate, validate and install the MemoryPack schema for the current client, then
     /// re-decode JsonData; exit 2 if it would decode fewer files, 3 if the client is unreadable
@@ -300,9 +304,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dry_run,
             prune,
             remove_local,
+            state,
         } => {
             cmd_publish(
                 Path::new(&output),
+                Path::new(&state),
                 PublishOptions {
                     dry_run,
                     prune,
@@ -1577,10 +1583,22 @@ fn install_blc_group(
 /// bucket the API serves and the bucket the unpacker fills are the same one. Without
 /// those variables there is nothing to publish into, and the run says so instead of
 /// failing.
+///
+/// The publish takes the lock of the update state: with `S3_KEEP_LOCAL=0` it removes the
+/// local files, which an update or a model build (`scripts/auto-update.sh`) may still be
+/// reading. When either one holds the lock, the publish is refused rather than queued.
 async fn cmd_publish(
     output: &Path,
+    state_path: &Path,
     options: PublishOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(_lock) = lock_state(state_path)? else {
+        return Err(format!(
+            "another update or model build holds {}.lock; publish again once it is done",
+            state_path.display()
+        )
+        .into());
+    };
     if publish_roots(output, options).await?.is_none() {
         println!("no S3 settings: set S3_ENDPOINT and friends to publish");
     }

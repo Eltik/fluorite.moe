@@ -278,11 +278,13 @@ Decrypts Lua scripts that older versions wrote still encrypted and decodes JsonD
 
 `backend/scripts/health-check.sh` rebuilds the binary if needed and runs `endfield health` (arguments pass through, e.g. `--max-age-hours 30`). When the result isn't OK, it posts a macOS notification (when `osascript` is available) and, if `FLUORITE_ALERT_WEBHOOK` is set, POSTs `{"content": ..., "text": ...}` to it, which works for both Discord and Slack incoming webhooks. It exits with the health exit code. Both scripts build with the toolchain pinned in `backend/rust-toolchain.toml`.
 
+With `FLUORITE_MODELS=1` in `backend/.env`, `auto-update.sh` also rebuilds the rigged models after a successful update whose state the models were not yet built for (recorded in `backend/data/models-state`). It builds `endfield-models` with `--features acl` and runs `scan`, `export` for operators, NPCs, enemies and weapons, `clips` and `charinfo` while holding the update lock (`data/update-state.json.lock`, which `endfield update` and `endfield publish` take too; with no `flock` on the system, as on macOS, a lock directory only keeps two builds apart), then `endfield publish`, all logged to `update.log`. A failed build is retried after 1, 2, 4… hours (at most a day) until it succeeds or the update state changes; it is logged but leaves the script's exit code to the update.
+
 ### endfield-models
 
 Exports rigged, skinned GLBs (skeleton, skin weights, materials with embedded textures) for operators, NPCs, enemies and weapons. `endfield extract --meshes` only writes bind-pose geometry per mesh; this tool follows each entity prefab through its renderers, materials and avatar to build one self-contained model. Output goes to `output/models/<kind>/<id>.glb` (`<kind>` is `operator`, `npc`, `enemy` or `weapon`) plus `output/models/index.json`, which the API reads as the `models` root. Entries from earlier runs with a different `--filter` are kept in `index.json`.
 
-**The scan store.** A prefab, its meshes, materials and textures live in different bundles of different ~1 GB chunks, most of it texture pixels. `scan` downloads each chunk once and keeps only what rig export needs: the SerializedFiles (a few MB per chunk), the resource streams of bundles holding meshes, and a per-chunk index. Exports then resolve cross-bundle references from the store without downloading anything. The store defaults to `<output>/.store` (`sf/`, `res/`, `index/`). `export` scans missing chunks on its own unless `--no-auto-scan` is set. Textures come from the existing extraction output (`--data-root`, default `./output`), so run `endfield extract --textures` first.
+**The scan store.** A prefab, its meshes, materials and textures live in different bundles of different ~1 GB chunks, most of it texture pixels. `scan` downloads each chunk once and keeps only what rig export needs: the SerializedFiles (a few MB per chunk), the resource streams of bundles holding meshes, and a per-chunk index. Exports then resolve cross-bundle references from the store without downloading anything. The store defaults to `<output>/.store` (`sf/`, `res/`, `index/`). `export` scans missing chunks on its own unless `--no-auto-scan` is set. Textures come from the existing extraction output (`--data-root`, default `./output`), so run `endfield extract --textures` first. When a bucket holds the `textures` root (see [S3 storage](#s3-storage)), a PNG that is not on disk, such as one the unpacker removed with `S3_KEEP_LOCAL=0`, is read from the bucket into memory; only the `.index` has to be local.
 
 ```bash
 # Download chunks once into the store (default: every bundle chunk not yet scanned)
@@ -380,7 +382,9 @@ public origin. `endfield update` keeps the output current underneath them.
 
 The API polls `<output>/update-log.jsonl` (every `FLUORITE_INDEX_POLL_SECS`) and
 rebuilds its search index when an update run appends to it, so neither server needs a
-restart when new game data lands.
+restart when new game data lands. With a bucket configured it also lists the bucket
+again every `FLUORITE_BUCKET_RELIST_SECS` and rebuilds when the listing changed, so files
+a publish uploaded late still show up in the search and the catalog.
 
 ### Running it
 
@@ -435,6 +439,7 @@ file somewhere else.
 | `FLUORITE_CACHE_DIR` | `<output>/.cache` | Thumbnail and audio cache (must be writable) |
 | `FLUORITE_STATE` | `<output>/../data/update-state.json` | Update state, for the version shown in `/api/status` |
 | `FLUORITE_INDEX_POLL_SECS` | `60` | How often to check `update-log.jsonl` and rebuild the search index |
+| `FLUORITE_BUCKET_RELIST_SECS` | `300` | With a bucket, how often to list it again so late uploads show up in the search and the catalog (`0` disables) |
 | `FLUORITE_AUDIO_REMOTE` | `1` | Read voice packages from the game CDN (`0` disables) |
 | `FLUORITE_AUDIO_DIRS` | unset | Extra directories of `.pck` files (path-list separated) |
 | `FLUORITE_AUDIO_CACHE_MB` | `5120` (5 GB) | Cap of the transcoded clip cache; swept hourly, oldest clips first |

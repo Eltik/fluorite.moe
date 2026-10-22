@@ -1,15 +1,17 @@
 //! Unity Material → glTF material, with the shader's name and saved properties in `extras`
 //! and textures embedded from the extracted PNG tree (or decoded from bundle data).
 use super::export::{Exporter, ObjRef};
+use crate::core::roots::Root;
+use crate::core::s3::{S3Client, S3Settings};
 use crate::extraction::texture::{bgra_to_rgba_flipped, decode_texture, resolve_stream_data};
 use crate::extraction::texture_layout::plan_textures;
 use crate::extraction::unity::value_bytes;
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const CLASS_TEXTURE2D: i32 = 28;
 /// Largest texture side decoded from bundle data.
@@ -153,6 +155,8 @@ pub struct TextureLibrary {
     pub root: PathBuf,
     /// Texture name (lowercase) → (relative path, format).
     pub by_name: HashMap<String, (PathBuf, String)>,
+    /// The bucket a PNG is read from when it is not on disk.
+    pub bucket: Option<TextureBucket>,
 }
 
 impl TextureLibrary {
@@ -162,6 +166,7 @@ impl TextureLibrary {
         let mut lib = Self {
             root: root.to_path_buf(),
             by_name: HashMap::new(),
+            bucket: None,
         };
         let Ok(entries) = std::fs::read_dir(root.join(".index")) else {
             return lib;
@@ -187,6 +192,110 @@ impl TextureLibrary {
             }
         }
         lib
+    }
+
+    /// The bytes of the PNG at `rel`: from the disk, else from the bucket.
+    #[must_use]
+    pub fn read(&self, rel: &Path) -> Option<Vec<u8>> {
+        match std::fs::read(self.root.join(rel)) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => self.bucket.as_ref()?.fetch(rel),
+        }
+    }
+}
+
+/// The bucket the textures were published to, read when a PNG is not on disk.
+///
+/// With `S3_KEEP_LOCAL=0` the unpacker removes each texture once it is uploaded, and only
+/// the `.index` stays local. A fetched PNG is kept in memory only: written back under the
+/// textures root, it would be uploaded and removed again by the next publish.
+///
+/// The texture code is synchronous and runs inside the runtime of the binary, which must
+/// not block on a future itself; the bucket has a runtime of its own, and a read waits
+/// for the request it spawned there.
+pub struct TextureBucket {
+    settings: S3Settings,
+    client: Arc<S3Client>,
+    /// Always set; taken out on drop to shut it down without blocking.
+    runtime: Option<tokio::runtime::Runtime>,
+    /// The paths that could not be read, so each one is asked for (and reported) once.
+    missed: Mutex<HashSet<PathBuf>>,
+}
+
+impl TextureBucket {
+    /// The bucket of `settings`, when the textures root lives in it.
+    pub fn new(settings: S3Settings) -> Result<Option<Self>, String> {
+        if !settings.roots.contains(&Root::Textures) {
+            return Ok(None);
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| format!("texture bucket runtime: {e}"))?;
+        Ok(Some(Self {
+            client: Arc::new(settings.client()?),
+            settings,
+            runtime: Some(runtime),
+            missed: Mutex::new(HashSet::new()),
+        }))
+    }
+
+    /// The bucket and where it is, for the logs.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.settings.describe()
+    }
+
+    /// The bytes of the PNG at `rel` (relative to the textures root), or `None` when the
+    /// bucket does not have it or could not be reached. A failure other than a missing
+    /// object is reported once per path.
+    #[must_use]
+    pub fn fetch(&self, rel: &Path) -> Option<Vec<u8>> {
+        let runtime = self.runtime.as_ref()?;
+        if self.missed.lock().ok()?.contains(rel) {
+            return None;
+        }
+        let key = self
+            .settings
+            .key_for(Root::Textures, &rel.to_string_lossy().replace('\\', "/"));
+        let client = self.client.clone();
+        let task = runtime.spawn(async move { client.get_bytes(&key).await });
+        let error = match futures::executor::block_on(task) {
+            Ok(Ok(bytes)) => return Some(bytes),
+            Ok(Err(error)) if error.status == 404 => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(error) = error {
+            eprintln!(
+                "texture {}: not read from the bucket: {error}",
+                rel.display()
+            );
+        }
+        if let Ok(mut missed) = self.missed.lock() {
+            missed.insert(rel.to_path_buf());
+        }
+        None
+    }
+}
+
+impl Drop for TextureBucket {
+    /// The runtime is dropped inside the runtime of the binary, where waiting for its
+    /// workers is not allowed.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl std::fmt::Debug for TextureBucket {
+    /// The settings print their own summary, without the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextureBucket")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
     }
 }
 
@@ -680,7 +789,7 @@ fn load_texture(exp: &mut Exporter, tref: ObjRef, role: TextureRole) -> Option<u
     let mut image: Option<(DynamicImage, String)> = None;
     if let Some(lib) = &opts.library
         && let Some(rel) = planned_path(exp, tref)
-        && let Ok(bytes) = std::fs::read(lib.root.join(&rel))
+        && let Some(bytes) = lib.read(&rel)
         && let Ok(img) = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
     {
         let format = lib
@@ -696,7 +805,7 @@ fn load_texture(exp: &mut Exporter, tref: ObjRef, role: TextureRole) -> Option<u
     if image.is_none()
         && let Some(lib) = &opts.library
         && let Some((rel, format)) = lib.by_name.get(&name.to_ascii_lowercase())
-        && let Ok(bytes) = std::fs::read(lib.root.join(rel))
+        && let Some(bytes) = lib.read(rel)
         && let Ok(img) = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
     {
         image = Some((img, format.clone()));
@@ -715,7 +824,7 @@ pub fn library_texture(exp: &mut Exporter, name: &str, role: TextureRole) -> Opt
     let opts = exp.material_options().clone();
     let lib = opts.library.as_ref()?;
     let (rel, format) = lib.by_name.get(&name.to_ascii_lowercase())?;
-    let bytes = std::fs::read(lib.root.join(rel)).ok()?;
+    let bytes = lib.read(rel)?;
     let img = image::load_from_memory_with_format(&bytes, ImageFormat::Png).ok()?;
     embed(exp, img, &format.clone(), name, role, &opts)
 }

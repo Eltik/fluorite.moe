@@ -17,6 +17,7 @@ use super::paths::Root;
 /// | `FLUORITE_CACHE_DIR` | `<output>/.cache` |
 /// | `FLUORITE_STATE` | `<output>/../data/update-state.json` |
 /// | `FLUORITE_INDEX_POLL_SECS` | `60` |
+/// | `FLUORITE_BUCKET_RELIST_SECS` | `300` (list the bucket again; `0` disables) |
 /// | `FLUORITE_AUDIO_REMOTE` | `1` (read voice packages from the game CDN; `0` disables) |
 /// | `FLUORITE_AUDIO_DIRS` | extra directories of `.pck` files (path-list separated) |
 /// | `FLUORITE_AUDIO_CACHE_MB` | `5120` (transcoded clips beyond this are swept, oldest first) |
@@ -33,6 +34,8 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub state_file: PathBuf,
     pub index_poll: Duration,
+    /// How often the bucket is listed again, when one is configured; `None` disables it.
+    pub bucket_relist: Option<Duration>,
     pub audio_remote: bool,
     pub audio_dirs: Vec<PathBuf>,
     /// Size cap of the transcoded clip cache, in bytes.
@@ -153,6 +156,7 @@ impl Config {
             cache_dir: output.join(".cache"),
             state_file: output.join("..").join("data").join("update-state.json"),
             index_poll: Duration::from_secs(60),
+            bucket_relist: Some(Duration::from_secs(300)),
             audio_remote: true,
             audio_dirs: Vec::new(),
             audio_cache_max: 5 << 30,
@@ -192,6 +196,12 @@ impl Config {
                 .parse()
                 .map_err(|e| format!("FLUORITE_INDEX_POLL_SECS={v:?}: {e}"))?;
             config.index_poll = Duration::from_secs(secs.max(1));
+        }
+        if let Some(v) = var("FLUORITE_BUCKET_RELIST_SECS") {
+            let secs: u64 = v
+                .parse()
+                .map_err(|e| format!("FLUORITE_BUCKET_RELIST_SECS={v:?}: {e}"))?;
+            config.bucket_relist = (secs > 0).then(|| Duration::from_secs(secs));
         }
         if let Some(v) = var("FLUORITE_AUDIO_REMOTE") {
             config.audio_remote = !matches!(v.trim(), "0" | "false" | "off" | "no");

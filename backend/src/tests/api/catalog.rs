@@ -1010,3 +1010,252 @@ fn lights_file_needs_an_exported_file() {
     assert_eq!(lights_file(&out, None), None);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// The catalog fixture with the textures, meshes and models roots moved into a mock
+/// bucket (only the hidden index files stay on the disk, like with `S3_KEEP_LOCAL=0`),
+/// and an app whose bucket view was listed once.
+async fn bucket_catalog() -> (
+    Fixture,
+    crate::tests::core::s3::Store,
+    crate::tests::core::s3::Log,
+    crate::api::SharedState,
+    axum::Router,
+) {
+    let (endpoint, store, log) = crate::tests::core::s3::mock_endpoint().await;
+    let fx = catalog_fixture();
+    let out = fx.output();
+    for root in ["textures", "meshes", "models"] {
+        let dir = out.join(root);
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let path = e.path();
+                let rel = path
+                    .strip_prefix(&out)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(path);
+                } else if !rel.split('/').any(|p| p.starts_with('.')) {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    store
+                        .lock()
+                        .unwrap()
+                        .insert(format!("fluorite/{rel}"), bytes);
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".index")).unwrap();
+        std::fs::write(dir.join(".index/files.jsonl"), b"{}").unwrap();
+    }
+
+    let settings = crate::core::s3::S3Settings::from_env(crate::tests::core::s3::env(&[
+        ("S3_ENDPOINT", endpoint.as_str()),
+        ("S3_BUCKET", "assets"),
+        ("S3_ACCESS_KEY_ID", "AKID"),
+        ("S3_SECRET_ACCESS_KEY", "secret"),
+        ("S3_PREFIX", "fluorite"),
+        ("S3_ROOTS", "textures,meshes,models"),
+    ]))
+    .unwrap()
+    .unwrap();
+    let mut config = fx.config();
+    config.s3 = Some(crate::api::config::S3Config {
+        settings,
+        mode: crate::api::config::S3Mode::Proxy,
+        thumbs: false,
+    });
+    let state = crate::api::AppState::new(config);
+    let remote = state.storage.list_remote_roots().await;
+    state
+        .index
+        .set(crate::api::search::SearchIndex::build_with_remote(
+            &out, &remote,
+        ));
+    let app = crate::api::router(state.clone());
+    (fx, store, log, state, app)
+}
+
+/// Icons, mesh parts and rigged models of a root that only lives in the bucket come from
+/// its listing, without asking the bucket per asset.
+#[tokio::test]
+async fn catalog_assets_resolve_from_the_bucket() {
+    let (fx, _store, log, _state, app) = bucket_catalog().await;
+    assert!(!fx.output().join(format!("{UI}/charicon")).exists());
+
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    let chen = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "chr_0005_chen")
+        .unwrap();
+    assert_eq!(
+        chen["icon"],
+        "beyond/dynamicassets/gameplay/ui/sprites/charicon/icon_chr_0005_chen.png"
+    );
+    assert_eq!(chen["hasModel"], true);
+
+    let v = body_json(get(&app, "/api/catalog/operators/chr_0005_chen").await).await;
+    assert_eq!(
+        v["art"]["icon"],
+        "beyond/dynamicassets/gameplay/ui/sprites/charicon/icon_chr_0005_chen.png"
+    );
+    assert_eq!(
+        v["skills"][0]["icon"],
+        "beyond/dynamicassets/gameplay/ui/sprites/skillicon/icon_skill_chen_01.png"
+    );
+    assert_eq!(v["model"]["dir"], "beyond/arts/entity/actor/girl/chen");
+    assert_eq!(
+        v["model"]["parts"],
+        json!([
+            {"name": "body_01", "path": "beyond/arts/entity/actor/girl/chen/models/S_actor_chen_body_01_lod0.glb", "lod": 0},
+            {"name": "cloth_01", "path": "beyond/arts/entity/actor/girl/chen/models/S_actor_chen_cloth_01_lod1.glb", "lod": 1}
+        ])
+    );
+    // `models/index.json` and the lights file are read from the bucket.
+    assert_eq!(v["model"]["rigged"], "operators/chr_0005_chen.glb");
+    assert_eq!(
+        v["model"]["clips"],
+        "clips/operators/chr_0005_chen/index.json"
+    );
+    assert_eq!(v["model"]["lights"], "lights/chr_0005_chen.json");
+    assert_eq!(
+        v["model"]["camera"],
+        json!({"position": [0.0, 0.998, 3.5], "target": [0.0, 1.225, 0.0], "fov": 20.0})
+    );
+    assert_eq!(
+        v["model"]["menu"],
+        "clips/operators/chr_0005_chen/menu.json"
+    );
+    assert_eq!(v["model"]["weapon"], "charinfo/weapons/chr_0005_chen.json");
+    assert_eq!(v["model"]["deco"], "charinfo/deco/chr_0005_chen/index.json");
+
+    let v = body_json(get(&app, "/api/catalog/enemies/eny_0007_mimicw").await).await;
+    assert_eq!(v["model"]["dir"], "beyond/arts/entity/monster/elite/mimicw");
+
+    // Existence is never asked of the bucket one asset at a time.
+    let log = log.lock().unwrap();
+    assert!(
+        log.iter().all(|(method, _)| method != "HEAD"),
+        "{:?}",
+        log.iter().map(|(m, _)| m).collect::<Vec<_>>()
+    );
+}
+
+/// A re-index lists the bucket again, and the catalog sees what was published since.
+#[tokio::test]
+async fn catalog_follows_a_new_listing_of_the_bucket() {
+    let (_fx, store, _log, state, app) = bucket_catalog().await;
+    let pelica = |v: &Value| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "chr_0004_pelica")
+            .unwrap()["hasModel"]
+            .clone()
+    };
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), false);
+
+    {
+        let mut store = store.lock().unwrap();
+        store.insert(
+            "fluorite/models/operators/chr_0004_pelica.glb".to_string(),
+            b"glTF".to_vec(),
+        );
+        store.insert(
+            "fluorite/models/index.json".to_string(),
+            br#"{"models":[{"path":"models/operators/chr_0004_pelica.glb"}]}"#.to_vec(),
+        );
+    }
+    // Still the old listing until the next re-index.
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), false);
+
+    state.storage.list_remote_roots().await;
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), true);
+}
+
+/// Listing the bucket again keeps the view (and every cache built on it) when nothing
+/// changed, and replaces it when a file was added.
+#[tokio::test]
+async fn bucket_view_changes_only_with_the_listing() {
+    let (_fx, store, _log, state, _app) = bucket_catalog().await;
+    let before = state.storage.view();
+    assert_eq!(before.generation, 1);
+
+    state.storage.list_remote_roots().await;
+    let same = state.storage.view();
+    assert!(std::sync::Arc::ptr_eq(&before, &same), "nothing changed");
+
+    store.lock().unwrap().insert(
+        "fluorite/models/operators/chr_0004_pelica.glb".to_string(),
+        b"glTF".to_vec(),
+    );
+    state.storage.list_remote_roots().await;
+    let after = state.storage.view();
+    assert_eq!(after.generation, 2);
+    assert_eq!(
+        after
+            .listing(crate::api::paths::Root::Models)
+            .unwrap()
+            .size("operators/chr_0004_pelica.glb"),
+        Some(4)
+    );
+    // The roots that did not change keep their listing.
+    assert!(std::sync::Arc::ptr_eq(
+        before.listing(crate::api::paths::Root::Textures).unwrap(),
+        after.listing(crate::api::paths::Root::Textures).unwrap()
+    ));
+}
+
+/// A rigged-model index built while the bucket would not give `index.json` is not kept:
+/// after the back-off the index is read again.
+#[tokio::test]
+async fn a_failed_index_read_is_not_cached() {
+    let (_fx, store, _log, state, app) = bucket_catalog().await;
+    let index = "fluorite/models/index.json".to_string();
+    // Only the index knows the variant prefab `chr_0004_pelica1`.
+    let bytes = br#"{"models":[{"path":"models/operators/chr_0004_pelica1.glb"}]}"#.to_vec();
+    {
+        let mut store = store.lock().unwrap();
+        store.insert(
+            "fluorite/models/operators/chr_0004_pelica1.glb".to_string(),
+            b"glTF".to_vec(),
+        );
+        store.insert(index.clone(), bytes.clone());
+    }
+    state.storage.list_remote_roots().await;
+    // The listing has `index.json`, but reading it fails.
+    store.lock().unwrap().remove(&index);
+
+    let pelica = |v: &Value| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "chr_0004_pelica")
+            .unwrap()["hasModel"]
+            .clone()
+    };
+    state
+        .catalog
+        .set_rig_retry(std::time::Duration::from_secs(3600));
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), false);
+
+    // Within the back-off the bucket is not asked again.
+    store.lock().unwrap().insert(index.clone(), bytes);
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), false);
+
+    // After it, the index is read again and kept.
+    state.catalog.set_rig_retry(std::time::Duration::ZERO);
+    let v = body_json(get(&app, "/api/catalog/operators").await).await;
+    assert_eq!(pelica(&v), true);
+}

@@ -1,14 +1,164 @@
 //! File-system lookups for catalog entries: UI textures by naming convention, static mesh
 //! folders (operators, NPCs, monsters, weapons), and rigged GLBs from `models/index.json`.
 //! Everything here is blocking I/O; call it from `spawn_blocking`.
+//!
+//! The lookups go through [`Files`], so a root that lives in the bucket is answered from
+//! its last listing (and the local disk), and every other root from the local disk.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::Serialize;
 
 use crate::api::paths::{Root, is_hidden};
+use crate::api::storage::{BucketView, Listing};
+
+/// The files of one root, as the catalog sees them. The paths are relative to the root,
+/// with `/` between the directories.
+pub trait Files {
+    /// The size of a file, or `None` when there is no such file.
+    fn file_size(&self, rel: &str) -> Option<u64>;
+
+    /// Whether a file exists.
+    fn has_file(&self, rel: &str) -> bool {
+        self.file_size(rel).is_some()
+    }
+
+    /// The visible entries of a directory: the name and whether it is a directory.
+    fn entries(&self, rel: &str) -> Vec<(String, bool)>;
+
+    /// The contents of a file.
+    fn read_file(&self, rel: &str) -> Option<Vec<u8>>;
+}
+
+/// A root on the local disk.
+impl Files for Path {
+    fn file_size(&self, rel: &str) -> Option<u64> {
+        let meta = std::fs::metadata(self.join(rel)).ok()?;
+        meta.is_file().then_some(meta.len())
+    }
+
+    fn entries(&self, rel: &str) -> Vec<(String, bool)> {
+        let Ok(rd) = std::fs::read_dir(self.join(rel)) else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let ft = e.file_type().ok()?;
+                (!is_hidden(&name)).then(|| (name, ft.is_dir()))
+            })
+            .collect()
+    }
+
+    fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.join(rel)).ok()
+    }
+}
+
+impl Files for PathBuf {
+    fn file_size(&self, rel: &str) -> Option<u64> {
+        self.as_path().file_size(rel)
+    }
+
+    fn entries(&self, rel: &str) -> Vec<(String, bool)> {
+        self.as_path().entries(rel)
+    }
+
+    fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        self.as_path().read_file(rel)
+    }
+}
+
+/// The files of one root: the local directory, or the last listing of the bucket for a
+/// root that lives there.
+#[derive(Clone)]
+pub enum RootFiles {
+    Disk(PathBuf),
+    /// The listing first, then the local directory: a file that is not published yet is
+    /// still served from the disk.
+    Bucket {
+        listing: Arc<Listing>,
+        disk: PathBuf,
+    },
+}
+
+impl Files for RootFiles {
+    fn file_size(&self, rel: &str) -> Option<u64> {
+        match self {
+            Self::Disk(dir) => dir.file_size(rel),
+            Self::Bucket { listing, disk } => listing.size(rel).or_else(|| disk.file_size(rel)),
+        }
+    }
+
+    fn entries(&self, rel: &str) -> Vec<(String, bool)> {
+        match self {
+            Self::Disk(dir) => dir.entries(rel),
+            Self::Bucket { listing, disk } => {
+                let mut all: BTreeMap<String, bool> = listing.entries(rel).into_iter().collect();
+                for (name, is_dir) in disk.entries(rel) {
+                    *all.entry(name).or_default() |= is_dir;
+                }
+                all.into_iter().collect()
+            }
+        }
+    }
+
+    /// From the bucket, the listing has the file: it is read from a blocking thread (the
+    /// catalog builders run on one) and remembered until the next listing.
+    fn read_file(&self, rel: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::Disk(dir) => dir.read_file(rel),
+            // A failed read of the bucket falls back to the local copy, if any.
+            Self::Bucket { listing, disk } => listing
+                .size(rel)
+                .and_then(|_| listing.read(rel))
+                .map(|bytes| bytes.to_vec())
+                .or_else(|| disk.read_file(rel)),
+        }
+    }
+}
+
+/// Where the files of each root of an output tree are.
+pub trait Roots {
+    fn root_files(&self, root: Root) -> RootFiles;
+}
+
+/// An output directory with every root on the local disk.
+impl Roots for Path {
+    fn root_files(&self, root: Root) -> RootFiles {
+        RootFiles::Disk(root.dir(self))
+    }
+}
+
+impl Roots for PathBuf {
+    fn root_files(&self, root: Root) -> RootFiles {
+        self.as_path().root_files(root)
+    }
+}
+
+/// The output directory plus the last listing of the bucket: the roots that live in the
+/// bucket are looked up in it, the others on the local disk.
+#[derive(Clone)]
+pub struct OutputFiles {
+    pub dir: PathBuf,
+    pub view: Arc<BucketView>,
+}
+
+impl Roots for OutputFiles {
+    fn root_files(&self, root: Root) -> RootFiles {
+        let disk = root.dir(&self.dir);
+        match self.view.listing(root) {
+            Some(listing) => RootFiles::Bucket {
+                listing: listing.clone(),
+                disk,
+            },
+            None => RootFiles::Disk(disk),
+        }
+    }
+}
 
 /// UI sprite folder, relative to the textures root.
 pub const UI: &str = "beyond/dynamicassets/gameplay/ui/sprites";
@@ -18,30 +168,26 @@ const PREFAB_WEAPONS: &str = "beyond/dynamicassets/gameplay/prefabs/weapons";
 const ENEMY_POSTMODELS: &str = "beyond/dynamicassets/gameplay/actors/postmodels/enemies";
 
 /// Texture-root-relative path of `UI/<dir>/<name>.png` when the file exists.
-pub fn ui_png(textures: &Path, dir: &str, name: &str) -> Option<String> {
+pub fn ui_png(textures: &(impl Files + ?Sized), dir: &str, name: &str) -> Option<String> {
     if name.is_empty() || name.contains("..") {
         return None;
     }
     let rel = format!("{UI}/{dir}/{name}.png");
-    textures.join(&rel).is_file().then_some(rel)
+    textures.has_file(&rel).then_some(rel)
 }
 
 /// Sprite reference like `TermIcon/icon_term_ba_noguard` → existing PNG under `UI/` (the
 /// folder name is lowercased the way the extractor writes it).
-pub fn ui_sprite_ref(textures: &Path, reference: &str) -> Option<String> {
+pub fn ui_sprite_ref(textures: &(impl Files + ?Sized), reference: &str) -> Option<String> {
     let (dir, name) = reference.rsplit_once('/')?;
     ui_png(textures, &dir.to_ascii_lowercase(), name)
 }
 
-fn list_dirs(dir: &Path) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = rd
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| !is_hidden(n))
+fn list_dirs(files: &(impl Files + ?Sized), dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = files
+        .entries(dir)
+        .into_iter()
+        .filter_map(|(name, is_dir)| is_dir.then_some(name))
         .collect();
     names.sort();
     names
@@ -63,13 +209,12 @@ pub struct MeshIndex {
 }
 
 impl MeshIndex {
-    pub fn build(meshes: &Path) -> Self {
+    pub fn build(meshes: &(impl Files + ?Sized)) -> Self {
         let mut ix = Self::default();
-        let entity = meshes.join(ENTITY);
         // Playable actors first so `actor/<type>/<code>` wins over NPC alternates.
         for base in ["actor", "npc/major"] {
-            for body in list_dirs(&entity.join(base)) {
-                for code in list_dirs(&entity.join(base).join(&body)) {
+            for body in list_dirs(meshes, &format!("{ENTITY}/{base}")) {
+                for code in list_dirs(meshes, &format!("{ENTITY}/{base}/{body}")) {
                     ix.actors
                         .entry(code.clone())
                         .or_insert_with(|| format!("{ENTITY}/{base}/{body}/{code}"));
@@ -77,35 +222,35 @@ impl MeshIndex {
             }
         }
         for tier in ["boss", "elite", "enemy"] {
-            for code in list_dirs(&entity.join("monster").join(tier)) {
+            for code in list_dirs(meshes, &format!("{ENTITY}/monster/{tier}")) {
                 ix.monsters
                     .entry(code.clone())
                     .or_insert_with(|| format!("{ENTITY}/monster/{tier}/{code}"));
             }
         }
-        for name in list_dirs(&meshes.join(ENEMY_POSTMODELS)) {
+        for name in list_dirs(meshes, ENEMY_POSTMODELS) {
             if let Some(id) = name.strip_suffix("_postmodel") {
                 ix.enemy_postmodels
                     .insert(id.to_string(), format!("{ENEMY_POSTMODELS}/{name}"));
             }
         }
-        for ty in list_dirs(&entity.join("wpn")) {
-            for id in list_dirs(&entity.join("wpn").join(&ty)) {
+        for ty in list_dirs(meshes, &format!("{ENTITY}/wpn")) {
+            for id in list_dirs(meshes, &format!("{ENTITY}/wpn/{ty}")) {
                 ix.weapons
                     .entry(id.clone())
                     .or_default()
                     .push(format!("{ENTITY}/wpn/{ty}/{id}"));
             }
         }
-        for id in list_dirs(&meshes.join(PREFAB_WEAPONS)) {
+        for id in list_dirs(meshes, PREFAB_WEAPONS) {
             ix.weapons
                 .entry(id.clone())
                 .or_default()
                 .push(format!("{PREFAB_WEAPONS}/{id}"));
         }
-        let crowd = entity.join("npc/pedestrain");
-        for body in list_dirs(&crowd) {
-            for name in list_dirs(&crowd.join(&body).join("body")) {
+        let crowd = format!("{ENTITY}/npc/pedestrain");
+        for body in list_dirs(meshes, &crowd) {
+            for name in list_dirs(meshes, &format!("{crowd}/{body}/body")) {
                 ix.crowd.insert(
                     name.clone(),
                     format!("{ENTITY}/npc/pedestrain/{body}/body/{name}"),
@@ -213,23 +358,13 @@ pub fn split_lod(file: &str) -> Option<(&str, u32)> {
 
 /// Every part under `rel_dir` (recursive, `animations/` skipped) at its best LOD, with
 /// display names stripped of the `S_` / kind / `code` prefix.
-pub fn model_parts(meshes: &Path, rel_dir: &str, code: &str) -> Vec<ModelPart> {
-    fn walk(abs: &Path, rel: &str, depth: u32, out: &mut Vec<(String, String)>) {
-        let Ok(rd) = std::fs::read_dir(abs) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let Ok(name) = e.file_name().into_string() else {
-                continue;
-            };
-            if is_hidden(&name) {
-                continue;
-            }
-            let Ok(ft) = e.file_type() else { continue };
+pub fn model_parts(meshes: &(impl Files + ?Sized), rel_dir: &str, code: &str) -> Vec<ModelPart> {
+    fn walk<F: Files + ?Sized>(meshes: &F, rel: &str, depth: u32, out: &mut Vec<(String, String)>) {
+        for (name, is_dir) in meshes.entries(rel) {
             let child = format!("{rel}/{name}");
-            if ft.is_dir() {
+            if is_dir {
                 if depth < 3 && name != "animations" {
-                    walk(&e.path(), &child, depth + 1, out);
+                    walk(meshes, &child, depth + 1, out);
                 }
             } else if name.ends_with(".glb") {
                 out.push((name, child));
@@ -237,7 +372,7 @@ pub fn model_parts(meshes: &Path, rel_dir: &str, code: &str) -> Vec<ModelPart> {
         }
     }
     let mut files = Vec::new();
-    walk(&meshes.join(rel_dir), rel_dir, 0, &mut files);
+    walk(meshes, rel_dir, 0, &mut files);
     let mut best: HashMap<String, (u32, String)> = HashMap::new();
     for (file, path) in files {
         let Some((part, lod)) = split_lod(&file) else {
@@ -285,19 +420,32 @@ impl RigIndex {
     /// to `/models/` is stripped) and kept only if the file exists.
     pub fn load(output: &Path) -> Self {
         let root = Root::Models.dir(output);
-        let index = root.join("index.json");
-        let Ok(meta) = std::fs::metadata(&index) else {
+        let Ok(meta) = std::fs::metadata(root.join("index.json")) else {
             return Self::default();
         };
+        Self::load_from(&root, meta.modified().ok())
+    }
+
+    /// The same from the files of the models root (the bucket's, when it lives there),
+    /// stamped with `stamp`. An index that cannot be read or parsed gives an empty one.
+    pub fn load_from(models: &(impl Files + ?Sized), stamp: Option<SystemTime>) -> Self {
+        Self::try_load_from(models, stamp).unwrap_or(Self {
+            by_stem: HashMap::new(),
+            stamp,
+        })
+    }
+
+    /// The same, or `None` when `index.json` cannot be read or parsed, so that the caller
+    /// can try again instead of keeping an empty index.
+    pub fn try_load_from(
+        models: &(impl Files + ?Sized),
+        stamp: Option<SystemTime>,
+    ) -> Option<Self> {
+        let bytes = models.read_file("index.json")?;
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
         let mut ix = Self {
             by_stem: HashMap::new(),
-            stamp: meta.modified().ok(),
-        };
-        let Ok(bytes) = std::fs::read(&index) else {
-            return ix;
-        };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            return ix;
+            stamp,
         };
         let mut strings = Vec::new();
         collect_glb_strings(&value, &mut strings);
@@ -310,28 +458,28 @@ impl RigIndex {
             if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
                 continue;
             }
-            if !root.join(&rel).is_file() {
+            if !models.has_file(&rel) {
                 continue;
             }
             if let Some(stem) = Path::new(&rel).file_stem().and_then(|s| s.to_str()) {
                 ix.by_stem.entry(stem.to_string()).or_insert(rel);
             }
         }
-        ix
+        Some(ix)
     }
 
     /// Rigged GLB for `id` (models-root relative): from the index, else
     /// `<kind>/<id>.glb` when the index exists.
-    pub fn find(&self, output: &Path, kind: &str, id: &str) -> Option<String> {
+    pub fn find(&self, output: &(impl Roots + ?Sized), kind: &str, id: &str) -> Option<String> {
         self.stamp?;
         let dirs = kind_dirs(kind);
         let in_dirs = |path: &str| dirs.iter().any(|d| path.split('/').next() == Some(d));
         // The kind's own folder first: operators and their NPC variants share stems
         // (`operator/chr_0005_chen.glb`, `npc/chr_0005_chen.glb`).
-        let root = Root::Models.dir(output);
+        let root = output.root_files(Root::Models);
         dirs.iter()
             .map(|k| format!("{k}/{id}.glb"))
-            .find(|rel| root.join(rel).is_file())
+            .find(|rel| root.has_file(rel))
             .or_else(|| self.by_stem.get(id).filter(|p| in_dirs(p)).cloned())
             .or_else(|| self.find_variant(id, &in_dirs))
     }
@@ -339,7 +487,12 @@ impl RigIndex {
     /// Rigged GLB for an NPC: by catalog id, else through its `dataKey`. `npc_chr_<chrId>`
     /// is an operator's NPC-mode prefab (`npc/<chrId>.glb`, else the operator's own GLB),
     /// `npc_eny_<enemyId>` an enemy, `npc_spl_<code>_NN` a named NPC (`npc/spl_<code>.glb`).
-    pub fn find_npc(&self, output: &Path, id: &str, data_key: &str) -> Option<String> {
+    pub fn find_npc(
+        &self,
+        output: &(impl Roots + ?Sized),
+        id: &str,
+        data_key: &str,
+    ) -> Option<String> {
         self.find(output, "npcs", id).or_else(|| {
             if let Some(chr) = data_key.strip_prefix("npc_chr_") {
                 let chr = format!("chr_{chr}");
@@ -447,21 +600,20 @@ pub struct ModelInfo {
 
 /// Clip index (models-root relative) of a rigged GLB, when `endfield-models clips` wrote a
 /// non-empty one: `operator/chr_0005_chen.glb` → `clips/operator/chr_0005_chen/index.json`.
-pub fn clips_index(output: &Path, rigged: Option<&str>) -> Option<String> {
+pub fn clips_index(output: &(impl Roots + ?Sized), rigged: Option<&str>) -> Option<String> {
     let stem = rigged?.strip_suffix(".glb")?;
     let rel = format!("clips/{stem}/index.json");
-    let meta = std::fs::metadata(Root::Models.dir(output).join(&rel)).ok()?;
+    let len = output.root_files(Root::Models).file_size(&rel)?;
     // An entity without clips gets `[]` (2 bytes).
-    (meta.is_file() && meta.len() > 2).then_some(rel)
+    (len > 2).then_some(rel)
 }
 
 /// Light data (models-root relative) of a rigged GLB, when the exporter wrote one:
 /// `operator/chr_0004_pelica.glb` → `lights/chr_0004_pelica.json`.
-pub fn lights_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+pub fn lights_file(output: &(impl Roots + ?Sized), rigged: Option<&str>) -> Option<String> {
     let stem = rigged?.strip_suffix(".glb")?;
     let id = stem.rsplit('/').next()?;
-    let rel = format!("lights/{id}.json");
-    Root::Models.dir(output).join(&rel).is_file().then_some(rel)
+    models_file(output, format!("lights/{id}.json"))
 }
 
 /// Id of a rigged GLB path: `operator/chr_0004_pelica.glb` → `chr_0004_pelica`.
@@ -470,19 +622,22 @@ fn rigged_id(rigged: Option<&str>) -> Option<&str> {
 }
 
 /// A models-root relative file, when it exists.
-fn models_file(output: &Path, rel: String) -> Option<String> {
-    Root::Models.dir(output).join(&rel).is_file().then_some(rel)
+fn models_file(output: &(impl Roots + ?Sized), rel: String) -> Option<String> {
+    output
+        .root_files(Root::Models)
+        .has_file(&rel)
+        .then_some(rel)
 }
 
 /// Character-screen state machine of a rigged GLB, when `endfield-models charinfo` wrote one:
 /// `operator/chr_0004_pelica.glb` → `clips/operator/chr_0004_pelica/menu.json`.
-pub fn menu_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+pub fn menu_file(output: &(impl Roots + ?Sized), rigged: Option<&str>) -> Option<String> {
     let stem = rigged?.strip_suffix(".glb")?;
     models_file(output, format!("clips/{stem}/menu.json"))
 }
 
 /// Default weapon mounting of a rigged GLB: `charinfo/weapons/<id>.json`.
-pub fn weapon_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+pub fn weapon_file(output: &(impl Roots + ?Sized), rigged: Option<&str>) -> Option<String> {
     models_file(
         output,
         format!("charinfo/weapons/{}.json", rigged_id(rigged)?),
@@ -490,7 +645,7 @@ pub fn weapon_file(output: &Path, rigged: Option<&str>) -> Option<String> {
 }
 
 /// Deco props of a rigged GLB: `charinfo/deco/<id>/index.json`.
-pub fn deco_file(output: &Path, rigged: Option<&str>) -> Option<String> {
+pub fn deco_file(output: &(impl Roots + ?Sized), rigged: Option<&str>) -> Option<String> {
     models_file(
         output,
         format!("charinfo/deco/{}/index.json", rigged_id(rigged)?),
@@ -498,20 +653,23 @@ pub fn deco_file(output: &Path, rigged: Option<&str>) -> Option<String> {
 }
 
 /// The `camera` block of a lights file (models-root relative), when set.
-pub fn camera_of(output: &Path, lights: Option<&str>) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(Root::Models.dir(output).join(lights?)).ok()?;
+pub fn camera_of(
+    output: &(impl Roots + ?Sized),
+    lights: Option<&str>,
+) -> Option<serde_json::Value> {
+    let bytes = output.root_files(Root::Models).read_file(lights?)?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     v.get("camera").filter(|c| c.is_object()).cloned()
 }
 
 pub fn model_info(
-    output: &Path,
+    output: &(impl Roots + ?Sized),
     rig: &RigIndex,
     kind: &str,
     id: &str,
     folder: Option<(&str, String)>,
 ) -> ModelInfo {
-    let meshes: PathBuf = Root::Meshes.dir(output);
+    let meshes = output.root_files(Root::Meshes);
     let (dir, parts) = match folder {
         Some((dir, code)) => (Some(dir.to_string()), model_parts(&meshes, dir, &code)),
         None => (None, Vec::new()),

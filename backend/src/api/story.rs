@@ -14,11 +14,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::SharedState;
+use super::catalog::assets::Roots;
 use super::catalog::tables::{
     ActorImageTable, DialogOptionTable, DialogSummaryTable, DialogTextTable, TextTable,
 };
 use super::catalog::text::{Gender, Rich, Texts, has_gender_variants};
-use super::catalog::{LangQuery, Memo, assets, blocking, dep, tables_dir, text_maps, texts};
+use super::catalog::{
+    LangQuery, Memo, assets, blocking, dep, output_files, tables_dir, text_maps, texts,
+};
 use super::error::{ApiError, ApiResult};
 use super::paths::{Root, is_hidden};
 
@@ -747,7 +750,7 @@ pub async fn dialog(
     let text = tables.get_or_default::<TextTable>(&dir).await?;
     let texts = texts(&state, &lang, gender).await?;
     let path: PathBuf = Root::Gamedata.dir(&state.config.output).join(&entry.rel);
-    let textures = Root::Textures.dir(&state.config.output);
+    let textures = output_files(&state).root_files(Root::Textures);
     let out = blocking(move || -> ApiResult<DialogOut> {
         let bytes = std::fs::read(&path).map_err(|e| ApiError::io(e, "dialog"))?;
         let tree: Value = serde_json::from_slice(&bytes)

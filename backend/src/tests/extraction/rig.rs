@@ -1047,3 +1047,119 @@ mod npr {
         assert!(is_rig_relevant(&classes, &deco));
     }
 }
+
+/// The texture library's fallback to the bucket, against the mock S3 service.
+mod texture_bucket {
+    use crate::core::s3::S3Settings;
+    use crate::extraction::rig::material::{TextureBucket, TextureLibrary};
+    use crate::tests::core::s3::{env, mock_endpoint};
+    use std::path::{Path, PathBuf};
+
+    /// A textures root of its own, removed when the test ends.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "fluorite-texture-bucket-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn settings(endpoint: &str, roots: &str) -> S3Settings {
+        S3Settings::from_env(env(&[
+            ("S3_ENDPOINT", endpoint),
+            ("S3_BUCKET", "assets"),
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "secret"),
+            ("S3_PREFIX", "fluorite"),
+            ("S3_ROOTS", roots),
+        ]))
+        .unwrap()
+        .unwrap()
+    }
+
+    /// The `GET`s the mock service received.
+    fn gets(log: &crate::tests::core::s3::Log) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "GET")
+            .count()
+    }
+
+    // The reads block on the bucket's own runtime while the mock service runs on the
+    // test's, so the test needs a runtime with more than one thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_png_not_on_disk_is_read_from_the_bucket_into_memory() {
+        let (endpoint, store, log) = mock_endpoint().await;
+        store.lock().unwrap().insert(
+            "fluorite/textures/chr/face.png".to_string(),
+            b"PNG-FACE".to_vec(),
+        );
+        let root = Root::new("fetch");
+        let mut library = TextureLibrary::load(&root.0);
+        library.bucket = TextureBucket::new(settings(&endpoint, "textures")).unwrap();
+
+        assert_eq!(
+            library.read(Path::new("chr/face.png")).as_deref(),
+            Some(&b"PNG-FACE"[..])
+        );
+        assert!(
+            !root.0.join("chr/face.png").exists(),
+            "the fetched PNG is not written under the textures root"
+        );
+        assert_eq!(gets(&log), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_png_on_disk_does_not_reach_the_bucket() {
+        let (endpoint, _store, log) = mock_endpoint().await;
+        let root = Root::new("disk");
+        std::fs::create_dir_all(root.0.join("chr")).unwrap();
+        std::fs::write(root.0.join("chr/face.png"), b"LOCAL").unwrap();
+        let mut library = TextureLibrary::load(&root.0);
+        library.bucket = TextureBucket::new(settings(&endpoint, "textures")).unwrap();
+
+        assert_eq!(
+            library.read(Path::new("chr/face.png")).as_deref(),
+            Some(&b"LOCAL"[..])
+        );
+        assert_eq!(gets(&log), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_png_missing_everywhere_is_asked_for_once() {
+        let (endpoint, _store, log) = mock_endpoint().await;
+        let root = Root::new("missing");
+        let mut library = TextureLibrary::load(&root.0);
+        library.bucket = TextureBucket::new(settings(&endpoint, "textures")).unwrap();
+
+        assert!(library.read(Path::new("chr/nope.png")).is_none());
+        assert!(library.read(Path::new("chr/nope.png")).is_none());
+        assert_eq!(gets(&log), 1, "a missing object is not asked for again");
+    }
+
+    #[test]
+    fn a_bucket_without_the_textures_root_is_not_read() {
+        let bucket = TextureBucket::new(settings("http://127.0.0.1:9", "meshes,models")).unwrap();
+        assert!(bucket.is_none());
+    }
+
+    #[test]
+    fn without_a_bucket_a_missing_png_is_missing() {
+        let root = Root::new("local");
+        let library = TextureLibrary::load(&root.0);
+        assert!(library.read(Path::new("chr/face.png")).is_none());
+    }
+}

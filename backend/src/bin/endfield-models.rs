@@ -209,6 +209,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The configuration lives in `backend/.env`; the variables of the environment
+    // win over the file.
+    backend::envfile::load();
+
     let cli = Cli::parse();
     let client = Client::new();
     match cli.command {
@@ -702,6 +706,28 @@ struct ExportArgs {
     opts: rig::ExportOptions,
 }
 
+/// The texture library under `textures`, reading the PNGs that are not on disk from the
+/// bucket when the textures root lives in one (the unpacker removes the local copies with
+/// `S3_KEEP_LOCAL=0`). Settings that cannot be used only warn: the textures on disk still
+/// work.
+fn texture_library(textures: &Path) -> rig::material::TextureLibrary {
+    let mut library = rig::material::TextureLibrary::load(textures);
+    let bucket = backend::core::s3::S3Settings::from_env(backend::envfile::var)
+        .and_then(|settings| settings.map_or(Ok(None), rig::material::TextureBucket::new));
+    match bucket {
+        Ok(Some(bucket)) => {
+            eprintln!(
+                "texture library: PNGs not on disk are read from {}",
+                bucket.describe()
+            );
+            library.bucket = Some(bucket);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("warning: texture library: not reading the bucket: {error}"),
+    }
+    library
+}
+
 /// Chunks whose texture index lists a dependency of a prefab matching `filter`.
 fn chunks_from_texture_index(textures: &Path, filter: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -843,7 +869,7 @@ async fn cmd_export(
             .as_ref()
             .is_none_or(|r| r.join("sf").join(cab).is_file())
     });
-    let library = std::sync::Arc::new(rig::material::TextureLibrary::load(&textures));
+    let library = std::sync::Arc::new(texture_library(&textures));
     eprintln!(
         "texture library: {} named textures under {}",
         library.by_name.len(),
@@ -1374,9 +1400,7 @@ fn cmd_charinfo(
     let stored = |cab: &str| store.join("sf").join(cab).is_file();
     let containers = charinfo::uimodel_containers(&records, &stored);
     let tables = charinfo::Tables::load(data_root);
-    let library = std::sync::Arc::new(rig::material::TextureLibrary::load(
-        &data_root.join("textures"),
-    ));
+    let library = std::sync::Arc::new(texture_library(&data_root.join("textures")));
     let opts = rig::ExportOptions {
         material: rig::material::MaterialOptions {
             library: Some(library),

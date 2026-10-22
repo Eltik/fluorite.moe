@@ -361,6 +361,23 @@ impl S3Client {
         })
     }
 
+    /// `GET` a whole object into memory, for a caller that needs all of its bytes at once.
+    ///
+    /// The answer is given up as stalled after [`STALL_TIMEOUT`], and the body gets the
+    /// same budget plus the time its length takes at [`MIN_UPLOAD_RATE`], like an upload.
+    pub async fn get_bytes(&self, key: &str) -> Result<Vec<u8>, S3Error> {
+        let object = tokio::time::timeout(STALL_TIMEOUT, self.get(key, None))
+            .await
+            .map_err(|_| S3Error::stalled(STALL_TIMEOUT))??;
+        let budget = STALL_TIMEOUT
+            + Duration::from_secs(object.content_length.unwrap_or(0) / MIN_UPLOAD_RATE);
+        let bytes = tokio::time::timeout(budget, object.body.bytes())
+            .await
+            .map_err(|_| S3Error::stalled(budget))?
+            .map_err(S3Error::transport)?;
+        Ok(bytes.to_vec())
+    }
+
     /// One page of `ListObjectsV2`.
     ///
     /// With a `delimiter`, the keys directly under `prefix` come back as objects and
@@ -403,9 +420,13 @@ impl S3Client {
         let mut all = ListResult::default();
         let mut continuation: Option<String> = None;
         loop {
-            let page = self
-                .list(prefix, delimiter, continuation.as_deref())
-                .await?;
+            // A stalled page is an error rather than a hang.
+            let page = tokio::time::timeout(
+                STALL_TIMEOUT,
+                self.list(prefix, delimiter, continuation.as_deref()),
+            )
+            .await
+            .map_err(|_| S3Error::stalled(STALL_TIMEOUT))??;
             all.objects.extend(page.objects);
             all.prefixes.extend(page.prefixes);
             continuation = page.next_continuation;
