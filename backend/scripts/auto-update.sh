@@ -82,37 +82,103 @@ models_wanted() {
   fi
 }
 
-# Scan, export and animate the rigged models (see `endfield-models` in the README).
-# Everything goes to the log.
-build_models() {
-  local bin=./target/release/endfield-models models=./output/models
-  local store=./output/models/.store
+# The rigged models are built one group at a time, and each group is published before
+# the next one is exported: with S3_KEEP_LOCAL=0 the publish removes the local copies,
+# so only one group is on the disk at once. The weapons go with the operators, whose
+# character-screen data reads the weapon models from the disk.
+MODEL_GROUPS=(operators npcs enemies)
+MODELS_BIN=./target/release/endfield-models
+MODELS_DIR=./output/models
+MODELS_STORE=./output/models/.store
+# The indexes each export or `clips` merges into. A publish removes them with the rest
+# of the group, so a copy waits here (a dot directory is never published) for the next.
+MODELS_KEEP=./output/models/.keep
+MODELS_INDEXES=(index.json clips/summary.json)
+
+# Build endfield-models and scan the chunks into the store (see `endfield-models` in the
+# README). Everything goes to the log.
+prepare_models() {
   echo "models: building endfield-models" >> "$LOG"
   if ! cargo build --release --features acl --bin endfield-models -q >> "$LOG" 2>&1; then
     echo "models: build failed" >> "$LOG"
     return 1
   fi
-  local exporter=("$bin" export --output "$models" --store "$store" --data-root ./output --jobs 2)
-  local people=uiteam_idle,dialog_single_idle,idle
-  if ! {
-    "$bin" scan --store "$store" --jobs 2 &&
-      "${exporter[@]}" --filter postmodels/characters --anims "$people" &&
-      "${exporter[@]}" --filter postmodels/npc --anims "$people" &&
-      "${exporter[@]}" --filter /npc/major/ --anims "$people" &&
-      "${exporter[@]}" --filter postmodels/enemies --anims idle &&
-      "${exporter[@]}" --filter prefabs/weapons &&
-      "$bin" clips --store "$store" --models "$models" --jobs 2 &&
-      "$bin" charinfo --store "$store" --models "$models" --data-root ./output
-  } >> "$LOG" 2>&1; then
-    echo "models: export failed" >> "$LOG"
+  if ! "$MODELS_BIN" scan --store "$MODELS_STORE" --jobs 2 >> "$LOG" 2>&1; then
+    echo "models: scan failed" >> "$LOG"
     return 1
   fi
 }
 
-# `build_models` under the lock of the update state, so no update or publish removes
-# its inputs while it reads them. With `flock` (Linux) it is the same flock the binary
+# Export one group of $MODEL_GROUPS with its clips.
+export_models() {
+  local exporter=("$MODELS_BIN" export --output "$MODELS_DIR" --store "$MODELS_STORE"
+    --data-root ./output --jobs 2)
+  local clips=("$MODELS_BIN" clips --store "$MODELS_STORE" --models "$MODELS_DIR" --jobs 2)
+  local people=uiteam_idle,dialog_single_idle,idle
+  echo "models: exporting $1" >> "$LOG"
+  if ! case "$1" in
+    operators)
+      "${exporter[@]}" --filter prefabs/weapons &&
+        "${exporter[@]}" --filter postmodels/characters --anims "$people" &&
+        "${clips[@]}" --kind operator &&
+        "$MODELS_BIN" charinfo --store "$MODELS_STORE" --models "$MODELS_DIR" --data-root ./output
+      ;;
+    npcs)
+      "${exporter[@]}" --filter postmodels/npc --anims "$people" &&
+        "${exporter[@]}" --filter /npc/major/ --anims "$people" &&
+        "${clips[@]}" --kind npc
+      ;;
+    enemies)
+      "${exporter[@]}" --filter postmodels/enemies --anims idle &&
+        "${clips[@]}" --kind enemy
+      ;;
+  esac >> "$LOG" 2>&1; then
+    echo "models: export of $1 failed" >> "$LOG"
+    return 1
+  fi
+}
+
+# Put back the indexes a publish removed, from the copy in $MODELS_KEEP or, before the
+# first group, from the bucket: an export that starts from no index would publish one
+# that lists only its own group.
+restore_model_indexes() {
+  local name base url prefix
+  base="${S3_PUBLIC_BASE_URL:-}"
+  prefix="${S3_PREFIX:-fluorite}"
+  prefix="${prefix#/}"
+  prefix="${prefix%/}"
+  for name in "${MODELS_INDEXES[@]}"; do
+    [ ! -f "$MODELS_DIR/$name" ] || continue
+    mkdir -p "$(dirname "$MODELS_DIR/$name")"
+    if [ -f "$MODELS_KEEP/$name" ]; then
+      cp "$MODELS_KEEP/$name" "$MODELS_DIR/$name"
+    elif [ -n "$base" ]; then
+      url="${base%/}/${prefix:+$prefix/}models/$name"
+      if curl -fsS --max-time 120 -o "$MODELS_DIR/$name.tmp" "$url" 2>> "$LOG"; then
+        mv "$MODELS_DIR/$name.tmp" "$MODELS_DIR/$name"
+      else
+        rm -f "$MODELS_DIR/$name.tmp"
+        echo "models: $url could not be read; $name starts empty" >> "$LOG"
+      fi
+    fi
+  done
+}
+
+# Keep a copy of the indexes before a publish removes them.
+keep_model_indexes() {
+  local name
+  for name in "${MODELS_INDEXES[@]}"; do
+    [ -f "$MODELS_DIR/$name" ] || continue
+    mkdir -p "$(dirname "$MODELS_KEEP/$name")"
+    cp "$MODELS_DIR/$name" "$MODELS_KEEP/$name.tmp"
+    mv "$MODELS_KEEP/$name.tmp" "$MODELS_KEEP/$name"
+  done
+}
+
+# Run "$@" under the lock of the update state, so no update or publish removes its
+# inputs while it reads them. With `flock` (Linux) it is the same flock the binary
 # takes; without it (macOS) a directory only keeps two builds apart.
-locked_build_models() {
+with_models_lock() {
   local rc=0
   if command -v flock > /dev/null; then
     exec 9>> "$STATE_LOCK"
@@ -122,7 +188,7 @@ locked_build_models() {
       return "$MODELS_BUSY"
     fi
     # The children do not get fd 9: one that outlives the build would keep the lock.
-    build_models 9>&- || rc=$?
+    "$@" 9>&- || rc=$?
     exec 9>&-
     return "$rc"
   fi
@@ -136,18 +202,39 @@ locked_build_models() {
     mkdir "$MODELS_LOCK" 2>/dev/null || return "$MODELS_BUSY"
   fi
   echo "$$" > "$MODELS_LOCK/pid"
-  build_models || rc=$?
+  "$@" || rc=$?
   rm -f "$MODELS_LOCK/pid"
   rmdir "$MODELS_LOCK" 2>/dev/null || true
   return "$rc"
 }
 
-# Build the rigged models, record the outcome, then publish them. A failure is logged
-# and leaves the exit code of the update alone.
+# The first group also builds the binary and fills the store.
+build_model_group() {
+  if [ "$1" = "${MODEL_GROUPS[0]}" ]; then
+    prepare_models || return 1
+  fi
+  restore_model_indexes
+  export_models "$1"
+}
+
+# Build and publish every group, then record the outcome. A failed group stops the run
+# and counts as a failed build, so the backoff of `models_wanted` retries it; the exit
+# code of the update is left alone.
 update_models() {
-  local rc=0 current status failures at built
+  local rc=0 group current status failures at built
   current=$(stamp "$STATE")
-  locked_build_models || rc=$?
+  for group in "${MODEL_GROUPS[@]}"; do
+    with_models_lock build_model_group "$group" || rc=$?
+    [ "$rc" = 0 ] || break
+    # The publish takes the lock itself, so it runs once the build has let go of it.
+    keep_model_indexes
+    if ! ./target/release/endfield publish --output ./output --state "$STATE" >> "$LOG" 2>&1; then
+      echo "models: publish of $group failed; it is retried with the next build" >> "$LOG"
+      rc=1
+      break
+    fi
+    echo "models: $group published" >> "$LOG"
+  done
   if [ "$rc" = "$MODELS_BUSY" ]; then
     return "$rc"
   fi
@@ -159,12 +246,8 @@ update_models() {
     echo "failed $(( failures + 1 )) $(date +%s) $current" > "$MODELS_STATE"
     return "$rc"
   fi
+  restore_model_indexes
   echo "ok 0 $(date +%s) $current" > "$MODELS_STATE"
-  # The publish takes the lock itself, so it runs once the build has let go of it. A
-  # failed publish is not a failed build: the next update publishes what is left.
-  if ! ./target/release/endfield publish --output ./output --state "$STATE" >> "$LOG" 2>&1; then
-    echo "models: publish failed, the next update publishes them" >> "$LOG"
-  fi
   echo "models: done" >> "$LOG"
 }
 
