@@ -1122,6 +1122,48 @@ mod texture_bucket {
         assert_eq!(gets(&log), 1);
     }
 
+    // An export reads its textures from inside a task of the binary's runtime, whose
+    // cooperative budget runs out after about 128 polls: the reads must keep working
+    // well past that instead of spinning on a wait that never yields.
+    // The reads run in a runtime on a thread of their own: a read that spins never
+    // yields, so it would keep any runtime it runs on from shutting down, and the test
+    // could not fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_reads_inside_a_runtime_task_do_not_spin() {
+        let (endpoint, store, log) = mock_endpoint().await;
+        const READS: usize = 400;
+        for i in 0..READS {
+            store
+                .lock()
+                .unwrap()
+                .insert(format!("fluorite/textures/chr/{i}.png"), vec![1, 2, 3]);
+        }
+        let root = Root::new("budget");
+        let mut library = TextureLibrary::load(&root.0);
+        library.bucket = TextureBucket::new(settings(&endpoint, "textures")).unwrap();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let read = runtime.block_on(async {
+                (0..READS)
+                    .filter(|i| library.read(Path::new(&format!("chr/{i}.png"))).is_some())
+                    .count()
+            });
+            let _ = done.send(read);
+        });
+        let read = tokio::task::spawn_blocking(move || {
+            finished.recv_timeout(std::time::Duration::from_secs(60))
+        })
+        .await
+        .unwrap()
+        .expect("the reads spin instead of finishing");
+        assert_eq!(read, READS);
+        assert_eq!(gets(&log), READS);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_png_on_disk_does_not_reach_the_bucket() {
         let (endpoint, _store, log) = mock_endpoint().await;

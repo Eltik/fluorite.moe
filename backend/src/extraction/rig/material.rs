@@ -260,12 +260,18 @@ impl TextureBucket {
             .settings
             .key_for(Root::Textures, &rel.to_string_lossy().replace('\\', "/"));
         let client = self.client.clone();
-        let task = runtime.spawn(async move { client.get_bytes(&key).await });
-        let error = match futures::executor::block_on(task) {
+        // The answer comes back over a channel rather than by polling the task's handle:
+        // inside a task of the binary's runtime the handle stops being ready once that
+        // task's cooperative budget is spent, and a wait that never yields spins forever.
+        let (send, answer) = std::sync::mpsc::sync_channel(1);
+        runtime.spawn(async move {
+            let _ = send.send(client.get_bytes(&key).await);
+        });
+        let error = match answer.recv() {
             Ok(Ok(bytes)) => return Some(bytes),
             Ok(Err(error)) if error.status == 404 => None,
             Ok(Err(error)) => Some(error.to_string()),
-            Err(error) => Some(error.to_string()),
+            Err(_) => Some("the request was dropped".to_string()),
         };
         if let Some(error) = error {
             eprintln!(
