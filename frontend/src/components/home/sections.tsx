@@ -189,7 +189,7 @@ export function RecentlyViewed(): React.ReactElement | null {
 /** Demoted raw-data roots plus the build line (version, freshness, size). */
 export function GameFiles(): React.ReactElement {
 	const status = useQuery(statusQuery());
-	const total = status.data
+	const total = status.data?.counts
 		? Object.values(status.data.counts).reduce((a, b) => a + b, 0)
 		: undefined;
 
@@ -204,7 +204,7 @@ export function GameFiles(): React.ReactElement {
 				{FILES.map((item) => {
 					const Icon = item.icon;
 					const key = countKey(item.href);
-					const count = key ? status.data?.counts[key] : undefined;
+					const count = key ? status.data?.counts?.[key] : undefined;
 					const description = key ? ROOT_META[key].description : undefined;
 					return (
 						<li key={item.href}>

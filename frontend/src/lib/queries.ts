@@ -18,7 +18,9 @@ export const statusQuery = () =>
 		queryKey: ["status"],
 		queryFn: ({ signal }) => api.status(signal),
 		staleTime: MINUTE,
-		refetchInterval: 5 * MINUTE,
+		// Poll quickly while the index is still building after a restart.
+		refetchInterval: (query) =>
+			query.state.data?.counts === null ? 5_000 : 5 * MINUTE,
 		retry: 1,
 	});
 

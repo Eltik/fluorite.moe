@@ -136,7 +136,8 @@ export interface Status {
 	resVersion: string;
 	updatedAt: string;
 	schemaVersion: number;
-	counts: StatusCounts;
+	/** `null` until the API's first file index build finishes. */
+	counts: StatusCounts | null;
 }
 
 export interface TreeEntry {
