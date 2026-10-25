@@ -16,7 +16,7 @@ The configuration of the whole project is one file, `backend/.env`;
 `backend/.env.example` is the template with every variable and its default.
 
 For a production deployment on a VPS — the API, the web server, the reverse
-proxy, pm2 or systemd, and the bucket — see
+proxy, pm2, and the bucket — see
 [docs/deployment.md](docs/deployment.md).
 
 ## How It Works
@@ -407,11 +407,10 @@ scripts/serve.sh --rebuild     # force both builds
 (cd frontend && bun install && bun run build && PORT=3000 bun run start)
 ```
 
-For a server, `scripts/systemd/` has example units: `fluorite-api.service`,
-`fluorite-web.service`, and `fluorite-update.service` + `.timer` (the systemd
-equivalent of the cron line under [Scheduling](#scheduling)). They assume a checkout
-at `/var/www/fluorite.moe` and run as root; adjust paths and build both parts once
-before enabling them. Put a reverse proxy (Caddy, nginx) in front of the web port for
+For a server, `deploy/ecosystem.config.cjs` runs `fluorite-api`, `fluorite-web`
+and `fluorite-update` (an update loop, the pm2 equivalent of the cron line under
+[Scheduling](#scheduling)) under pm2; build both parts once, then
+`pm2 start deploy/ecosystem.config.cjs`. See [docs/deployment.md](docs/deployment.md). Put a reverse proxy (Caddy, nginx) in front of the web port for
 TLS, HSTS and compression of HTML; the API already compresses its JSON.
 
 ### Configuration
@@ -425,8 +424,8 @@ source it — so one file configures the whole project:
 cp backend/.env.example backend/.env   # then fill in the blanks
 ```
 
-A variable that is already in the environment wins over the file, so a systemd
-`Environment=`, a `FOO=1 ./endfield` or a `docker run -e` overrides it without
+A variable that is already in the environment wins over the file, so a pm2
+`env` entry, a `FOO=1 ./endfield` or a `docker run -e` overrides it without
 anyone having to edit the file. `FLUORITE_ENV_FILE` points the binaries at a
 file somewhere else.
 
@@ -621,7 +620,7 @@ answering `If-None-Match` with 304 and `Range` with 206 (also through the proxy)
   client binary changes. If `health` warns about MemoryPack, run `endfield schema-gen`
   (see [above](#endfield-schema-gen)).
 - [ ] **Deploying a new frontend**: `git pull && scripts/serve.sh` (or `bun run build`
-  then `systemctl restart fluorite-web`). A new API binary needs
+  then `pm2 restart fluorite-web`). A new API binary needs
   `cargo build --release --bin fluorite-api` and a restart of `fluorite-api`.
 - [ ] **Disk**: the output is ~80 GB and grows with each game version; keep headroom
   for `update` (see [Fixing an existing output](#fixing-an-existing-output)). With an
