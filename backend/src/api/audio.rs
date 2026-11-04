@@ -142,6 +142,9 @@ fn local_packs(output: &Path, extra: &[PathBuf]) -> Vec<LocalPack> {
             }
         }
     }
+    // `read_dir` order is the filesystem's: name order on APFS, hash order on ext4.
+    // Pack indices follow this list, so sort it to give every host the same index.
+    roots.sort();
     for d in extra {
         let name = d
             .file_name()
