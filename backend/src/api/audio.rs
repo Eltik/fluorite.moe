@@ -148,6 +148,9 @@ fn local_packs(output: &Path, extra: &[PathBuf]) -> Vec<LocalPack> {
             .map_or_else(|| "extra".into(), |n| n.to_string_lossy().into_owned());
         roots.push((name, d.clone()));
     }
+    // read_dir order is the filesystem's: sorted on APFS, hash order on ext4.
+    // Sort so the pack list is the same on the Mac and on the Linux VPS.
+    roots.sort();
     let mut packs = Vec::new();
     for (group, root) in roots {
         let mut files = Vec::new();
